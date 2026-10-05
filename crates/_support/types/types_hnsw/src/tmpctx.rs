@@ -514,6 +514,73 @@ mod tests {
         assert!(t.size().is_power_of_two() && t.size() as f64 * 0.9 >= t.members() as f64);
     }
 
+    // SH_INSERT (simplehash.h:627-636) grows when members >= grow_threshold
+    // (= size * SH_FILLFACTOR, :352), i.e. at the insert that would add
+    // member threshold+1. SH_GROW (:509, :601) palloc's the new array, rehashes,
+    // then pfree's the old one. Not covered: the robin-hood restart paths
+    // (SH_GROW_MAX_DIB / SH_GROW_MAX_MOVE, :716, :766); they are hard to trigger
+    // deterministically.
+    #[test]
+    fn tidhash_grow_charges_model() {
+        let keys = |t: &mut TidHash, m: &mut AllocSetModel, from: u32, to: u32| {
+            for i in from..to {
+                assert!(!t.insert(i, 1, Some(&mut *m)), "key {i} is distinct");
+            }
+        };
+
+        // Small chunks. create(32): 32/0.9 -> 64 buckets, threshold
+        // floor(64*0.9) = 57. Header 48 B -> 64 B chunk (class 3); array
+        // 8*64 = 512 B -> 512 B chunk (class 6). Each costs chunk + 8 B header
+        // from the keeper block's free tail.
+        let mut m = AllocSetModel::new(0, 8 * 1024, 256 * 1024);
+        let avail0 = m.avail;
+        let mut t = TidHash::create(32, Some(&mut m));
+        assert_eq!(t.size(), 64);
+        assert_eq!(avail0 - m.avail, (64 + 8) + (512 + 8));
+        // 57 distinct inserts: members reaches 57 without growing.
+        keys(&mut t, &mut m, 0, 57);
+        assert_eq!((t.members(), t.size()), (57, 64));
+        assert_eq!(m.nfree, [0; ALLOCSET_NUM_FREELISTS]);
+        let avail1 = m.avail;
+        // The 58th insert sees members (57) >= threshold: grow to 128 buckets.
+        // palloc 8*128 = 1024 B (class 7, from the free tail), then pfree the
+        // old 512 B chunk (class 6 freelist). No new block.
+        keys(&mut t, &mut m, 57, 58);
+        assert_eq!((t.members(), t.size()), (58, 128));
+        assert_eq!(avail1 - m.avail, 1024 + 8);
+        let mut expect = [0u32; ALLOCSET_NUM_FREELISTS];
+        expect[6] = 1;
+        assert_eq!(m.nfree, expect);
+        assert_eq!(m.mem_allocated(), 8192);
+
+        // Large chunks. create(1280): 1280/0.9 = 1422 -> 2048 buckets,
+        // threshold floor(2048*0.9) = 1843. The 16384 B array exceeds the
+        // 8192 B chunk limit, so it is a dedicated block of
+        // 16384 + 40 (block hdr) + 8 (chunk hdr) = 16432.
+        let mut m = AllocSetModel::new(0, 8 * 1024, 256 * 1024);
+        let mut t = TidHash::create(1280, Some(&mut m));
+        assert_eq!(t.size(), 2048);
+        assert_eq!(m.mem_allocated(), 8192 + 16432);
+        // Insert distinct keys until the table grows. The threshold is 1843,
+        // but SH_INSERT's SH_GROW_MAX_DIB check (simplehash.h:760-766) may
+        // force the grow earlier when a probe run exceeds 25 at >= 10% fill;
+        // with these keys it fires at member 1834, so the grow point is
+        // asserted to be <= 1844 members rather than exactly 1844.
+        let mut i = 0u32;
+        while t.size() == 2048 {
+            assert_eq!(m.mem_allocated(), 8192 + 16432, "no charge before the grow");
+            assert!(!t.insert(i, 1, Some(&mut m)));
+            i += 1;
+        }
+        assert!(t.members() <= 1844, "grew at {} members", t.members());
+        // The grow to 4096 buckets palloc's 32768 B (a dedicated
+        // 32768 + 48 = 32816 block), then pfree's the old block (-16432):
+        // net +16384.
+        assert_eq!(t.size(), 4096);
+        assert_eq!(m.mem_allocated(), 8192 + 16432 + 16384);
+        assert_eq!(m.mem_allocated(), 8192 + 32816);
+    }
+
     // Replay C's real allocation sequence (tests/data/README.md): the model
     // must equal C's MemoryContextMemAllocated at every checkpoint.
     #[test]
