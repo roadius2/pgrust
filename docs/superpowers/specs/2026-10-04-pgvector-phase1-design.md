@@ -73,7 +73,7 @@ The survey `docs/Vector Search for pgrust Algorithm & Benchmark Survey.md` sets 
 ### 4.3 HNSW: extend the existing crates
 - `types_hnsw` gains `HnswTypeInfo`: max dimensions, normalize, value check, and the dimension-count function added in 0.8.7.
 - `pgvector_hnsw` gains the 0.8.7 changes and type dispatch.
-- `pgvector_hnsw_build` gains the seed fix (§5.4) and a new `parallel.rs` module (§7).
+- `pgvector_hnsw_build` gains the opt-in build seed (§5.4) and a new `parallel.rs` module (§7).
 
 ### 4.4 IVFFlat: three new crates, mirroring HNSW
 - `crates/_support/types/types_ivfflat` holds the `ivfflat.h` vocabulary and the scan state. It lives here so `relscan`'s `IndexScanOpaque` can hold the scan state without a dependency cycle.
@@ -107,12 +107,18 @@ These are the same places HNSW is wired in today. Core depends on access-method 
 ## 5. Types and the 0.8.7 catch-up
 
 ### 5.1 Bringing existing code to 0.8.7
-- **HNSW dimension count:** HNSW reads the dimension count from its metadata page (`HnswGetMetaPageInfo(..., &dimensions, ...)`). Build, insert and scan call `HnswCheckDim`, which raises `expected %d dimensions, not %d` (`ERRCODE_DATA_EXCEPTION`).
-- **Level RNG:** a uniform draw of `0.0` returns the maximum level instead of computing `-log(0)`. `HnswGetMaxLevel` caps at **63**, down from 255.
-- **Neighbour updates:** `UpdateNeighborOnDisk` always checks whether a connection already exists. The `checkExisting` parameter is removed.
-- **Empty aggregate states:** `vector_combine` handles empty partial states, fixing the 0.8.7 "error with `avg` aggregate when no matching rows" bug. The `vector` and `halfvec` `avg`/`sum` aggregates share this merge step, so the fix shows up mainly under parallel aggregation.
-- **Size arithmetic:** C's `add_size`/`mul_size` become checked arithmetic that raises the same errors.
-- **Version string** becomes 0.8.7.
+Corrected on 2026-10-05 against `git diff v0.8.5 v0.8.7` (port base `159b79a` is the `v0.8.5` tag):
+- **HNSW dimension count:** `HnswCheckDim` raises `expected %d dimensions, not %d` (`ERRCODE_DATA_EXCEPTION`, `hnswutils.c:1366-1374`).
+  - Build checks against the column typmod (`buildstate->dimensions`, `hnswbuild.c:503-504`).
+  - Insert (`hnswinsert.c:713-717`) and scan (`hnswscan.c:39-44`) check against the metapage (`HnswGetMetaPageInfo(..., &dimensions, ...)`).
+  - The scan checks only a non-NULL query value, and checks it before returning early on an empty index, so a wrong-dimension query errors even on an empty index.
+- **Level RNG:** a uniform draw of `0.0` returns the maximum level instead of computing `-log(0)` (`hnswutils.c:250-255`). The port already behaves this way because the `inf as i32` cast saturates; M1 makes it explicit. `HnswGetMaxLevel` caps at **63**, down from 255 (`hnsw.h:133`, 0.8.6).
+- **Neighbour updates:** `UpdateNeighborOnDisk` always checks whether a connection already exists, and the `checkExisting` parameter is removed (upstream #1010).
+- **`vector_combine`:** it branches on the partial states' dimensions rather than their counts, and calls `CheckDim` on every non-empty side (`vector.c:1211-1284`).
+  - The 0.8.7 changelog's "error with `avg` aggregate when no matching rows" bug came in with 0.8.6 and never existed in 0.8.5 or in the port.
+  - Only `avg` uses `vector_combine`. `sum` combines with `vector_add`, and `halfvec_combine` is an SQL alias of `vector_combine`.
+- **Size arithmetic:** the only reachable site is `HnswLoadNeighborTids`' `mul_size(element->level - lc, m)` (`hnswutils.c:789`). A corrupt metapage entry level makes it raise instead of indexing out of bounds. The other `add_size`/`mul_size` sites have bounded inputs and stay plain arithmetic.
+- **Version:** the extension stays at the trimmed `vector--0.8.5.sql` and `default_version = '0.8.5'` until M4 (§4.6). C also reports a library version of 0.8.7 through `PG_MODULE_MAGIC_EXT` (`vector.c:49`, visible in `pg_get_loaded_modules()`), while pgrust reports 18.6 for every built-in library. That gap is recorded as a `DIVERGENCE` and revisited in M4.
 
 ### 5.2 Type layouts (byte-identical to C)
 
@@ -144,7 +150,12 @@ Every error message is copied verbatim with C's SQLSTATE, about 20 per type. Tex
   - `halfvec_{l2,ip,cosine,l1}_ops`
   - `bit_{hamming,jaccard}_ops`
   - `sparsevec_{l2,ip,cosine,l1}_ops`
-- **Determinism fix:** C calls `SeedRandom(42)` at the start of every HNSW build, so serial builds are deterministic. The port seeds per backend, which its header records as a divergence. Phase 1 matches C, including C's side effect of reseeding the backend's global PRNG. This enables the byte-identical index tier (§8).
+- **Build seed (corrected 2026-10-05):** C seeds the level generator only when pgvector is compiled with `-DHNSW_MEMORY`. That is a debug flag that also prints `INFO: memory:` lines; the seed is `SeedRandom(42)` at `hnswbuild.c:1134-1136`.
+  - Stock C builds, including the Docker image and the reference, draw levels from the backend's `InitProcessGlobals` seed, so they are not reproducible. Two stock builds of the same table differ.
+  - pgrust matches stock C by default.
+  - The pgrust-only placeholder option `pgrust.hnsw_build_seed` makes a build call `SeedRandom(<value>)` at the same point C does. It is unregistered, so it adds no `pg_settings` row (the same pattern as `pgrust.gather_fair_stride`). With 42 it reproduces C's `-DHNSW_MEMORY` build, including that build's reseeding of the backend's `pg_global_prng_state`. The byte-identical and iterative-scan tiers (§8.2) use it.
+  - IVFFlat is similar: `SeedRandom(42)` runs only under `#ifdef IVFFLAT_BENCH` (`ivfbuild.c:1075-1077`). This matters in M4.
+- **Tie order:** C's search heaps are pairing heaps (`hnswutils.c:632-672`). On distance ties their pop order decides neighbour lists and the order of tied scan results, so the port uses the C-exact `pairingheap` crate rather than binary heaps.
 
 ## 6. IVFFlat (serial port)
 
@@ -193,6 +204,7 @@ Every error message is copied verbatim with C's SQLSTATE, about 20 per type. Tex
 - **Local reference (dev loop):** PostgreSQL 18.6 built from `crates/postgres-18.6-reference`, plus pgvector 0.8.7 built from `crates/pgvector-0.8.7-reference` with the Docker image's compiler flags (`make OPTFLAGS=""`). `scripts/pgvector/build-reference.sh` builds two installs under `$PGREF` (default `~/.cache/pgrust/pgref-18.6`):
   - `pg`: PostgreSQL 18.6 only. pgrust reads its share directory and uses its `initdb`, `pg_ctl`, `psql` and `pg_regress`.
   - `pgvec`: a copy of `pg` plus C pgvector, used as the reference server. It's kept separate so pgrust never sees C pgvector's control or upgrade scripts.
+  - `pgvec-seeded` (added in M1): the same, but pgvector is built with `-DHNSW_MEMORY`, the only C configuration that seeds HNSW builds (§5.4). It is the oracle for the byte-identical and iterative-scan tiers, and nothing else uses it.
   
   (An earlier draft named the single prefix `/tmp/pgrust_pginstall`, which `crates/backend/commands/matview/tests/refresh_freeze_e2e.rs` probes. That test can be pointed at `$PGREF/pg` through `PGINSTALL`.) This build is needed for two reasons:
   - C `pg_ctl` and `initdb` require the `postgres` binary's version string to match theirs exactly, so the C tools must be exactly 18.6.
@@ -210,7 +222,8 @@ Every error message is copied verbatim with C's SQLSTATE, about 20 per type. Tex
 | TAP | `prove` on the 48 `test/t/*.pl` files using a hybrid setup: C `initdb` sits beside C `postgres` for bootstrap, while `pg_ctl` sits beside pgrust's `postgres`, so clusters are created by C and run by pgrust | Pass, or a written reason per exclusion (for example, the WAL tests need pgrust-to-pgrust streaming replication) | Yes |
 | Exact differential | A new vector module in `crates/bin/fuzzgen`, run by `diffrunner --a <reference> --b <pgrust>`. Covers functions, casts, operators, error cases and exact (non-index) nearest-neighbour queries, with special values: zero vectors, denormals, dimension and nnz limits, NaN/inf rejection. | Identical, with distances within a tight relative tolerance (add tolerance comparison to `diffrunner` scoped to vector values if it lacks one). Accepted divergences go in `docs/fuzzing/rulings.toml`. | Yes |
 | Approximate differential | Same real-embedding dataset and index parameters on both servers. Recall@10 and @100 against exact ground truth, for HNSW and IVFFlat, all types. | pgrust recall ≥ pgvector recall − 0.01 | Yes |
-| Byte-identical index | Serial HNSW build (seed 42) on integer-valued data, where float math is exact, on both servers. Compare relation files with `crates/bin/pagemask`. IVFFlat is attempted but is nondeterministic in C. | HNSW pages identical | HNSW yes |
+| Byte-identical index | Serial HNSW builds with seed 42 on integer-valued data, where float math is exact or rounds once: `pgvec-seeded` against pgrust with `pgrust.hnsw_build_seed = 42`. Index files are compared after masking both with `crates/bin/pagemask generic`. Cases cover tie-free and tie-heavy data, `m = 4`, 2,000 dimensions, an unlogged init fork, and inserts after the build. Two cases are opt-in known divergences: spilling past `maintenance_work_mem` (the build's memory accounting) and cosine (C's `-ffp-contract=fast`). IVFFlat is attempted but is nondeterministic in C. | Every default case identical | HNSW yes |
+| Iterative-scan stop points (M1) | The same seeded, tie-free HNSW index on both servers. Iterative scans whose stop point depends on `hnsw.max_scan_tuples` or on the scan memory cap (`MemoryContextMemAllocated(tmpCtx) > work_mem × hnsw.scan_mem_multiplier`, `hnswscan.c:264`), including a rescan through `LATERAL`. | Same rows in the same order, and the same `Rows Removed by Filter` | Yes |
 | On-disk, forward | Docker fixture: all four types, every HNSW and IVFFlat opclass, a `binary_quantize` expression index, deletes + `VACUUM`. Captured (a) after a clean stop and (b) after `pg_ctl stop -m immediate` with index writes since the last checkpoint. pgrust boots each copy and reruns the fixture queries, then runs inserts, deletes, `VACUUM` and `REINDEX`. Plus a fixture from the 0.8.1-pg18 image followed by `ALTER EXTENSION vector UPDATE`. | Query results **identical to those captured on pgvector, including approximate-search results**: the same index pages give the same traversal. Follow-up DML and maintenance succeed. | Yes |
 | On-disk, reverse | pgrust creates the same fixture; Docker pgvector boots it and reruns the queries | Reported | No |
 
@@ -220,6 +233,7 @@ Every error message is copied verbatim with C's SQLSTATE, about 20 per type. Tex
   - `run-regress.sh`
   - `run-tap.sh`
   - `run-ondisk.sh`
+  - `run-bytecmp.sh` and `run-iterscan.sh` (M1)
   - fixture SQL
   - a wrapper that runs every gated tier and prints a pass/fail table
 - The repo has no CI config, so the wrapper is the gate.
@@ -235,7 +249,7 @@ Every error message is copied verbatim with C's SQLSTATE, about 20 per type. Tex
 | # | Milestone | Exit criteria |
 |---|---|---|
 | M0 | Vendor the pgvector reference; build the local reference; write the `scripts/pgvector/` runners. **Spikes:** (1) the hybrid TAP setup running one pgvector TAP test end to end; (2) the regression suite against current pgrust. | One TAP test passes end to end; a baseline report of what passes today |
-| M1 | 0.8.7 catch-up for `vector` and HNSW, plus the seed-42 fix | Regression files `vector_type` and `hnsw_vector` pass; byte-identical HNSW tier passes for `vector` |
+| M1 | 0.8.7 catch-up for `vector` and HNSW; the 016 page-chain fix; the opt-in build seed; C's pairing-heap tie order; exact iterative-scan memory accounting | Regression files `vector_type` and `hnsw_vector` pass; TAP `016`, `043` and `044` pass; the byte-identical HNSW tier and the iterative-scan tier pass for `vector` |
 | M2 | `halfvec`, `sparsevec`, `bit` functions | Regression files `halfvec`, `sparsevec`, `bit`, `cast`, `btree` and `copy` pass (`btree` and `copy` also cover `halfvec` and `sparsevec`, so they move here from M1); exhaustive f16 test passes; exact differential is clean |
 | M3 | HNSW type info and opclasses for all types | Regression files `hnsw_bit`, `hnsw_halfvec` and `hnsw_sparsevec` pass, plus all HNSW TAP tests (serial builds) |
 | M4 | IVFFlat serial port; switch to the verbatim 0.8.7 script and upgrade scripts | Regression files `ivfflat_bit`, `ivfflat_halfvec` and `ivfflat_vector` pass, plus all IVFFlat TAP tests; lookup-coverage test passes. All 14 regression files now pass. |
