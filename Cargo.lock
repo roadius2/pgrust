@@ -20585,6 +20585,7 @@ name = "types_hnsw"
 version = "0.1.0"
 dependencies = [
  "datum",
+ "hashfn",
  "mcx",
  "pairingheap",
  "rustc-hash",

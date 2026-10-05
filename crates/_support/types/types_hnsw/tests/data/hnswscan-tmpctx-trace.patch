@@ -1,0 +1,415 @@
+diff -ruN /Users/jody/dev_projects/pgrust/crates/pgvector-0.8.7-reference/src/hnswscan.c pgv-src/src/hnswscan.c
+--- /Users/jody/dev_projects/pgrust/crates/pgvector-0.8.7-reference/src/hnswscan.c	2026-10-04 23:39:33
++++ pgv-src/src/hnswscan.c	2026-10-05 12:41:28
+@@ -5,6 +5,10 @@
+ #include "access/genam.h"
+ #include "access/relscan.h"
+ #include "hnsw.h"
++#include "hnswshadow.h"
++
++HnswShadow hnsw_shadow;
++FILE *hnsw_shadow_log;
+ #include "lib/pairingheap.h"
+ #include "miscadmin.h"
+ #include "nodes/pg_list.h"
+@@ -50,6 +54,7 @@
+ 		return NIL;
+ 
+ 	ep = list_make1(HnswEntryCandidate(base, entryPoint, q, index, support, false));
++	shadow_alloc(64);
+ 
+ 	for (int lc = entryPoint->level; lc >= 1; lc--)
+ 	{
+@@ -85,7 +90,7 @@
+ 
+ 		sc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(so->discarded));
+ 
+-		ep = lappend(ep, sc);
++		SHADOW_LAPPEND(ep, sc);
+ 	}
+ 
+ 	return HnswSearchLayer(base, &so->q, ep, batch_size, 0, index, &so->support, so->m, false, NULL, &so->v, &so->discarded, false, &so->tuples);
+@@ -112,7 +117,10 @@
+ 
+ 		/* Normalize if needed */
+ 		if (so->support.normprocinfo != NULL)
++		{
+ 			value = HnswNormValue(so->typeInfo, so->support.collation, value);
++			shadow_alloc(VARSIZE_ANY(DatumGetPointer(value)));
++		}
+ 	}
+ 
+ 	return value;
+@@ -125,7 +133,7 @@
+ static void
+ ShowMemoryUsage(HnswScanOpaque so)
+ {
+-	elog(INFO, "memory: %zu KB, tuples: " INT64_FORMAT, MemoryContextMemAllocated(so->tmpCtx, false) / 1024, so->tuples);
++	elog(INFO, "memory: %zu B, shadow: %zu B, tuples: " INT64_FORMAT "%s", MemoryContextMemAllocated(so->tmpCtx, false), hnsw_shadow.mem_allocated, so->tuples, MemoryContextMemAllocated(so->tmpCtx, false) == hnsw_shadow.mem_allocated ? "" : " MISMATCH");
+ }
+ #endif
+ 
+@@ -160,6 +168,15 @@
+ 	maxMemory = (double) work_mem * hnsw_scan_mem_multiplier * 1024.0 + 256;
+ 	so->maxMemory = Min(maxMemory, (double) (SIZE_MAX / 2));
+ 
++	hnsw_shadow.ctx = so->tmpCtx;
++	if (hnsw_shadow_log == NULL && getenv("HNSW_SHADOW_LOG") != NULL)
++		hnsw_shadow_log = fopen(getenv("HNSW_SHADOW_LOG"), "a");
++	if (hnsw_shadow_log)
++		fprintf(hnsw_shadow_log, "B\n");
++	shadow_reset();
++	if (MemoryContextMemAllocated(so->tmpCtx, false) != hnsw_shadow.mem_allocated)
++		elog(INFO, "shadow init mismatch: %zu", MemoryContextMemAllocated(so->tmpCtx, false));
++
+ 	scan->opaque = so;
+ 
+ 	return scan;
+@@ -180,6 +197,8 @@
+ 	so->tuples = 0;
+ 	so->previousDistance = -get_float8_infinity();
+ 	MemoryContextReset(so->tmpCtx);
++	hnsw_shadow.ctx = so->tmpCtx;
++	shadow_reset();
+ 
+ 	if (keys && scan->numberOfKeys > 0)
+ 		memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));
+@@ -260,6 +279,15 @@
+ 			if (so->discarded == NULL)
+ 				break;
+ 
++#if defined(HNSW_MEMORY)
++			if (MemoryContextMemAllocated(so->tmpCtx, false) != hnsw_shadow.mem_allocated)
++				elog(INFO, "CHECK MISMATCH real %zu shadow %zu tuples " INT64_FORMAT, MemoryContextMemAllocated(so->tmpCtx, false), hnsw_shadow.mem_allocated, so->tuples);
++#endif
++			if (hnsw_shadow_log)
++			{
++				fprintf(hnsw_shadow_log, "C %zu " INT64_FORMAT "\n", MemoryContextMemAllocated(so->tmpCtx, false), so->tuples);
++				fflush(hnsw_shadow_log);
++			}
+ 			/* Reached max number of tuples or memory limit */
+ 			if (so->tuples >= hnsw_max_scan_tuples || MemoryContextMemAllocated(so->tmpCtx, false) > so->maxMemory)
+ 			{
+@@ -267,7 +295,7 @@
+ 					break;
+ 
+ 				/* Return remaining tuples */
+-				so->w = lappend(so->w, HnswGetSearchCandidate(w_node, pairingheap_remove_first(so->discarded)));
++				SHADOW_LAPPEND(so->w, HnswGetSearchCandidate(w_node, pairingheap_remove_first(so->discarded)));
+ 			}
+ 			else
+ 			{
+@@ -301,6 +329,8 @@
+ 		/* Move to next element if no valid heap TIDs */
+ 		if (element->heaptidsLength == 0)
+ 		{
++			if (list_length(so->w) <= 1)
++				shadow_list_free(so->w->max_length, so->w->elements == so->w->initial_elements);
+ 			so->w = list_delete_last(so->w);
+ 
+ 			/* Mark memory as free for next iteration */
+@@ -308,6 +338,8 @@
+ 			{
+ 				pfree(element);
+ 				pfree(sc);
++				shadow_free(sizeof(HnswElementData));
++				shadow_free(sizeof(HnswSearchCandidate));
+ 			}
+ 
+ 			continue;
+diff -ruN /Users/jody/dev_projects/pgrust/crates/pgvector-0.8.7-reference/src/hnswshadow.h pgv-src/src/hnswshadow.h
+--- /Users/jody/dev_projects/pgrust/crates/pgvector-0.8.7-reference/src/hnswshadow.h	1969-12-31 19:00:00
++++ pgv-src/src/hnswshadow.h	2026-10-05 12:41:28
+@@ -0,0 +1,176 @@
++/* Shadow model of aset.c accounting for the hnsw scan tmpCtx (validation only). */
++#ifndef HNSWSHADOW_H
++#define HNSWSHADOW_H
++#include "postgres.h"
++#include "nodes/pg_list.h"
++#include "port/pg_bitutils.h"
++
++typedef struct HnswShadow
++{
++	MemoryContext ctx;			/* model applies only while this is current */
++	Size		mem_allocated;
++	Size		avail;			/* endptr - freeptr of set->blocks (head) */
++	int			nfree[11];
++	Size		nextBlockSize;
++} HnswShadow;
++
++extern HnswShadow hnsw_shadow;
++extern FILE *hnsw_shadow_log;
++#define SHADOW_LOG(...) do { if (hnsw_shadow_log && SHADOW_ON()) fprintf(hnsw_shadow_log, __VA_ARGS__); } while (0)
++
++#define SHADOW_ON() (hnsw_shadow.ctx != NULL && CurrentMemoryContext == hnsw_shadow.ctx)
++
++static inline int
++shadow_fidx(Size size)
++{
++	if (size > 8)
++		return pg_leftmost_one_pos32((uint32) ((size - 1) >> 3)) + 1;
++	return 0;
++}
++
++static inline void
++shadow_reset(void)
++{
++	if (hnsw_shadow_log)
++		fprintf(hnsw_shadow_log, "R\n");
++	hnsw_shadow.mem_allocated = 8192;
++	hnsw_shadow.avail = 8192 - 200 - 40;
++	memset(hnsw_shadow.nfree, 0, sizeof(hnsw_shadow.nfree));
++	hnsw_shadow.nextBlockSize = 8192;
++}
++
++static inline void
++shadow_alloc(Size size)
++{
++	int			fidx;
++	Size		chunk_size;
++	Size		blksize;
++
++	if (!SHADOW_ON())
++		return;
++	SHADOW_LOG("A %zu\n", size);
++	if (size > 8192)
++	{
++		hnsw_shadow.mem_allocated += MAXALIGN(size) + 40 + 8;
++		return;
++	}
++	fidx = shadow_fidx(size);
++	if (hnsw_shadow.nfree[fidx] > 0)
++	{
++		hnsw_shadow.nfree[fidx]--;
++		return;
++	}
++	chunk_size = ((Size) 8) << fidx;
++	if (hnsw_shadow.avail >= chunk_size + 8)
++	{
++		hnsw_shadow.avail -= chunk_size + 8;
++		return;
++	}
++	while (hnsw_shadow.avail >= 16)
++	{
++		Size		availchunk = hnsw_shadow.avail - 8;
++		int			a = shadow_fidx(availchunk);
++
++		if (availchunk != (((Size) 8) << a))
++		{
++			a--;
++			availchunk = ((Size) 8) << a;
++		}
++		hnsw_shadow.nfree[a]++;
++		hnsw_shadow.avail -= availchunk + 8;
++	}
++	blksize = hnsw_shadow.nextBlockSize;
++	hnsw_shadow.nextBlockSize <<= 1;
++	if (hnsw_shadow.nextBlockSize > 256 * 1024)
++		hnsw_shadow.nextBlockSize = 256 * 1024;
++	while (blksize < chunk_size + 40 + 8)
++		blksize <<= 1;
++	hnsw_shadow.mem_allocated += blksize;
++	hnsw_shadow.avail = blksize - 40 - chunk_size - 8;
++}
++
++static inline void
++shadow_free(Size size)
++{
++	if (!SHADOW_ON())
++		return;
++	SHADOW_LOG("F %zu\n", size);
++	if (size > 8192)
++	{
++		hnsw_shadow.mem_allocated -= MAXALIGN(size) + 40 + 8;
++		return;
++	}
++	hnsw_shadow.nfree[shadow_fidx(size)]++;
++}
++
++/* repalloc of a small chunk (aset.c AllocSetRealloc): grow only across classes */
++static inline void
++shadow_realloc(Size oldsize, Size newsize)
++{
++	if (!SHADOW_ON())
++		return;
++	if (oldsize <= 8192 && newsize <= 8192 && (((Size) 8) << shadow_fidx(oldsize)) >= newsize)
++		return;
++	shadow_alloc(newsize);
++	shadow_free(oldsize);
++}
++
++/* Account an lappend given the list state before it */
++static inline void
++shadow_lappend(List *before, int before_max, bool before_inline)
++{
++	if (before == NIL)
++	{
++		shadow_alloc(64);		/* new_list(1): 24 + 5 * 8 */
++		return;
++	}
++	if (before->length + 1 > before_max)
++	{
++		int			newmax = pg_nextpower2_32(Max(16, before->length + 1));
++
++		if (before_inline)
++			shadow_alloc(newmax * sizeof(ListCell));
++		else
++			shadow_realloc(before_max * sizeof(ListCell), newmax * sizeof(ListCell));
++	}
++}
++
++#define SHADOW_LAPPEND(lst, item) \
++	do { \
++		List *b_ = (lst); \
++		int bm_ = b_ ? b_->max_length : 0; \
++		bool bi_ = b_ ? b_->elements == b_->initial_elements : false; \
++		int bl_ = b_ ? b_->length : 0; \
++		(lst) = lappend((lst), (item)); \
++		shadow_lappend_len(b_ == NIL, bl_, bm_, bi_); \
++	} while (0)
++
++static inline void
++shadow_lappend_len(bool was_nil, int len, int max, bool was_inline)
++{
++	if (was_nil)
++	{
++		shadow_alloc(64);
++		return;
++	}
++	if (len + 1 > max)
++	{
++		int			newmax = pg_nextpower2_32(Max(16, len + 1));
++
++		if (was_inline)
++			shadow_alloc(newmax * sizeof(ListCell));
++		else
++			shadow_realloc(max * sizeof(ListCell), newmax * sizeof(ListCell));
++	}
++}
++
++/* list_free of a List built by lappend */
++static inline void
++shadow_list_free(int max, bool is_inline)
++{
++	if (!is_inline)
++		shadow_free(max * sizeof(ListCell));
++	shadow_free(64);
++}
++
++#endif
+diff -ruN /Users/jody/dev_projects/pgrust/crates/pgvector-0.8.7-reference/src/hnswutils.c pgv-src/src/hnswutils.c
+--- /Users/jody/dev_projects/pgrust/crates/pgvector-0.8.7-reference/src/hnswutils.c	2026-10-04 23:39:33
++++ pgv-src/src/hnswutils.c	2026-10-05 12:41:28
+@@ -7,6 +7,7 @@
+ #include "common/hashfn.h"
+ #include "fmgr.h"
+ #include "hnsw.h"
++#include "hnswshadow.h"
+ #include "lib/pairingheap.h"
+ #include "nodes/pg_list.h"
+ #include "port/atomics.h"
+@@ -287,6 +288,7 @@
+ 	HnswElement element = palloc_object(HnswElementData);
+ 	char	   *base = NULL;
+ 
++	shadow_alloc(sizeof(HnswElementData));
+ 	element->blkno = blkno;
+ 	element->offno = offno;
+ 	HnswPtrStore(base, element->neighbors, (HnswNeighborArrayPtr *) NULL);
+@@ -603,6 +605,7 @@
+ {
+ 	HnswSearchCandidate *sc = palloc_object(HnswSearchCandidate);
+ 
++	shadow_alloc(sizeof(HnswSearchCandidate));
+ 	HnswPtrStore(base, sc->element, element);
+ 	sc->distance = distance;
+ 	return sc;
+@@ -677,7 +680,12 @@
+ InitVisited(char *base, visited_hash * v, bool inMemory, int ef, int m)
+ {
+ 	if (!inMemory)
++	{
+ 		v->tids = tidhash_create(CurrentMemoryContext, ef * m * 2, NULL);
++		SHADOW_LOG("H %d %llu\n", ef * m * 2, (unsigned long long) v->tids->size);
++		shadow_alloc(sizeof(tidhash_hash));
++		shadow_alloc(sizeof(TidHashEntry) * v->tids->size);
++	}
+ 	else if (base != NULL)
+ 		v->offsets = offsethash_create(CurrentMemoryContext, ef * m * 2, NULL);
+ 	else
+@@ -695,8 +703,16 @@
+ 		HnswElement element = HnswPtrAccess(base, elementPtr);
+ 		ItemPointerData indextid;
+ 
++		uint64		oldsize = v->tids->size;
++
+ 		ItemPointerSet(&indextid, element->blkno, element->offno);
+ 		tidhash_insert(v->tids, indextid, found);
++		SHADOW_LOG("I %u %u %d %llu\n", element->blkno, element->offno, (int) *found, (unsigned long long) v->tids->size);
++		if (v->tids->size != oldsize)
++		{
++			shadow_alloc(sizeof(TidHashEntry) * v->tids->size);
++			shadow_free(sizeof(TidHashEntry) * oldsize);
++		}
+ 	}
+ 	else if (base != NULL)
+ 	{
+@@ -814,8 +830,19 @@
+ 		if (!ItemPointerIsValid(indextid))
+ 			break;
+ 
+-		tidhash_insert(v->tids, *indextid, &found);
++		{
++			uint64		oldsize = v->tids->size;
+ 
++			tidhash_insert(v->tids, *indextid, &found);
++			SHADOW_LOG("I %u %u %d %llu\n", ItemPointerGetBlockNumber(indextid), ItemPointerGetOffsetNumber(indextid), (int) found, (unsigned long long) v->tids->size);
++			if (v->tids->size != oldsize)
++			{
++				if (false) elog(INFO, "GROW members %u oldsize %llu fill %.3f", v->tids->members, (unsigned long long) oldsize, (double) v->tids->members / oldsize);
++				shadow_alloc(sizeof(TidHashEntry) * v->tids->size);
++				shadow_free(sizeof(TidHashEntry) * oldsize);
++			}
++		}
++
+ 		if (!found)
+ 			unvisited[(*unvisitedLength)++].indextid = *indextid;
+ 	}
+@@ -830,6 +857,7 @@
+ 	List	   *w = NIL;
+ 	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
+ 	pairingheap *W = pairingheap_allocate(CompareFurthestCandidates, NULL);
++	int			shadow_dummy_ = (shadow_alloc(sizeof(pairingheap)), shadow_alloc(sizeof(pairingheap)), 0);
+ 	int			wlen = 0;
+ 	visited_hash vh;
+ 	ListCell   *lc2;
+@@ -840,6 +868,9 @@
+ 	int			unvisitedLength;
+ 	bool		inMemory = index == NULL;
+ 
++	(void) shadow_dummy_;
++	shadow_alloc(sizeof(HnswUnvisited) * lm);
++
+ 	if (v == NULL)
+ 	{
+ 		v = &vh;
+@@ -851,7 +882,10 @@
+ 		InitVisited(base, v, inMemory, ef, m);
+ 
+ 		if (discarded != NULL)
++		{
+ 			*discarded = pairingheap_allocate(CompareNearestDiscardedCandidates, NULL);
++			shadow_alloc(sizeof(pairingheap));
++		}
+ 	}
+ 
+ 	/* Create local memory for neighborhood if needed */
+@@ -983,7 +1017,7 @@
+ 	{
+ 		HnswSearchCandidate *sc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+ 
+-		w = lappend(w, sc);
++		SHADOW_LAPPEND(w, sc);
+ 	}
+ 
+ 	return w;

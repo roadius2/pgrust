@@ -13,3 +13,4 @@ types_error = { path = "../types_error" }
 types_fmgr = { path = "../fmgr" }
 types_tuple = { path = "../types_tuple" }
 pairingheap = { path = "../../../backend/lib/pairingheap" }
+hashfn = { path = "../../../common/hashfn" }

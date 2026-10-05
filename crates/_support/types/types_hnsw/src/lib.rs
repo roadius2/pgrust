@@ -1,6 +1,9 @@
 //! hnsw.h vocabulary (pgvector): scan state lives here so relscan's
 //! IndexScanOpaque can hold it without a cycle through the AM crates.
 
+pub mod tmpctx;
+pub use tmpctx::*;
+
 use types_core::{BlockNumber, Oid};
 use types_fmgr::FmgrInfo;
 use types_tuple::itemptr::ItemPointerData;
