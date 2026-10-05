@@ -104,7 +104,7 @@ Keep these conventions when porting or changing code.
 
 ## Vector search (fork work)
 
-There is an existing pgvector 0.8.5 port (upstream commit `159b79a`; pgvector is now at 0.8.7):
+There is an existing pgvector port (upstream 0.8.5 commit `159b79a`, brought to 0.8.7 behavior for `vector` and HNSW in M1; the SQL script is still the trimmed 0.8.5 one):
 - `crates/contrib/pgvector`: the `vector` type, functions, aggregates and casts.
 - `crates/contrib/pgvector_hnsw` and `pgvector_hnsw_build`: the HNSW AM, using pgvector's page layout and GenericXLog.
 - `crates/_support/types/types_hnsw`.
@@ -122,6 +122,10 @@ scripts/pgvector/run-regress.sh pgrust [test ...]         # pgvector SQL suite; 
 scripts/pgvector/run-tap.sh pgrust [NNN_name.pl ...]      # TAP suite: C initdb + pgrust server via a hybrid bin dir
 scripts/pgvector/run-all.sh {pgrust|ref}                  # every tier + report; `ref` must always be all-green
 scripts/pgvector/tests/harness_test.sh                    # self-tests of the harness itself
+scripts/pgvector/server.sh {start|fresh|stop|psql} {pgrust|ref}  # manual servers on the harness ports
+scripts/pgvector/docker-ref.sh {up|down|psql}                  # pgvector/pgvector:0.8.7-pg18 reference (port 55493)
+scripts/pgvector/run-bytecmp.sh {pgrust|ref}                    # HNSW pages vs the seeded C build (pgvec-seeded, -DHNSW_MEMORY)
+scripts/pgvector/run-iterscan.sh {pgrust|ref}                   # iterative-scan stop points vs the seeded C build
 ```
 
-Baseline: `docs/superpowers/reports/pgvector-m0-baseline.md`.
+Stock C pgvector never seeds HNSW builds; `SET pgrust.hnsw_build_seed = 42` (an unregistered placeholder option) makes pgrust match the seeded C build. Baselines: `docs/superpowers/reports/pgvector-m0-baseline.md`, `docs/superpowers/reports/pgvector-m1-report.md`.

@@ -1,7 +1,9 @@
-//! pgvector 0.8.5 (github.com/pgvector/pgvector @ 159b79a) — the vector type,
-//! distance/arithmetic functions, and aggregates. v1 scope: vector type + hnsw
-//! (halfvec/sparsevec/bit opclasses and ivfflat are unported; the shipped
-//! extension script is trimmed accordingly).
+//! pgvector (github.com/pgvector/pgvector), ported from 0.8.5 @ 159b79a and
+//! brought to 0.8.7 behavior for the vector type: distance/arithmetic
+//! functions and aggregates. halfvec/sparsevec/bit and ivfflat are unported;
+//! the shipped extension script is still the trimmed vector--0.8.5.sql until
+//! M4 (spec §4.6). DIVERGENCE: pg_get_loaded_modules() reports 18.6 for this
+//! library; C reports PG_MODULE_MAGIC_EXT's "0.8.7" (vector.c:49). Revisit in M4.
 
 pub mod funcs;
 pub mod vec;

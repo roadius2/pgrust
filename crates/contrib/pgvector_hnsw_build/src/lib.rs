@@ -1,4 +1,4 @@
-//! pgvector 0.8.5 hnswbuild.c, serial rendering: in-memory graph phase in a
+//! pgvector 0.8.7 hnswbuild.c, serial rendering: in-memory graph phase in a
 //! bump arena (u32 element handles mirror C's graphCtx pointer sharing), flush
 //! to disk at maintenance_work_mem, then per-tuple on-disk inserts.
 
