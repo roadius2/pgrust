@@ -94,6 +94,15 @@ test_regress_identity() {
   "$here/../server.sh" stop pgrust >/dev/null 2>&1 || true
 }
 
+test_tap_ref() {
+  if "$here/../run-tap.sh" ref 015_hnsw_vector_duplicates.pl >/dev/null 2>&1; then
+    pass "tap ref: 015_hnsw_vector_duplicates"
+  else
+    fail "tap ref: 015_hnsw_vector_duplicates (see $PGV_WORK/tap/ref/prove)"
+  fi
+  if assert_reference_clean; then pass "tap: reference trees untouched"; else fail "tap: reference trees modified"; fi
+}
+
 # --- runner ---
 if [ "$#" -eq 0 ]; then
   # shellcheck disable=SC2046 # intentional splitting: function names have no spaces
