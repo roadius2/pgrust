@@ -83,15 +83,22 @@ test_regress_ref() {
 
 # Review focus 4: pgrust mode must refuse a server that isn't pgrust.
 test_regress_identity() {
-  local log="$PGV_WORK/identity-test.log"
-  if PGRUST_BIN="$PG_VEC/bin/postgres" "$here/../run-regress.sh" pgrust bit >"$log" 2>&1; then
+  local log="$PGV_WORK/identity-test.log" sentinel="$PGV_WORK/regress/pgrust/.identity-sentinel"
+  mkdir -p "$(dirname "$sentinel")"
+  : >"$sentinel"
+  # Isolated work dir: run-regress.sh wipes its output and data dirs first.
+  if PGV_WORK="$PGV_WORK/identity" PGRUST_BIN="$PG_VEC/bin/postgres" \
+    "$here/../run-regress.sh" pgrust bit >"$log" 2>&1; then
     fail "pgrust mode refuses a C server"
   elif grep -q 'not a pgrust server' "$log"; then
     pass "pgrust mode refuses a C server"
   else
     fail "pgrust mode refuses a C server: wrong error (see $log)"
   fi
-  "$here/../server.sh" stop pgrust >/dev/null 2>&1 || true
+  PGV_WORK="$PGV_WORK/identity" "$here/../server.sh" stop pgrust >/dev/null 2>&1 || true
+  # Self-tests must not destroy real results from the last pgrust run.
+  if [ -e "$sentinel" ]; then pass "identity test leaves pgrust results alone"; else fail "identity test wiped $PGV_WORK/regress/pgrust"; fi
+  rm -f "$sentinel"
 }
 
 test_tap_ref() {

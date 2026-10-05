@@ -111,4 +111,17 @@ There is an existing pgvector 0.8.5 port (upstream commit `159b79a`; pgvector is
 
 `halfvec`, `sparsevec`, the `bit` opclasses and `ivfflat` are **not ported**, and the extension script is trimmed to match. The SQL test files in `crates/contrib/pgvector/sql/` have no expected outputs in the repo.
 
-Direction and roadmap: `docs/Vector Search for pgrust Algorithm & Benchmark Survey.md`.
+Direction and roadmap: `docs/Vector Search for pgrust Algorithm & Benchmark Survey.md`. Phase 1 spec: `docs/superpowers/specs/2026-10-04-pgvector-phase1-design.md`; plans in `docs/superpowers/plans/`.
+
+The pristine upstream source is vendored at `crates/pgvector-0.8.7-reference/` (read-only, like the PG reference). Conformance harness: `scripts/pgvector/`. All state lives outside the repo in `~/.cache/pgrust/`.
+
+```bash
+scripts/pgvector/build-reference.sh      # once: C PG 18.6 + pgvector 0.8.7 under ~/.cache/pgrust/pgref-18.6
+scripts/pgvector/build-pgrust.sh         # target/fast-profile/postgres (needs `brew install re2 pkg-config`)
+scripts/pgvector/run-regress.sh pgrust [test ...]         # pgvector SQL suite; diffs in ~/.cache/pgrust/pgvector-work/regress/pgrust
+scripts/pgvector/run-tap.sh pgrust [NNN_name.pl ...]      # TAP suite: C initdb + pgrust server via a hybrid bin dir
+scripts/pgvector/run-all.sh {pgrust|ref}                  # every tier + report; `ref` must always be all-green
+scripts/pgvector/tests/harness_test.sh                    # self-tests of the harness itself
+```
+
+Baseline: `docs/superpowers/reports/pgvector-m0-baseline.md`.
