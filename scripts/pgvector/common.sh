@@ -36,3 +36,109 @@ ncpu() {
 pg_regress_bin() {
   echo "$("$PG_TOOLS/bin/pg_config" --pkglibdir)/pgxs/src/test/regress/pg_regress"
 }
+
+# --- pgrust binary and servers ---
+
+PGRUST_PROFILE="${PGRUST_PROFILE:-fast-profile}"
+PGRUST_BIN="${PGRUST_BIN:-$PGV_REPO/target/$PGRUST_PROFILE/postgres}"
+PGRUST_SERVER_OPTS=(-c listen_addresses= -c io_method=sync -c max_stack_depth=60000)
+
+port_for() {
+  case "$1" in
+    pgrust) echo "$PGV_PORT_PGRUST" ;;
+    ref) echo "$PGV_PORT_REF" ;;
+    *) die "unknown mode '$1' (expected pgrust or ref)" ;;
+  esac
+}
+
+# Runtime environment from the README quickstart. pgrust reads timezone data
+# from a PostgreSQL share dir; extensions come from its own staged
+# target/<profile>/share/extension first.
+pgrust_env() {
+  local share
+  share="$("$PG_TOOLS/bin/pg_config" --sharedir)"
+  export PGRUST_PGSHAREDIR="$share"
+  export PGRUST_TZDIR="$share/timezone"
+  export RUST_MIN_STACK=33554432
+}
+
+pgrust_ext_version() {
+  sed -n "s/^default_version = '\(.*\)'$/\1/p" \
+    "$(dirname "$PGRUST_BIN")/share/extension/vector.control" 2>/dev/null || true
+}
+
+pgv_psql() {
+  local port="$1"
+  shift
+  "$PG_TOOLS/bin/psql" -X -q -v ON_ERROR_STOP=1 -h "$PGV_WORK/sock" -p "$port" -U postgres -d postgres "$@"
+}
+
+wait_ready() {
+  local port="$1" i
+  for i in $(seq 1 120); do
+    if "$PG_TOOLS/bin/pg_isready" -q -h "$PGV_WORK/sock" -p "$port"; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+assert_identity() {
+  local mode="$1" port="$2" v
+  v="$(pgv_psql "$port" -Atc 'select version()')" || die "cannot query the server on port $port"
+  case "$mode:$v" in
+    "pgrust:"*"(pgrust "*) ;;
+    "pgrust:"*) die "port $port is not a pgrust server: $v" ;;
+    "ref:"*"(pgrust "*) die "port $port is a pgrust server, expected the C reference: $v" ;;
+    "ref:PostgreSQL 18.6"*) ;;
+    *) die "port $port runs an unexpected server: $v" ;;
+  esac
+}
+
+server_start() {
+  local mode="$1" data="$2" port="$3" log
+  mkdir -p "$PGV_WORK/sock" "$PGV_WORK/log"
+  if "$PG_TOOLS/bin/pg_isready" -q -h "$PGV_WORK/sock" -p "$port"; then
+    die "a server is already running on port $port; stop it first (scripts/pgvector/server.sh stop $mode)"
+  fi
+  if [ ! -d "$data" ]; then
+    "$PG_TOOLS/bin/initdb" -D "$data" --no-locale --encoding UTF8 -U postgres -A trust \
+      >"$PGV_WORK/log/initdb-$mode.log" 2>&1 || die "initdb failed; see $PGV_WORK/log/initdb-$mode.log"
+  fi
+  log="$PGV_WORK/log/server-$mode.log"
+  case "$mode" in
+    pgrust)
+      [ -x "$PGRUST_BIN" ] || die "missing $PGRUST_BIN; run scripts/pgvector/build-pgrust.sh"
+      (
+        pgrust_env
+        ulimit -s 65520
+        exec "$PGRUST_BIN" -D "$data" -k "$PGV_WORK/sock" -p "$port" "${PGRUST_SERVER_OPTS[@]}"
+      ) >"$log" 2>&1 &
+      ;;
+    ref)
+      (exec "$PG_VEC/bin/postgres" -D "$data" -k "$PGV_WORK/sock" -p "$port" -c listen_addresses=) >"$log" 2>&1 &
+      ;;
+    *) die "unknown mode '$mode' (expected pgrust or ref)" ;;
+  esac
+  echo $! >"$PGV_WORK/$mode.pid"
+  wait_ready "$port" || die "server ($mode) did not become ready; see $log"
+  assert_identity "$mode" "$port"
+}
+
+server_stop() {
+  local mode="$1" pidfile="$PGV_WORK/$1.pid" pid i
+  [ -f "$pidfile" ] || return 0
+  pid="$(cat "$pidfile")"
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -INT "$pid"
+    for i in $(seq 1 60); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.5
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      die "server ($mode, pid $pid) did not stop"
+    fi
+  fi
+  rm -f "$pidfile"
+}
