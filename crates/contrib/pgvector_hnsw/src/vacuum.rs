@@ -275,7 +275,7 @@ fn update_neighbors_on_disk_repair(
 ) -> PgResult<()> {
     let mut support = vs.support.clone();
     crate::insert::update_neighbors_on_disk(
-        vs.index, &mut support, pool, e_id, vs.m, true, false, vs.op_mcx,
+        vs.index, &mut support, pool, e_id, vs.m, false, vs.op_mcx,
     )
 }
 

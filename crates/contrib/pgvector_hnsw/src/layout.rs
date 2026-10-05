@@ -31,13 +31,14 @@ pub const fn neighbor_tuple_size(level: u8, m: i32) -> usize {
     maxalign(NEIGHBOR_TIDS_OFFSET + (level as usize + 2) * (m as usize) * SIZE_OF_ITEM_POINTER)
 }
 
-// HnswGetMaxLevel (hnsw.h) — integer division order preserved.
+// HnswGetMaxLevel (hnsw.h:133, capped at 63 since 0.8.6) — integer division
+// order preserved.
 pub fn hnsw_get_max_level(m: i32) -> i32 {
     let v = (BLCKSZ - SIZE_OF_PAGE_HEADER - HNSW_PAGE_OPAQUE_SIZE - NEIGHBOR_TIDS_OFFSET
         - SIZE_OF_ITEM_ID)
         / SIZE_OF_ITEM_POINTER
         / (m as usize);
-    ((v as i32) - 2).min(255)
+    ((v as i32) - 2).min(63)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -187,4 +188,19 @@ pub fn page_opaque_init(page: &mut [u8]) {
     page[off..off + 4].copy_from_slice(&INVALID_BLOCK.to_ne_bytes());
     page[off + 4..off + 6].copy_from_slice(&0u16.to_ne_bytes());
     page[off + 6..off + 8].copy_from_slice(&HNSW_PAGE_ID.to_ne_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // HnswGetMaxLevel (hnsw.h:133): (8152 / 6 / m) - 2, capped at 63 since 0.8.6.
+    #[test]
+    fn hnsw_get_max_level_caps_at_63() {
+        assert_eq!(hnsw_get_max_level(2), 63);
+        assert_eq!(hnsw_get_max_level(16), 63);
+        assert_eq!(hnsw_get_max_level(20), 63);
+        assert_eq!(hnsw_get_max_level(21), 62);
+        assert_eq!(hnsw_get_max_level(100), 11);
+    }
 }

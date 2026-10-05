@@ -466,10 +466,18 @@ pub fn load_neighbor_tids(
         UnlockReleaseBuffer(buf)?;
         return Ok(false);
     }
-    let start = (e.level as i32 - lc) * m;
+    // start = mul_size(element->level - lc, m) (hnswutils.c:789, 0.8.6+). A
+    // level below lc (corrupt metapage entry level) converts to a huge Size,
+    // so mul_size raises instead of indexing out of bounds.
+    let start = match mcx::mul_size((e.level as i32 - lc) as i64 as usize, m as usize) {
+        Ok(s) => s,
+        Err(err) => {
+            UnlockReleaseBuffer(buf)?;
+            return Err(err);
+        }
+    };
     for i in 0..lm as usize {
-        indextids[i]
-            .copy_from_slice(ntup.indextid_bytes(start as usize + i));
+        indextids[i].copy_from_slice(ntup.indextid_bytes(start + i));
     }
     UnlockReleaseBuffer(buf)?;
     Ok(true)

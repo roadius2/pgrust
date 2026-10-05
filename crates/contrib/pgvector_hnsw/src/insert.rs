@@ -530,7 +530,6 @@ fn update_neighbor_on_disk(
     lm: i32,
     lc: i32,
     index: &Relation<'_>,
-    check_existing: bool,
     building: bool,
     op_mcx: Mcx<'_>,
 ) -> PgResult<()> {
@@ -549,7 +548,8 @@ fn update_neighbor_on_disk(
     let ntup_bytes = item_bytes_at_mut(page, offno);
     let start_idx = (elem_level - lc) * m;
 
-    if check_existing && connection_exists(pool, new_element, ntup_bytes, start_idx, lm) {
+    // Check for existing connection (hnswinsert.c:503-505; upstream #1010).
+    if connection_exists(pool, new_element, ntup_bytes, start_idx, lm) {
         idx = -1;
     } else if idx == -2 {
         idx = -1;
@@ -589,7 +589,6 @@ pub fn update_neighbors_on_disk(
     pool: &mut ElementPool<'_>,
     e_id: u32,
     m: i32,
-    check_existing: bool,
     building: bool,
     op_mcx: Mcx<'_>,
 ) -> PgResult<()> {
@@ -614,7 +613,7 @@ pub fn update_neighbors_on_disk(
                 continue;
             }
             update_neighbor_on_disk(
-                pool, hc.element, e_id, idx, m, lm, lc, index, check_existing, building, op_mcx,
+                pool, hc.element, e_id, idx, m, lm, lc, index, building, op_mcx,
             )?;
         }
     }
@@ -745,7 +744,7 @@ fn update_graph_on_disk(
         )?;
     }
 
-    update_neighbors_on_disk(index, support, pool, element, m, false, building, op_mcx)?;
+    update_neighbors_on_disk(index, support, pool, element, m, building, op_mcx)?;
 
     let promote = match entry_point {
         None => true,
@@ -765,14 +764,23 @@ fn update_graph_on_disk(
     Ok(())
 }
 
-// HnswInitElement's level draw.
-pub fn random_level(ml: f64, max_level: i32) -> u8 {
-    let r = pg_prng::global_prng(|p| p.next_f64());
-    let mut level = (-(r.ln()) * ml) as i32;
+// HnswInitElement's level draw (hnswutils.c:250-255): a uniform of exactly
+// 0.0 takes maxLevel instead of computing -log(0); then the maxLevel cap.
+pub fn level_for_uniform(uniform: f64, ml: f64, max_level: i32) -> u8 {
+    let mut level = if uniform == 0.0 {
+        max_level
+    } else {
+        (-(uniform.ln()) * ml) as i32
+    };
     if level > max_level {
         level = max_level;
     }
     level as u8
+}
+
+// RandomDouble() (hnsw.h:105): pg_prng_double(&pg_global_prng_state).
+pub fn random_level(ml: f64, max_level: i32) -> u8 {
+    level_for_uniform(pg_prng::global_prng(|p| p.next_f64()), ml, max_level)
 }
 
 // HnswInsertTupleOnDisk. `value` is a detoasted (possibly normalized) image.
@@ -897,6 +905,16 @@ pub fn hnswinsert<'mcx>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // HnswInitElement (hnswutils.c:250-255, 0.8.7): uniform == 0.0 takes maxLevel.
+    #[test]
+    fn level_for_uniform_matches_c() {
+        let ml = hnsw_get_ml(16);
+        assert_eq!(level_for_uniform(0.0, ml, 63), 63);
+        assert_eq!(level_for_uniform(1e-10, ml, 63), 8);
+        assert_eq!(level_for_uniform(0.5, ml, 63), 0);
+        assert_eq!(level_for_uniform(1e-300, ml, 63), 63);
+    }
 
     // A stale bound must be refreshed, not reported: a concurrent inserter
     // appended blocks (and chain pages) after the walk read the block count.
