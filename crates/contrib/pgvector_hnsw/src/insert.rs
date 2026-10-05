@@ -783,6 +783,11 @@ pub fn random_level(ml: f64, max_level: i32) -> u8 {
     level_for_uniform(pg_prng::global_prng(|p| p.next_f64()), ml, max_level)
 }
 
+// SeedRandom(seed) (hnsw.h:106): pg_prng_seed(&pg_global_prng_state, seed).
+pub fn seed_random(seed: u64) {
+    pg_prng::global_prng(|p| p.seed(seed));
+}
+
 // HnswInsertTupleOnDisk. `value` is a detoasted (possibly normalized) image.
 pub fn insert_tuple_on_disk(
     index: &Relation<'_>,
@@ -911,6 +916,28 @@ pub fn hnswinsert<'mcx>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // SeedRandom(42) then RandomDouble() (hnsw.h:105-106) against C pg_prng.c.
+    #[test]
+    fn seed_random_42_level_stream_matches_c() {
+        seed_random(42);
+        for want in [
+            0x3fda7a16cd8c4e04u64, 0x3fcde1962a0eb130, 0x3fcf1aef3259d9b8, 0x3fb06e3c0092b080,
+            0x3f8e650b88680600, 0x3fc5f3da196c34f8, 0x3fe54b86c216e79c, 0x3fc910659855e9e8,
+        ] {
+            assert_eq!(pg_prng::global_prng(|p| p.next_f64()).to_bits(), want);
+        }
+        let (ml, max) = (hnsw_get_ml(16), crate::layout::hnsw_get_max_level(16));
+        seed_random(42);
+        let lv: Vec<u8> = (0..16).map(|_| random_level(ml, max)).collect();
+        assert_eq!(lv, [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
+        seed_random(42);
+        let mut h = [0u32; 4];
+        for _ in 0..1000 {
+            h[random_level(ml, max) as usize] += 1;
+        }
+        assert_eq!(h, [928, 68, 4, 0]);
+    }
 
     // HnswInitElement (hnswutils.c:250-255, 0.8.7): uniform == 0.0 takes maxLevel.
     #[test]

@@ -6,7 +6,7 @@ use bufmgr::{LockBuffer, MarkBufferDirty, UnlockReleaseBuffer, BUFFER_LOCK_EXCLU
 use datum::Datum;
 use execindexing::IndexInfo;
 use mcx::{Mcx, PgVec};
-use pgvector_hnsw::insert::{form_index_value, insert_tuple_on_disk, random_level};
+use pgvector_hnsw::insert::{form_index_value, insert_tuple_on_disk, random_level, seed_random};
 use pgvector_hnsw::layout::*;
 use pgvector_hnsw::utils::*;
 use types_core::{BlockNumber, Buffer, ForkNumber};
@@ -951,6 +951,30 @@ fn init_build_state<'a, 'g, 'mcx>(
     })
 }
 
+// pgrust.hnsw_build_seed: a placeholder customized option, deliberately NOT a
+// registered GUC (a pg_settings row would break byte-identical regression
+// outputs); read the way guc_tables/src/gather_fair.rs reads its option. Set to
+// N, a build calls SeedRandom(N) where BuildIndex calls SeedRandom(42) under
+// #ifdef HNSW_MEMORY (hnswbuild.c:1134-1136). Unset (the default) is stock C,
+// which never seeds.
+// DIVERGENCE (opt-in only): stock C has no such switch; the byte-identical and
+// iterative-scan tiers set 42 to match the -DHNSW_MEMORY reference build.
+fn hnsw_build_seed() -> Option<u64> {
+    // Uninstalled seam (unit-test binaries without a guc boot): stock C.
+    if !guc_seams::get_config_option_missing_ok::is_installed() {
+        return None;
+    }
+    parse_build_seed(
+        guc_seams::get_config_option_missing_ok::call("pgrust.hnsw_build_seed")
+            .ok()
+            .flatten(),
+    )
+}
+
+fn parse_build_seed(value: Option<String>) -> Option<u64> {
+    value.and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 fn build_index<'mcx>(
     mcx: Mcx<'mcx>,
     heap: Option<&Relation<'mcx>>,
@@ -958,6 +982,10 @@ fn build_index<'mcx>(
     index_info: Option<&mut IndexInfo<'mcx>>,
     fork_num: ForkNumber,
 ) -> PgResult<IndexBuildResult> {
+    // BuildIndex (hnswbuild.c:1134-1136): SeedRandom before InitBuildState.
+    if let Some(seed) = hnsw_build_seed() {
+        seed_random(seed);
+    }
     let graph_ctx = mcx::MemoryContext::new_bump("Hnsw build graph context");
     let gmcx = graph_ctx.mcx();
     let mut bs = init_build_state(heap, index, fork_num, gmcx)?;
@@ -1029,6 +1057,16 @@ pub fn hnswbuildempty(index: &Relation<'_>) -> PgResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_build_seed_accepts_only_unsigned_integers() {
+        assert_eq!(parse_build_seed(None), None);
+        assert_eq!(parse_build_seed(Some("42".to_string())), Some(42));
+        assert_eq!(parse_build_seed(Some(" 7 ".to_string())), Some(7));
+        assert_eq!(parse_build_seed(Some(String::new())), None);
+        assert_eq!(parse_build_seed(Some("-1".to_string())), None);
+        assert_eq!(parse_build_seed(Some("abc".to_string())), None);
+    }
 
     // C HnswUpdateConnection mutates neighbors->items[i].closer through the
     // shared candidate-list pointers; these tests pin that the in-memory port
