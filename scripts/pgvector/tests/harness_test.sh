@@ -63,6 +63,37 @@ test_servers() {
   done
 }
 
+# Review focus 1: suites must never write into the read-only reference trees.
+# --ignored matters: pgvector's .gitignore hides results/ and regression.*.
+assert_reference_clean() {
+  [ -z "$(git -C "$PGV_REPO" status --porcelain --ignored -- crates/pgvector-0.8.7-reference crates/postgres-18.6-reference)" ]
+}
+
+test_regress_ref() {
+  local n
+  if "$here/../run-regress.sh" ref >/dev/null 2>&1; then
+    pass "regress ref: exit 0"
+  else
+    fail "regress ref: exit 0 (see $PGV_WORK/regress/ref)"
+  fi
+  n="$(grep -c $'\tok$' "$PGV_WORK/regress/ref/summary.tsv" 2>/dev/null || true)"
+  if [ "$n" = 14 ]; then pass "regress ref: 14 ok"; else fail "regress ref: '$n' ok, want 14"; fi
+  if assert_reference_clean; then pass "regress: reference trees untouched"; else fail "regress: reference trees modified"; fi
+}
+
+# Review focus 4: pgrust mode must refuse a server that isn't pgrust.
+test_regress_identity() {
+  local log="$PGV_WORK/identity-test.log"
+  if PGRUST_BIN="$PG_VEC/bin/postgres" "$here/../run-regress.sh" pgrust bit >"$log" 2>&1; then
+    fail "pgrust mode refuses a C server"
+  elif grep -q 'not a pgrust server' "$log"; then
+    pass "pgrust mode refuses a C server"
+  else
+    fail "pgrust mode refuses a C server: wrong error (see $log)"
+  fi
+  "$here/../server.sh" stop pgrust >/dev/null 2>&1 || true
+}
+
 # --- runner ---
 if [ "$#" -eq 0 ]; then
   # shellcheck disable=SC2046 # intentional splitting: function names have no spaces
