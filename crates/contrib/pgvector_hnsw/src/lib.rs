@@ -1,9 +1,10 @@
 //! pgvector 0.8.5 hnsw AM (hnsw.c/hnswutils.c/hnswinsert.c/hnswscan.c/
 //! hnswvacuum.c), serial on-disk rendering; the in-memory build phase lives in
 //! pgvector_hnsw_build. DIVERGENCES (recorded): no parallel build (C falls back
-//! to serial when no workers launch); iterative-scan memory cap approximates
-//! C's MemoryContextMemAllocated with per-tuple estimates; level RNG uses the
-//! ported pg_global_prng (same generator, per-backend seeding).
+//! to serial when no workers launch); iterative-scan memory cap is a
+//! byte-exact model of C's so->tmpCtx (types_hnsw::tmpctx), charged at C's
+//! allocation points; level RNG uses the ported pg_global_prng (same
+//! generator, per-backend seeding).
 
 pub mod insert;
 pub mod layout;

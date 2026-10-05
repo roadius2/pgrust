@@ -263,6 +263,33 @@ test_bytecmp_identity() {
   fi
 }
 
+# Iterative-scan tier, C vs C: two fresh seeded clusters stop identically.
+test_iterscan_ref() {
+  local want n
+  want="$("$here/../run-iterscan.sh" --list | wc -l | tr -d ' ')"
+  if "$here/../run-iterscan.sh" ref >/dev/null 2>&1; then
+    pass "iterscan ref: exit 0"
+  else
+    fail "iterscan ref: exit 0 (see $PGV_WORK/iterscan/ref)"
+  fi
+  n="$(grep -c $'\tok$' "$PGV_WORK/iterscan/ref/summary.tsv" 2>/dev/null || true)"
+  if [ "$n" = "$want" ]; then pass "iterscan ref: $want ok"; else fail "iterscan ref: '$n' ok, want $want"; fi
+}
+
+# The cases must stop where they claim (reads the C-vs-C run above): the 64kB
+# case on the memory cap, the 300-tuple case on hnsw.max_scan_tuples, and a
+# doubled multiplier must scan further. 990 rows fail the filter in total.
+test_iterscan_cases() {
+  local a b t
+  removed() { sed -n 's/^Rows Removed by Filter: //p' "$PGV_WORK/iterscan/ref/oracle.$1.out" | head -1; }
+  a="$(removed relaxed_64k)"
+  b="$(removed relaxed_64k_x2)"
+  t="$(removed relaxed_tuples)"
+  if [ -n "$a" ] && [ "$a" -lt 990 ]; then pass "iterscan relaxed_64k stops early ($a removed)"; else fail "iterscan relaxed_64k: removed '$a', want < 990"; fi
+  if [ -n "$b" ] && [ -n "$a" ] && [ "$b" -gt "$a" ]; then pass "iterscan: multiplier x2 scans further ($a -> $b)"; else fail "iterscan: multiplier x2 removed '$b', want > '$a'"; fi
+  if [ -n "$t" ] && [ "$t" -lt 990 ]; then pass "iterscan relaxed_tuples stops early ($t removed)"; else fail "iterscan relaxed_tuples: removed '$t', want < 990"; fi
+}
+
 # --- runner ---
 if [ "$#" -eq 0 ]; then
   # Declaration order (declare -F would sort): a test may read the results of

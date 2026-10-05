@@ -108,8 +108,9 @@ pub struct HnswScanOpaqueData<'mcx> {
     pub tuples: i64,
     pub previous_distance: f64,
     pub max_memory: usize,
-    // Approximates C MemoryContextMemAllocated(tmpCtx) for the iterative cap.
-    pub mem_used: usize,
+    // so->tmpCtx's MemoryContextMemAllocated, modeled (tmpctx.rs): the
+    // iterative scan stops when it exceeds max_memory (hnswscan.c:264).
+    pub tmp_ctx: AllocSetModel,
     // value/w/visited/discarded live in C's so->tmpCtx, which hnswrescan
     // resets; here they are globally-allocated owned values so reassignment
     // in hnswrescan/hnswendscan frees them (bounded memory across rescans).
@@ -118,6 +119,9 @@ pub struct HnswScanOpaqueData<'mcx> {
     pub max_dimensions: i32,
     pub norm_is_l2: bool,
     pub w: Vec<HnswScanElement>,
-    pub visited: std::collections::HashSet<(BlockNumber, u16), rustc_hash::FxBuildHasher>,
+    // The allocation shape of the C List so->w in tmpCtx.
+    pub w_list: ListShape,
+    // so->v.tids (hnswscan.c:60): NULL until GetScanItems' layer-0 search.
+    pub visited: Option<TidHash>,
     pub discarded: Option<ScanDiscardedHeap>,
 }

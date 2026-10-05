@@ -4,7 +4,7 @@ use bufmgr::{
     BUFFER_LOCK_SHARE,
 };
 use datum::Datum;
-use mcx::{Mcx, PgFxHashMap, PgVec};
+use mcx::{Mcx, PgVec};
 use pairingheap::PairingHeap;
 use types_core::{BlockNumber, Buffer, ForkNumber, Oid};
 use types_error::{PgError, PgResult};
@@ -525,8 +525,6 @@ pub struct SearchCandidate {
     pub distance: f64,
 }
 
-pub type Visited<'v> = PgFxHashMap<'v, (BlockNumber, u16), ()>;
-
 // Search heaps over (distance, element). C's pairingheap_first is the
 // comparator's maximum; the pairingheap crate reproduces C's merge order, so
 // equal distances pop in C's order (which decides neighbor lists and the
@@ -570,8 +568,12 @@ pub struct SearchStats {
     pub visited_inserts: i64,
 }
 
-// HnswSearchLayer (on-disk form, index != NULL). Returns w emptied from the
-// furthest-first heap: furthest first, nearest last (C list order).
+// HnswSearchLayer (on-disk form, index != NULL; hnswutils.c:828-990). Returns
+// w emptied from the furthest-first heap: furthest first, nearest last (C list
+// order). `visited: None` is C's v == NULL (a local set, always initialized);
+// `discarded` is C's pairingheap **discarded, allocated at InitVisited.
+// `tmp_ctx` (scans only) is charged at C's tmpCtx allocation points; the
+// caller charges the returned w list (C's final lappends).
 #[allow(clippy::too_many_arguments)]
 pub fn search_layer_disk<'t>(
     pool: &mut ElementPool<'t>,
@@ -584,15 +586,44 @@ pub fn search_layer_disk<'t>(
     m: i32,
     inserting: bool,
     skip_element: Option<(BlockNumber, u16)>,
-    visited: &mut Visited<'_>,
-    mut discarded: Option<&mut ScanDiscardedHeap>,
+    visited: Option<&mut Option<TidHash>>,
+    discarded: Option<&mut Option<ScanDiscardedHeap>>,
     init_visited: bool,
     mut tuples: Option<&mut i64>,
+    mut tmp_ctx: Option<&mut AllocSetModel>,
 ) -> PgResult<PgVec<'t, SearchCandidate>> {
     let lm = hnsw_get_layer_m(m, lc);
+    // pairingheap_allocate C and W; palloc_array_checked(HnswUnvisited, lm)
+    // (hnswutils.c:831-832, 839).
+    if let Some(mem) = tmp_ctx.as_deref_mut() {
+        mem.palloc(PAIRINGHEAP_SIZE);
+        mem.palloc(PAIRINGHEAP_SIZE);
+        mem.palloc(HNSW_UNVISITED_SIZE * lm as usize);
+    }
     let mut c_heap = nearest_candidate_heap();
     let mut w_heap = furthest_candidate_heap();
     let mut wlen: i32 = 0;
+
+    // v == NULL: a local set, always initialized (hnswutils.c:843-847).
+    let mut local_visited: Option<TidHash> = None;
+    let (visited, init_visited) = match visited {
+        Some(v) => (v, init_visited),
+        None => (&mut local_visited, true),
+    };
+    let mut discarded = discarded;
+    if init_visited {
+        // InitVisited (hnswutils.c:849-855, 677-680): tidhash_create(ef * m * 2).
+        *visited = Some(TidHash::create((ef * m * 2) as u32, tmp_ctx.as_deref_mut()));
+        if let Some(slot) = discarded.as_deref_mut() {
+            if let Some(mem) = tmp_ctx.as_deref_mut() {
+                mem.palloc(PAIRINGHEAP_SIZE);
+            }
+            *slot = Some(new_scan_discarded_heap());
+        }
+    }
+    let visited = visited.as_mut().expect("visited set initialized");
+    let mut discarded: Option<&mut ScanDiscardedHeap> =
+        discarded.map(|slot| slot.as_mut().expect("discarded heap allocated at InitVisited"));
 
     // CountElement: skip elements being deleted when vacuuming.
     let count_element = |pool: &ElementPool<'_>, e: u32| -> bool {
@@ -604,8 +635,9 @@ pub fn search_layer_disk<'t>(
 
     for sc in ep.iter() {
         if init_visited {
+            // AddToVisited (hnswutils.c:870-877).
             let e = pool.get(sc.element);
-            visited.insert((e.blkno, e.offno), ());
+            visited.insert(e.blkno, e.offno, tmp_ctx.as_deref_mut());
             if let Some(t) = tuples.as_deref_mut() {
                 *t += 1;
             }
@@ -627,16 +659,16 @@ pub fn search_layer_disk<'t>(
             break;
         }
 
-        // HnswLoadUnvisitedFromDisk.
+        // HnswLoadUnvisitedFromDisk (hnswutils.c:800-822).
         unvisited.clear();
         if load_neighbor_tids(pool, c_elem, &mut tidbuf[..lm as usize], index, m, lm, lc)? {
             for tid in tidbuf[..lm as usize].iter() {
                 if !itemptr_is_valid(tid) {
                     break;
                 }
-                let key = itemptr_decode(tid);
-                if visited.insert(key, ()).is_none() {
-                    unvisited.push(key);
+                let (blkno, offno) = itemptr_decode(tid);
+                if !visited.insert(blkno, offno, tmp_ctx.as_deref_mut()) {
+                    unvisited.push((blkno, offno));
                 }
             }
         }
@@ -669,9 +701,17 @@ pub fn search_layer_disk<'t>(
             if !loaded {
                 continue;
             }
+            // HnswInitElementFromBlock for a loaded element (hnswutils.c:567-570).
+            if let Some(mem) = tmp_ctx.as_deref_mut() {
+                mem.palloc(HNSW_ELEMENT_DATA_SIZE);
+            }
 
             if !(e_distance < f_dist || always_add) {
                 if let Some(dh) = discarded.as_deref_mut() {
+                    // HnswInitSearchCandidate (hnswutils.c:944).
+                    if let Some(mem) = tmp_ctx.as_deref_mut() {
+                        mem.palloc(HNSW_SEARCH_CANDIDATE_SIZE);
+                    }
                     dh.add(pool.scan_element(id, e_distance));
                 }
                 continue;
@@ -682,6 +722,10 @@ pub fn search_layer_disk<'t>(
                 continue;
             }
 
+            // HnswInitSearchCandidate (hnswutils.c:956).
+            if let Some(mem) = tmp_ctx.as_deref_mut() {
+                mem.palloc(HNSW_SEARCH_CANDIDATE_SIZE);
+            }
             c_heap.add((e_distance, id));
             w_heap.add((e_distance, id));
 
@@ -967,13 +1011,8 @@ pub fn find_element_neighbors<'t>(
 
     let mut lc = entry_level;
     while lc >= level + 1 {
-        let mut visited: Visited<'_> = PgFxHashMap::with_capacity_and_hasher_in(
-            64,
-            Default::default(),
-            pool.mcx,
-        );
         ep = search_layer_disk(
-            pool, q, ep, 1, lc, index, support, m, true, skip, &mut visited, None, true, None,
+            pool, q, ep, 1, lc, index, support, m, true, skip, None, None, true, None, None,
         )?;
         lc -= 1;
     }
@@ -986,11 +1025,6 @@ pub fn find_element_neighbors<'t>(
     let mut lc = level;
     loop {
         let lm = hnsw_get_layer_m(m, lc);
-        let mut visited: Visited<'_> = PgFxHashMap::with_capacity_and_hasher_in(
-            (ef_construction * m * 2) as usize,
-            Default::default(),
-            pool.mcx,
-        );
         let w = search_layer_disk(
             pool,
             q,
@@ -1002,9 +1036,10 @@ pub fn find_element_neighbors<'t>(
             m,
             true,
             skip,
-            &mut visited,
+            None,
             None,
             true,
+            None,
             None,
         )?;
 

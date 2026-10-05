@@ -1,6 +1,6 @@
 use crate::utils::*;
 use datum::Datum;
-use mcx::{Mcx, PgBox, PgFxHashMap, PgVec};
+use mcx::{Mcx, PgBox, PgVec};
 use types_core::InvalidOid;
 use types_error::{PgError, PgResult};
 use types_fmgr::FmgrInfo;
@@ -41,13 +41,15 @@ pub fn hnswbeginscan<'mcx>(
         tuples: 0,
         previous_distance: f64::NEG_INFINITY,
         max_memory,
-        mem_used: 0,
+        // hnswscan.c:154-156
+        tmp_ctx: AllocSetModel::new(0, 8 * 1024, 256 * 1024),
         value: None,
         support,
         max_dimensions: HNSW_MAX_DIM as i32,
         norm_is_l2: false,
         w: Vec::new(),
-        visited: Default::default(),
+        w_list: ListShape::NIL,
+        visited: None,
         discarded: None,
     };
     relation_get_index_scan(
@@ -84,14 +86,15 @@ pub fn hnswrescan(
     let so = opaque(scan);
     so.first = true;
     so.tuples = 0;
-    so.mem_used = 0;
     so.previous_distance = f64::NEG_INFINITY;
-    // C: MemoryContextReset(so->tmpCtx) — value/w/visited/discarded live
-    // there. These are owned allocations, so reassignment frees them and
-    // memory stays bounded across arbitrarily many rescans.
+    // hnswrescan (hnswscan.c:176-182): v and discarded live in tmpCtx, which
+    // is reset. The owned values are dropped so memory stays bounded across
+    // arbitrarily many rescans.
+    so.tmp_ctx.reset();
     so.value = None;
     so.w = Vec::new();
-    so.visited = Default::default();
+    so.w_list = ListShape::NIL;
+    so.visited = None;
     so.discarded = None;
     Ok(())
 }
@@ -100,7 +103,8 @@ pub fn hnswendscan(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
     let so = opaque(scan);
     so.value = None;
     so.w = Vec::new();
-    so.visited = Default::default();
+    so.w_list = ListShape::NIL;
+    so.visited = None;
     so.discarded = None;
     Ok(())
 }
@@ -155,9 +159,6 @@ pub fn norm_value<'m>(mcx: Mcx<'m>, img: &[u8]) -> PgResult<PgVec<'m, u8>> {
     }
     Ok(b.image())
 }
-
-// Approximate C tmpCtx accounting: element + candidate + hash entry bytes.
-const SCAN_TUPLE_MEM: usize = 200;
 
 // Reloption invariants the rest of the HNSW code assumes, matching pgvector's
 // limits (2 <= m <= HNSW_MAX_M, 4 <= ef_construction <= 1000). Meta-page fields
@@ -233,40 +234,34 @@ fn get_scan_items(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
     let mut support = so.support.clone();
 
     let ep_id = pool.from_block(entry.blkno, entry.offno);
+    // HnswGetMetaPageInfo's HnswInitElementFromBlock (hnswutils.c:325).
+    so.tmp_ctx.palloc(HNSW_ELEMENT_DATA_SIZE);
     pool.get_mut(ep_id).level = entry.level;
     let mut ep_dist = 0.0f64;
     load_element(&mut pool, ep_id, Some(&mut ep_dist), q, &index, &mut support, false, None)?;
+    // HnswEntryCandidate's HnswInitSearchCandidate, then list_make1 (hnswscan.c:52).
+    so.tmp_ctx.palloc(HNSW_SEARCH_CANDIDATE_SIZE);
+    let _ = ListShape::lappend_n(1, &mut so.tmp_ctx);
 
     let mut ep: PgVec<'_, SearchCandidate> = mcx::vec_with_capacity_in_infallible(tmcx, 1);
     ep.push(SearchCandidate { element: ep_id, distance: ep_dist });
 
     let mut lc = entry.level as i32;
     while lc >= 1 {
-        let mut visited: Visited<'_> =
-            PgFxHashMap::with_capacity_and_hasher_in(64, Default::default(), tmcx);
+        // hnswscan.c:54-58: v == NULL; the previous ep List is not freed.
         ep = search_layer_disk(
-            &mut pool, q, ep, 1, lc, &index, &mut support, so.m, false, None, &mut visited,
-            None, true, None,
+            &mut pool, q, ep, 1, lc, &index, &mut support, so.m, false, None, None, None,
+            true, None, Some(&mut so.tmp_ctx),
         )?;
+        let _ = ListShape::lappend_n(ep.len(), &mut so.tmp_ctx);
         lc -= 1;
     }
 
     let ef_search = guc_tables::vars::hnsw_ef_search.read();
     // C reads the hnsw_iterative_scan GUC at each use (no cached copy).
     let iterative = guc_tables::vars::hnsw_iterative_scan.read() != HNSW_ITERATIVE_SCAN_OFF;
-    // GetScanItems passes &so->discarded only with iterative scans (hnswscan.c:60).
-    so.discarded = iterative.then(new_scan_discarded_heap);
-
-    // Layer-0 visited persists across iterations in so.visited. so.m is clamped
-    // to the reloption range by validate_meta_fields above, so this capacity is
-    // bounded; try_reserve keeps even a large ef_search from aborting on OOM.
-    let visited0_cap = (ef_search * so.m * 2).max(0) as usize;
-    let mut visited0: Visited<'_> =
-        PgFxHashMap::with_hasher_in(Default::default(), tmcx);
-    visited0
-        .try_reserve(visited0_cap)
-        .map_err(|_| tmcx.oom(visited0_cap))?;
     let mut tuples = so.tuples;
+    // hnswscan.c:60: &so->v, and &so->discarded only with iterative scans.
     let w = search_layer_disk(
         &mut pool,
         q,
@@ -278,22 +273,16 @@ fn get_scan_items(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
         so.m,
         false,
         None,
-        &mut visited0,
-        so.discarded.as_mut(),
+        Some(&mut so.visited),
+        if iterative { Some(&mut so.discarded) } else { None },
         true,
         Some(&mut tuples),
+        Some(&mut so.tmp_ctx),
     )?;
     so.tuples = tuples;
+    so.w_list = ListShape::lappend_n(w.len(), &mut so.tmp_ctx);
     so.support = support;
-
-    so.w = Vec::with_capacity(w.len());
-    for sc in w.iter() {
-        so.w.push(pool.scan_element(sc.element, sc.distance));
-    }
-    for key in visited0.keys() {
-        so.visited.insert(*key);
-    }
-    so.mem_used += pool.elems.len() * SCAN_TUPLE_MEM;
+    so.w = w.iter().map(|sc| pool.scan_element(sc.element, sc.distance)).collect();
     Ok(())
 }
 
@@ -325,10 +314,14 @@ fn resume_scan_items(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
 
     let mut ep: PgVec<'_, SearchCandidate> =
         mcx::vec_with_capacity_in_infallible(tmcx, batch_size as usize);
+    let mut ep_list = ListShape::NIL;
     {
         let dh = so.discarded.as_mut().expect("checked");
         for _ in 0..batch_size {
             let Some(e) = dh.remove_first() else { break };
+            // ep = lappend(ep, sc) (hnswscan.c:88): sc is an existing
+            // candidate, so only the List grows.
+            ep_list.lappend(&mut so.tmp_ctx);
             let id = pool.from_block(e.blkno, e.offno);
             let pe = pool.get_mut(id);
             pe.level = e.level;
@@ -341,17 +334,8 @@ fn resume_scan_items(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
         }
     }
 
-    // Bounded working copy of the persistent visited set keyed the same.
-    let mut visited: Visited<'_> = PgFxHashMap::with_capacity_and_hasher_in(
-        so.visited.len() + 256,
-        Default::default(),
-        tmcx,
-    );
-    for k in so.visited.iter() {
-        visited.insert(*k, ());
-    }
-
     let mut tuples = so.tuples;
+    // hnswscan.c:91: &so->v and &so->discarded, initVisited = false.
     let w = search_layer_disk(
         &mut pool,
         q,
@@ -363,22 +347,16 @@ fn resume_scan_items(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
         so.m,
         false,
         None,
-        &mut visited,
-        so.discarded.as_mut(),
+        Some(&mut so.visited),
+        Some(&mut so.discarded),
         false,
         Some(&mut tuples),
+        Some(&mut so.tmp_ctx),
     )?;
     so.tuples = tuples;
+    so.w_list = ListShape::lappend_n(w.len(), &mut so.tmp_ctx);
     so.support = support;
-
-    so.w = Vec::with_capacity(w.len());
-    for sc in w.iter() {
-        so.w.push(pool.scan_element(sc.element, sc.distance));
-    }
-    for key in visited.keys() {
-        so.visited.insert(*key);
-    }
-    so.mem_used += pool.elems.len() * SCAN_TUPLE_MEM;
+    so.w = w.iter().map(|sc| pool.scan_element(sc.element, sc.distance)).collect();
     Ok(())
 }
 
@@ -411,6 +389,12 @@ pub fn hnswgettuple(
             let mut support = so.support.clone();
             so.value = get_scan_value(&mut support, &orderby)?;
             so.support = support;
+            // HnswNormValue's palloc0(VECTOR_SIZE(dim)) in tmpCtx (hnswscan.c:115).
+            if so.support.normprocinfo.is_some() {
+                if let Some(v) = so.value.as_ref() {
+                    so.tmp_ctx.palloc(v.len());
+                }
+            }
         }
 
         lmgr::LockPage(&index, HNSW_SCAN_LOCK, types_storage::lock::ShareLock)?;
@@ -431,8 +415,9 @@ pub fn hnswgettuple(
             } else if so.discarded.is_none() {
                 (false, false, true)
             } else if so.tuples >= guc_tables::vars::hnsw_max_scan_tuples.read() as i64
-                || so.mem_used > so.max_memory
+                || so.tmp_ctx.mem_allocated() > so.max_memory
             {
+                // Reached max number of tuples or memory limit (hnswscan.c:264).
                 if so.discarded.as_ref().expect("some").is_empty() {
                     (false, false, true)
                 } else {
@@ -448,6 +433,8 @@ pub fn hnswgettuple(
         if drain_one {
             let so = opaque(scan);
             let e = so.discarded.as_mut().expect("some").remove_first().expect("nonempty");
+            // so->w = lappend(so->w, ...) (hnswscan.c:270).
+            so.w_list.lappend(&mut so.tmp_ctx);
             so.w.push(e);
         } else if need_resume {
             lmgr::LockPage(&index, HNSW_SCAN_LOCK, types_storage::lock::ShareLock)?;
@@ -463,6 +450,13 @@ pub fn hnswgettuple(
         let last = so.w.len() - 1;
         if so.w[last].heaptids_len == 0 {
             so.w.pop();
+            // list_delete_last, then pfree(element) and pfree(sc) with
+            // iterative scans (hnswscan.c:302-311).
+            so.w_list.delete_last(&mut so.tmp_ctx);
+            if guc_tables::vars::hnsw_iterative_scan.read() != HNSW_ITERATIVE_SCAN_OFF {
+                so.tmp_ctx.pfree(HNSW_ELEMENT_DATA_SIZE);
+                so.tmp_ctx.pfree(HNSW_SEARCH_CANDIDATE_SIZE);
+            }
             continue;
         }
         let sc_distance = so.w[last].distance;
