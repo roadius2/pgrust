@@ -73,68 +73,28 @@ pub struct HnswScanElement {
     pub distance: f64,
 }
 
-// Owned (global-allocator) storage: this heap persists across hnswgettuple
-// calls inside one scan, and C keeps it in so->tmpCtx which hnswrescan
-// resets — dropping/reassigning it must actually free.
-pub struct DistanceMinHeap {
-    pub items: Vec<HnswScanElement>,
-}
+// so->discarded (hnswscan.c; allocated with InitVisited, hnswutils.c:853-854):
+// a pairingheap ordered by CompareNearestDiscardedCandidates. It holds
+// self-contained copies of the discarded elements so it outlives each call's
+// element pool, and it is filled in the exact order C adds to it, so ties pop
+// in C's order. Owned (global allocator): hnswrescan drops it, as C's
+// MemoryContextReset(so->tmpCtx) frees it.
+pub type ScanDiscardedHeap =
+    pairingheap::PairingHeap<HnswScanElement, fn(&HnswScanElement, &HnswScanElement) -> i32>;
 
-impl Default for DistanceMinHeap {
-    fn default() -> Self {
-        Self::new()
+// CompareNearestDiscardedCandidates (hnswutils.c:647-656): nearest first.
+pub fn compare_nearest_discarded(a: &HnswScanElement, b: &HnswScanElement) -> i32 {
+    if a.distance < b.distance {
+        1
+    } else if a.distance > b.distance {
+        -1
+    } else {
+        0
     }
 }
 
-impl DistanceMinHeap {
-    pub fn new() -> Self {
-        DistanceMinHeap { items: Vec::new() }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
-    pub fn push(&mut self, e: HnswScanElement) {
-        self.items.push(e);
-        let mut i = self.items.len() - 1;
-        while i > 0 {
-            let parent = (i - 1) / 2;
-            if self.items[i].distance < self.items[parent].distance {
-                self.items.swap(i, parent);
-                i = parent;
-            } else {
-                break;
-            }
-        }
-    }
-
-    pub fn pop(&mut self) -> Option<HnswScanElement> {
-        if self.items.is_empty() {
-            return None;
-        }
-        let last = self.items.len() - 1;
-        self.items.swap(0, last);
-        let out = self.items.pop();
-        let n = self.items.len();
-        let mut i = 0;
-        loop {
-            let (l, r) = (2 * i + 1, 2 * i + 2);
-            let mut m = i;
-            if l < n && self.items[l].distance < self.items[m].distance {
-                m = l;
-            }
-            if r < n && self.items[r].distance < self.items[m].distance {
-                m = r;
-            }
-            if m == i {
-                break;
-            }
-            self.items.swap(i, m);
-            i = m;
-        }
-        out
-    }
+pub fn new_scan_discarded_heap() -> ScanDiscardedHeap {
+    ScanDiscardedHeap::new(compare_nearest_discarded)
 }
 
 // C HnswScanOpaqueData; `w` is furthest-first, last() = nearest.
@@ -156,5 +116,5 @@ pub struct HnswScanOpaqueData<'mcx> {
     pub norm_is_l2: bool,
     pub w: Vec<HnswScanElement>,
     pub visited: std::collections::HashSet<(BlockNumber, u16), rustc_hash::FxBuildHasher>,
-    pub discarded: Option<DistanceMinHeap>,
+    pub discarded: Option<ScanDiscardedHeap>,
 }

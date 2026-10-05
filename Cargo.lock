@@ -20586,6 +20586,7 @@ version = "0.1.0"
 dependencies = [
  "datum",
  "mcx",
+ "pairingheap",
  "rustc-hash",
  "types_core",
  "types_error",

@@ -5,6 +5,7 @@ use bufmgr::{
 };
 use datum::Datum;
 use mcx::{Mcx, PgFxHashMap, PgVec};
+use pairingheap::PairingHeap;
 use types_core::{BlockNumber, Buffer, ForkNumber, Oid};
 use types_error::{PgError, PgResult};
 use types_hnsw::*;
@@ -330,6 +331,23 @@ impl<'t> ElementPool<'t> {
                 .as_ptr() as usize,
         )
     }
+
+    // A self-contained copy of a loaded element for the scan's w list and
+    // discarded heap (C keeps HnswElement pointers into so->tmpCtx).
+    pub fn scan_element(&self, id: u32, distance: f64) -> HnswScanElement {
+        let e = self.get(id);
+        HnswScanElement {
+            blkno: e.blkno,
+            offno: e.offno,
+            level: e.level,
+            version: e.version,
+            heaptids: e.heaptids,
+            heaptids_len: e.heaptids_len,
+            neighbor_page: e.neighbor_page,
+            neighbor_offno: e.neighbor_offno,
+            distance,
+        }
+    }
 }
 
 // HnswGetDistance.
@@ -509,158 +527,42 @@ pub struct SearchCandidate {
 
 pub type Visited<'v> = PgFxHashMap<'v, (BlockNumber, u16), ()>;
 
-pub struct DiscardedHeap<'t> {
-    pub items: PgVec<'t, SearchCandidate>,
-}
+// Search heaps over (distance, element). C's pairingheap_first is the
+// comparator's maximum; the pairingheap crate reproduces C's merge order, so
+// equal distances pop in C's order (which decides neighbor lists and the
+// order of tied scan results).
+pub type CandHeap = PairingHeap<(f64, u32), fn(&(f64, u32), &(f64, u32)) -> i32>;
 
-impl<'t> DiscardedHeap<'t> {
-    pub fn new(mcx: Mcx<'t>) -> Self {
-        DiscardedHeap { items: mcx::vec_with_capacity_in_infallible(mcx, 0) }
-    }
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-    pub fn push(&mut self, sc: SearchCandidate) {
-        self.items.push(sc);
-        let mut i = self.items.len() - 1;
-        while i > 0 {
-            let parent = (i - 1) / 2;
-            if self.items[i].distance < self.items[parent].distance {
-                self.items.swap(i, parent);
-                i = parent;
-            } else {
-                break;
-            }
-        }
-    }
-    pub fn pop(&mut self) -> Option<SearchCandidate> {
-        if self.items.is_empty() {
-            return None;
-        }
-        let last = self.items.len() - 1;
-        self.items.swap(0, last);
-        let out = self.items.pop();
-        let n = self.items.len();
-        let mut i = 0;
-        loop {
-            let (l, r) = (2 * i + 1, 2 * i + 2);
-            let mut sm = i;
-            if l < n && self.items[l].distance < self.items[sm].distance {
-                sm = l;
-            }
-            if r < n && self.items[r].distance < self.items[sm].distance {
-                sm = r;
-            }
-            if sm == i {
-                break;
-            }
-            self.items.swap(i, sm);
-            i = sm;
-        }
-        out
+// CompareNearestCandidates (hnswutils.c:632-641): the nearest candidate first.
+pub fn compare_nearest_candidates(a: &(f64, u32), b: &(f64, u32)) -> i32 {
+    if a.0 < b.0 {
+        1
+    } else if a.0 > b.0 {
+        -1
+    } else {
+        0
     }
 }
 
-// Binary max/min heaps over (distance, candidate index): C's pairingheaps C
-// (nearest-first) and W (furthest-first) in HnswSearchLayer.
-struct MinHeapF {
-    v: Vec<(f64, u32)>,
-}
-struct MaxHeapF {
-    v: Vec<(f64, u32)>,
-}
-
-impl MinHeapF {
-    fn new() -> Self {
-        MinHeapF { v: Vec::new() }
-    }
-    fn push(&mut self, d: f64, x: u32) {
-        self.v.push((d, x));
-        let mut i = self.v.len() - 1;
-        while i > 0 {
-            let p = (i - 1) / 2;
-            if self.v[i].0 < self.v[p].0 {
-                self.v.swap(i, p);
-                i = p;
-            } else {
-                break;
-            }
-        }
-    }
-    fn pop(&mut self) -> Option<(f64, u32)> {
-        if self.v.is_empty() {
-            return None;
-        }
-        let last = self.v.len() - 1;
-        self.v.swap(0, last);
-        let out = self.v.pop();
-        let n = self.v.len();
-        let mut i = 0;
-        loop {
-            let (l, r) = (2 * i + 1, 2 * i + 2);
-            let mut sm = i;
-            if l < n && self.v[l].0 < self.v[sm].0 {
-                sm = l;
-            }
-            if r < n && self.v[r].0 < self.v[sm].0 {
-                sm = r;
-            }
-            if sm == i {
-                break;
-            }
-            self.v.swap(i, sm);
-            i = sm;
-        }
-        out
+// CompareFurthestCandidates (hnswutils.c:662-671): the furthest candidate first.
+pub fn compare_furthest_candidates(a: &(f64, u32), b: &(f64, u32)) -> i32 {
+    if a.0 < b.0 {
+        -1
+    } else if a.0 > b.0 {
+        1
+    } else {
+        0
     }
 }
 
-impl MaxHeapF {
-    fn new() -> Self {
-        MaxHeapF { v: Vec::new() }
-    }
-    fn push(&mut self, d: f64, x: u32) {
-        self.v.push((d, x));
-        let mut i = self.v.len() - 1;
-        while i > 0 {
-            let p = (i - 1) / 2;
-            if self.v[i].0 > self.v[p].0 {
-                self.v.swap(i, p);
-                i = p;
-            } else {
-                break;
-            }
-        }
-    }
-    fn first(&self) -> Option<(f64, u32)> {
-        self.v.first().copied()
-    }
-    fn pop(&mut self) -> Option<(f64, u32)> {
-        if self.v.is_empty() {
-            return None;
-        }
-        let last = self.v.len() - 1;
-        self.v.swap(0, last);
-        let out = self.v.pop();
-        let n = self.v.len();
-        let mut i = 0;
-        loop {
-            let (l, r) = (2 * i + 1, 2 * i + 2);
-            let mut sm = i;
-            if l < n && self.v[l].0 > self.v[sm].0 {
-                sm = l;
-            }
-            if r < n && self.v[r].0 > self.v[sm].0 {
-                sm = r;
-            }
-            if sm == i {
-                break;
-            }
-            self.v.swap(i, sm);
-            i = sm;
-        }
-        out
-    }
+// pairingheap_allocate(CompareNearestCandidates) (hnswutils.c:831).
+pub fn nearest_candidate_heap() -> CandHeap {
+    CandHeap::new(compare_nearest_candidates)
+}
+
+// pairingheap_allocate(CompareFurthestCandidates) (hnswutils.c:832).
+pub fn furthest_candidate_heap() -> CandHeap {
+    CandHeap::new(compare_furthest_candidates)
 }
 
 pub struct SearchStats {
@@ -683,13 +585,13 @@ pub fn search_layer_disk<'t>(
     inserting: bool,
     skip_element: Option<(BlockNumber, u16)>,
     visited: &mut Visited<'_>,
-    mut discarded: Option<&mut DiscardedHeap<'t>>,
+    mut discarded: Option<&mut ScanDiscardedHeap>,
     init_visited: bool,
     mut tuples: Option<&mut i64>,
 ) -> PgResult<PgVec<'t, SearchCandidate>> {
     let lm = hnsw_get_layer_m(m, lc);
-    let mut c_heap = MinHeapF::new();
-    let mut w_heap = MaxHeapF::new();
+    let mut c_heap = nearest_candidate_heap();
+    let mut w_heap = furthest_candidate_heap();
     let mut wlen: i32 = 0;
 
     // CountElement: skip elements being deleted when vacuuming.
@@ -708,8 +610,8 @@ pub fn search_layer_disk<'t>(
                 *t += 1;
             }
         }
-        c_heap.push(sc.distance, sc.element);
-        w_heap.push(sc.distance, sc.element);
+        c_heap.add((sc.distance, sc.element));
+        w_heap.add((sc.distance, sc.element));
         if count_element(pool, sc.element) {
             wlen += 1;
         }
@@ -719,8 +621,8 @@ pub fn search_layer_disk<'t>(
     let mut unvisited: Vec<(BlockNumber, u16)> = Vec::with_capacity(lm as usize);
     let mut tidbuf = [[0u8; 6]; 200];
 
-    while let Some((c_dist, c_elem)) = c_heap.pop() {
-        let (f_dist, _) = w_heap.first().expect("W nonempty while C nonempty");
+    while let Some((c_dist, c_elem)) = c_heap.remove_first() {
+        let (f_dist, _) = *w_heap.first().expect("W nonempty while C nonempty");
         if c_dist > f_dist {
             break;
         }
@@ -745,7 +647,7 @@ pub fn search_layer_disk<'t>(
 
         for &(blkno, offno) in unvisited.iter() {
             let always_add = wlen < ef;
-            let (f_dist, _) = w_heap.first().expect("W nonempty");
+            let (f_dist, _) = *w_heap.first().expect("W nonempty");
 
             let id = pool.from_block(blkno, offno);
             let mut e_distance = 0.0f64;
@@ -770,7 +672,7 @@ pub fn search_layer_disk<'t>(
 
             if !(e_distance < f_dist || always_add) {
                 if let Some(dh) = discarded.as_deref_mut() {
-                    dh.push(SearchCandidate { element: id, distance: e_distance });
+                    dh.add(pool.scan_element(id, e_distance));
                 }
                 continue;
             }
@@ -780,24 +682,23 @@ pub fn search_layer_disk<'t>(
                 continue;
             }
 
-            c_heap.push(e_distance, id);
-            w_heap.push(e_distance, id);
+            c_heap.add((e_distance, id));
+            w_heap.add((e_distance, id));
 
             if count_element(pool, id) {
                 wlen += 1;
                 if wlen > ef {
-                    let (d_dist, d_elem) = w_heap.pop().expect("W nonempty");
+                    let (d_dist, d_elem) = w_heap.remove_first().expect("W nonempty");
                     if let Some(dh) = discarded.as_deref_mut() {
-                        dh.push(SearchCandidate { element: d_elem, distance: d_dist });
+                        dh.add(pool.scan_element(d_elem, d_dist));
                     }
                 }
             }
         }
     }
 
-    let mut w: PgVec<'t, SearchCandidate> =
-        mcx::vec_with_capacity_in_infallible(pool.mcx, w_heap.v.len());
-    while let Some((d, x)) = w_heap.pop() {
+    let mut w: PgVec<'t, SearchCandidate> = mcx::vec_with_capacity_in_infallible(pool.mcx, 0);
+    while let Some((d, x)) = w_heap.remove_first() {
         w.push(SearchCandidate { element: x, distance: d });
     }
     Ok(w)
@@ -1196,5 +1097,21 @@ mod tests {
         let e = hnsw_check_dim(3, types_core::InvalidOid, d).unwrap_err();
         assert_eq!(e.message(), "expected 3 dimensions, not 2");
         assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_EXCEPTION);
+    }
+
+    // pairingheap_first is the comparator's maximum: C pops the nearest
+    // candidate (CompareNearestCandidates, hnswutils.c:632) and W the furthest
+    // (CompareFurthestCandidates, hnswutils.c:662).
+    #[test]
+    fn candidate_heaps_pop_in_c_order() {
+        let mut c = nearest_candidate_heap();
+        let mut w = furthest_candidate_heap();
+        for (d, e) in [(2.0, 1u32), (1.0, 2), (3.0, 3)] {
+            c.add((d, e));
+            w.add((d, e));
+        }
+        assert_eq!(c.remove_first(), Some((1.0, 2)));
+        assert_eq!(w.remove_first(), Some((3.0, 3)));
+        assert_eq!(w.first(), Some(&(2.0, 1)));
     }
 }

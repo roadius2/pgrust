@@ -156,21 +156,6 @@ pub fn norm_value<'m>(mcx: Mcx<'m>, img: &[u8]) -> PgResult<PgVec<'m, u8>> {
     Ok(b.image())
 }
 
-fn pool_elem_to_scan(pool: &ElementPool<'_>, sc: &SearchCandidate) -> HnswScanElement {
-    let e = pool.get(sc.element);
-    HnswScanElement {
-        blkno: e.blkno,
-        offno: e.offno,
-        level: e.level,
-        version: e.version,
-        heaptids: e.heaptids,
-        heaptids_len: e.heaptids_len,
-        neighbor_page: e.neighbor_page,
-        neighbor_offno: e.neighbor_offno,
-        distance: sc.distance,
-    }
-}
-
 // Approximate C tmpCtx accounting: element + candidate + hash entry bytes.
 const SCAN_TUPLE_MEM: usize = 200;
 
@@ -269,7 +254,8 @@ fn get_scan_items(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
     let ef_search = guc_tables::vars::hnsw_ef_search.read();
     // C reads the hnsw_iterative_scan GUC at each use (no cached copy).
     let iterative = guc_tables::vars::hnsw_iterative_scan.read() != HNSW_ITERATIVE_SCAN_OFF;
-    let mut discarded = iterative.then(|| DiscardedHeap::new(tmcx));
+    // GetScanItems passes &so->discarded only with iterative scans (hnswscan.c:60).
+    so.discarded = iterative.then(new_scan_discarded_heap);
 
     // Layer-0 visited persists across iterations in so.visited. so.m is clamped
     // to the reloption range by validate_meta_fields above, so this capacity is
@@ -293,7 +279,7 @@ fn get_scan_items(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
         false,
         None,
         &mut visited0,
-        discarded.as_mut(),
+        so.discarded.as_mut(),
         true,
         Some(&mut tuples),
     )?;
@@ -302,17 +288,10 @@ fn get_scan_items(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
 
     so.w = Vec::with_capacity(w.len());
     for sc in w.iter() {
-        so.w.push(pool_elem_to_scan(&pool, sc));
+        so.w.push(pool.scan_element(sc.element, sc.distance));
     }
     for key in visited0.keys() {
         so.visited.insert(*key);
-    }
-    if let Some(dh) = discarded {
-        let mut out = DistanceMinHeap::new();
-        for sc in dh.items.iter() {
-            out.push(pool_elem_to_scan(&pool, sc));
-        }
-        so.discarded = Some(out);
     }
     so.mem_used += pool.elems.len() * SCAN_TUPLE_MEM;
     Ok(())
@@ -349,7 +328,7 @@ fn resume_scan_items(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
     {
         let dh = so.discarded.as_mut().expect("checked");
         for _ in 0..batch_size {
-            let Some(e) = dh.pop() else { break };
+            let Some(e) = dh.remove_first() else { break };
             let id = pool.from_block(e.blkno, e.offno);
             let pe = pool.get_mut(id);
             pe.level = e.level;
@@ -372,7 +351,6 @@ fn resume_scan_items(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
         visited.insert(*k, ());
     }
 
-    let mut discarded = DiscardedHeap::new(tmcx);
     let mut tuples = so.tuples;
     let w = search_layer_disk(
         &mut pool,
@@ -386,7 +364,7 @@ fn resume_scan_items(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
         false,
         None,
         &mut visited,
-        Some(&mut discarded),
+        so.discarded.as_mut(),
         false,
         Some(&mut tuples),
     )?;
@@ -395,14 +373,10 @@ fn resume_scan_items(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
 
     so.w = Vec::with_capacity(w.len());
     for sc in w.iter() {
-        so.w.push(pool_elem_to_scan(&pool, sc));
+        so.w.push(pool.scan_element(sc.element, sc.distance));
     }
     for key in visited.keys() {
         so.visited.insert(*key);
-    }
-    let out = so.discarded.as_mut().expect("checked");
-    for sc in discarded.items.iter() {
-        out.push(pool_elem_to_scan(&pool, sc));
     }
     so.mem_used += pool.elems.len() * SCAN_TUPLE_MEM;
     Ok(())
@@ -473,7 +447,7 @@ pub fn hnswgettuple(
         }
         if drain_one {
             let so = opaque(scan);
-            let e = so.discarded.as_mut().expect("some").pop().expect("nonempty");
+            let e = so.discarded.as_mut().expect("some").remove_first().expect("nonempty");
             so.w.push(e);
         } else if need_resume {
             lmgr::LockPage(&index, HNSW_SCAN_LOCK, types_storage::lock::ShareLock)?;

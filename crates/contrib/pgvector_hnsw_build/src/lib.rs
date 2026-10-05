@@ -102,77 +102,18 @@ fn search_layer_mem(
     _m: i32,
 ) -> PgResult<Vec<(u32, f64)>> {
     let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    let mut c_heap: Vec<(f64, u32)> = Vec::new();
-    let mut w_heap: Vec<(f64, u32)> = Vec::new();
+    let mut c_heap = nearest_candidate_heap();
+    let mut w_heap = furthest_candidate_heap();
     let mut wlen: i32 = 0;
-
-    fn push_min(v: &mut Vec<(f64, u32)>, item: (f64, u32)) {
-        v.push(item);
-        let mut i = v.len() - 1;
-        while i > 0 {
-            let p = (i - 1) / 2;
-            if v[i].0 < v[p].0 {
-                v.swap(i, p);
-                i = p;
-            } else {
-                break;
-            }
-        }
-    }
-    fn pop_min(v: &mut Vec<(f64, u32)>) -> Option<(f64, u32)> {
-        heap_pop(v, |a, b| a < b)
-    }
-    fn push_max(v: &mut Vec<(f64, u32)>, item: (f64, u32)) {
-        v.push(item);
-        let mut i = v.len() - 1;
-        while i > 0 {
-            let p = (i - 1) / 2;
-            if v[i].0 > v[p].0 {
-                v.swap(i, p);
-                i = p;
-            } else {
-                break;
-            }
-        }
-    }
-    fn pop_max(v: &mut Vec<(f64, u32)>) -> Option<(f64, u32)> {
-        heap_pop(v, |a, b| a > b)
-    }
-    fn heap_pop(v: &mut Vec<(f64, u32)>, before: fn(f64, f64) -> bool) -> Option<(f64, u32)> {
-        if v.is_empty() {
-            return None;
-        }
-        let last = v.len() - 1;
-        v.swap(0, last);
-        let out = v.pop();
-        let n = v.len();
-        let mut i = 0;
-        loop {
-            let (l, r) = (2 * i + 1, 2 * i + 2);
-            let mut sm = i;
-            if l < n && before(v[l].0, v[sm].0) {
-                sm = l;
-            }
-            if r < n && before(v[r].0, v[sm].0) {
-                sm = r;
-            }
-            if sm == i {
-                break;
-            }
-            v.swap(i, sm);
-            i = sm;
-        }
-        out
-    }
 
     for (e, d) in ep.iter() {
         visited.insert(*e);
-        push_min(&mut c_heap, (*d, *e));
-        push_max(&mut w_heap, (*d, *e));
+        c_heap.add((*d, *e));
+        w_heap.add((*d, *e));
         wlen += 1;
     }
 
-    while let Some((c_dist, c_elem)) = pop_min(&mut c_heap) {
+    while let Some((c_dist, c_elem)) = c_heap.remove_first() {
         let (f_dist, _) = *w_heap.first().expect("W nonempty");
         if c_dist > f_dist {
             break;
@@ -197,17 +138,17 @@ fn search_layer_mem(
             if (graph.elems[e as usize].level as i32) < lc {
                 continue;
             }
-            push_min(&mut c_heap, (e_distance, e));
-            push_max(&mut w_heap, (e_distance, e));
+            c_heap.add((e_distance, e));
+            w_heap.add((e_distance, e));
             wlen += 1;
             if wlen > ef {
-                pop_max(&mut w_heap);
+                w_heap.remove_first();
             }
         }
     }
 
-    let mut w: Vec<(u32, f64)> = Vec::with_capacity(w_heap.len());
-    while let Some((d, e)) = pop_max(&mut w_heap) {
+    let mut w: Vec<(u32, f64)> = Vec::new();
+    while let Some((d, e)) = w_heap.remove_first() {
         w.push((e, d));
     }
     Ok(w)
