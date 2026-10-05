@@ -798,6 +798,12 @@ pub fn insert_tuple_on_disk(
     lmgr::LockPage(index, HNSW_UPDATE_LOCK, lockmode)?;
 
     let meta = read_meta(index)?;
+    // Check dimensions match index (hnswinsert.c:716-717).
+    crate::utils::hnsw_check_dim(
+        meta.dimensions as i32,
+        support.collation,
+        Datum::from_usize(value.as_ptr() as usize),
+    )?;
     let m = meta.m as i32;
     let ef_construction = hnsw_get_ef_construction(index);
     let mut entry = meta_entry_point(&meta);

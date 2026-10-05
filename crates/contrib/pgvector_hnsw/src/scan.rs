@@ -223,6 +223,15 @@ fn get_scan_items(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
     // Meta fields come from disk unvalidated; reject out-of-range values before
     // they drive the hash preallocation and layer buffers below.
     validate_meta_fields(meta.m as i32, meta.ef_construction as i32, meta.entry_level as i32)?;
+    // Check dimensions match index (hnswscan.c:42-44): only for a non-NULL
+    // value, and before the empty-index return below.
+    if let Some(v) = so.value.as_ref() {
+        hnsw_check_dim(
+            meta.dimensions as i32,
+            so.support.collation,
+            Datum::from_usize(v.as_ptr() as usize),
+        )?;
+    }
     so.m = meta.m as i32;
     let q = so
         .value

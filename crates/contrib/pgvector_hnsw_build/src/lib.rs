@@ -825,6 +825,9 @@ fn insert_tuple(
     };
     bs.support = support;
 
+    // Check dimensions match index (hnswbuild.c:503-504): the column typmod.
+    hnsw_check_dim(bs.dimensions, bs.support.collation, Datum::from_usize(img.as_ptr() as usize))?;
+
     if bs.graph.flushed {
         let mut support = bs.support.clone();
         let r = insert_tuple_on_disk(bs.index, &mut support, &img, heaptid, true);

@@ -76,6 +76,25 @@ pub fn check_type_supported(index: &Relation<'_>) -> PgResult<i32> {
     Ok(HNSW_MAX_DIM as i32)
 }
 
+// HnswCheckDim (hnswutils.c:1366-1374, pgvector 0.8.7). typeInfo->dimensions
+// is vector_dims for the vector opclasses (hnswutils.c:1407); the halfvec/
+// bit/sparsevec type info arrives in M3.
+pub fn hnsw_check_dim(expected: i32, collation: Oid, value: Datum) -> PgResult<()> {
+    let dim = types_fmgr::fcinfo::direct_function_call1_coll(
+        pgvector::funcs::fc_vector_dims,
+        collation,
+        value,
+    )?
+    .as_i32();
+    if dim != expected {
+        return Err(PgError::error(format!("expected {expected} dimensions, not {dim}"))
+            .with_sqlstate(types_error::ERRCODE_DATA_EXCEPTION)
+            .with_location("hnswutils.c", 1373, "HnswCheckDim")
+            .into());
+    }
+    Ok(())
+}
+
 #[inline]
 pub fn buf_page_mut(buffer: Buffer) -> PageMut<'static> {
     // SAFETY: caller holds the content lock required for its access mode.
@@ -1157,4 +1176,25 @@ pub fn relation_needs_wal(rel: &Relation<'_>) -> bool {
 
 pub fn heaptid_valid(t: &ItemPointerData) -> bool {
     ItemPointerIsValid(t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // HnswCheckDim (hnswutils.c:1366-1374): ERRCODE_DATA_EXCEPTION, C's text.
+    #[test]
+    fn hnsw_check_dim_matches_c() {
+        let ctx = mcx::MemoryContext::new("hnsw-test");
+        let m = ctx.mcx();
+        let mut b = pgvector::vec::VecBuilder::new(m, 2).unwrap();
+        b.set(0, 1.0);
+        b.set(1, 2.0);
+        let img = b.image();
+        let d = Datum::from_usize(img.as_ptr() as usize);
+        assert!(hnsw_check_dim(2, types_core::InvalidOid, d).is_ok());
+        let e = hnsw_check_dim(3, types_core::InvalidOid, d).unwrap_err();
+        assert_eq!(e.message(), "expected 3 dimensions, not 2");
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_EXCEPTION);
+    }
 }
