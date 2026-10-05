@@ -99,7 +99,7 @@ Every remaining failure keeps its M0 cause (`pgvector-m0-baseline.md`): types no
 ## What M1 established
 - Stock C pgvector never seeds HNSW builds (`SeedRandom(42)` is under `#ifdef HNSW_MEMORY`); `pgrust.hnsw_build_seed` reproduces the seeded build on demand.
 - With seed 42, pgrust's HNSW index pages are byte-identical to C's on tie-free and tie-heavy data, unlogged init forks and post-build inserts (bytecmp 10/10).
-- Iterative scans stop at exactly C's point (memory cap and tuple limit), through rescans (iterscan 7/7, including `lateral_64k`).
+- Iterative scans stop at C's point at every tested stop point (memory cap and tuple limit), through rescans (iterscan 7/7, including `lateral_64k`).
 
 ## Known divergences left open
 - Build memory accounting decides the spill point (`run-bytecmp.sh pgrust spill`: FAIL; C flushes after 1436 tuples, pgrust after 1840 at 1MB; pages differ in 526,983 masked bytes over 1,916,928); M6 reworks build memory.
@@ -112,3 +112,5 @@ Every remaining failure keeps its M0 cause (`pgvector-m0-baseline.md`): types no
 - The iterscan tier distinguishes only one memory-cap stop point on its 1000-row index: C's scan memory goes 48 KB to 80 KB peak, the smallest reachable cap is 65,792 B, and `relaxed_64k_x2` and `relaxed_128k` have the same cap and both exhaust the index.
 - It has no `vector_cosine_ops` case, so byte-level fidelity of the scan's memory charges rests on code review plus TAP 043/044.
 - Follow-up: add an `hnsw.ef_search` column, a larger table with several caps, and a cosine case.
+- Scan memory-charge emission order is checked end to end only at one cap transition; before M3 rewrites `scan.rs`, add either an event-stream diff (pgrust emits the B/R/A/F/C stream under a debug switch, diffed against a C trace of the same seed-42 query) or a larger tier (>=10k rows, caps 64k-512k, `hnsw.ef_search` variants, a lateral case whose later loops also hit the cap, a cosine case on data whose normalization is exact).
+- Review Focus 2 (a wrong-dimension query errors before the empty-index return; the insert and build `HnswCheckDim` sites) has no committed test; it was a one-off C-vs-pgrust SQL diff in M1 Task 4. M3, which edits all three call sites, should add a durable C-vs-pgrust SQL diff check for it.

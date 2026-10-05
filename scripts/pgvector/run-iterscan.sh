@@ -11,6 +11,8 @@
 #        run-iterscan.sh --list
 #   pgrust: the subject is pgrust (SET pgrust.hnsw_build_seed = 42).
 #   ref:    the subject is a second, fresh seeded C cluster (must always pass).
+#   PGV_KEEP_DATA=1 keeps each side's cluster under $PGV_WORK/iterscan/<mode>/data
+#           (default: deleted after a successful side, to save disk).
 set -euo pipefail
 . "$(dirname "$0")/common.sh"
 
@@ -82,6 +84,8 @@ run_side() {
 $CASES
 EOF
   server_stop "$kind"
+  # Nothing reads the cluster after this; PGV_KEEP_DATA=1 keeps it.
+  [ "${PGV_KEEP_DATA:-}" = 1 ] || rm -rf "$out/data/$label"
 }
 
 if [ "${1:-}" = --list ]; then

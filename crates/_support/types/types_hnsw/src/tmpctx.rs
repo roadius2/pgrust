@@ -602,6 +602,9 @@ mod tests {
                     let size = num();
                     assert_eq!(TidHash::create(n, None).size(), size, "tidhash_create({n})");
                 }
+                // tidhash insert `I <blkno> <offno> <found> <size>`: the trace
+                // patch emits it, but the model has no use for it.
+                b'I' => {}
                 b'C' => {
                     assert_eq!(m.mem_allocated() as u64, num(), "checkpoint {checks}: {line}");
                     checks += 1;

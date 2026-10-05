@@ -14,6 +14,8 @@
 #           the oracle and every case are deterministic (must always pass).
 #   PGV_BYTECMP_SUBJECT={pgrust|ref|seeded} overrides the subject (self-tests);
 #   PGV_BYTECMP_SEED= (empty) omits the SET (self-test of the opt-in seed).
+#   PGV_KEEP_DATA=1 keeps each side's cluster under $PGV_WORK/bytecmp/<mode>/data
+#           (default: deleted after a successful side, to save disk).
 #
 # The oracle is $PG_VEC_SEEDED (see common.sh): stock C pgvector does not seed
 # its level RNG at all (SeedRandom(42) sits under #ifdef HNSW_MEMORY), so only
@@ -172,6 +174,8 @@ run_side() {
         die "pagemask failed on $dir/$c.$rel"
     done <"$dir/$c.out"
   done
+  # Nothing reads the cluster after the copies; PGV_KEEP_DATA=1 keeps it.
+  [ "${PGV_KEEP_DATA:-}" = 1 ] || rm -rf "$out/data/$label"
 }
 
 # HnswMetaPageData.entryLevel (int16 at page offset 24 + 22): the graph height.

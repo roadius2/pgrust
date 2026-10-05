@@ -280,7 +280,7 @@ test_iterscan_ref() {
 # case on the memory cap, the 300-tuple case on hnsw.max_scan_tuples, and a
 # doubled multiplier must scan further. 990 rows fail the filter in total.
 test_iterscan_cases() {
-  local a b t
+  local a b t l
   removed() { sed -n 's/^Rows Removed by Filter: //p' "$PGV_WORK/iterscan/ref/oracle.$1.out" | head -1; }
   a="$(removed relaxed_64k)"
   b="$(removed relaxed_64k_x2)"
@@ -288,6 +288,11 @@ test_iterscan_cases() {
   if [ -n "$a" ] && [ "$a" -lt 990 ]; then pass "iterscan relaxed_64k stops early ($a removed)"; else fail "iterscan relaxed_64k: removed '$a', want < 990"; fi
   if [ -n "$b" ] && [ -n "$a" ] && [ "$b" -gt "$a" ]; then pass "iterscan: multiplier x2 scans further ($a -> $b)"; else fail "iterscan: multiplier x2 removed '$b', want > '$a'"; fi
   if [ -n "$t" ] && [ "$t" -lt 990 ]; then pass "iterscan relaxed_tuples stops early ($t removed)"; else fail "iterscan relaxed_tuples: removed '$t', want < 990"; fi
+  # lateral_64k must hit the cap in its first loop (x = 1000000): a loop the
+  # cap does not stop returns all 10 matching rows. Otherwise the
+  # rescan-after-cap coverage would silently vanish.
+  l="$(grep -c '^1000000|' "$PGV_WORK/iterscan/ref/oracle.lateral_64k.out" 2>/dev/null || true)"
+  if [ -n "$l" ] && [ "$l" -lt 10 ]; then pass "iterscan lateral_64k first loop hits the cap ($l of 10 rows)"; else fail "iterscan lateral_64k: first loop returned '$l' rows, want < 10 (cap not hit)"; fi
 }
 
 # --- runner ---

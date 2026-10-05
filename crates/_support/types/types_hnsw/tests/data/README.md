@@ -14,6 +14,7 @@ Events, one per line, in so->tmpCtx only:
 - `A <size>` palloc
 - `F <size>` pfree
 - `H <nelements> <buckets>` tidhash_create
+- `I <blkno> <offno> <found> <size>` tidhash insert (`replay_c_trace` ignores it)
 - `C <bytes> <tuples>` checkpoint: C's real `MemoryContextMemAllocated(so->tmpCtx, false)`
 
 `tmpctx.rs`'s `replay_c_trace` feeds A/F/R into `AllocSetModel` and requires
