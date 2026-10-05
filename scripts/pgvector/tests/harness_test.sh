@@ -3,6 +3,10 @@
 # usage: harness_test.sh [test_fn ...]   (default: every test_* function)
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
+# Self-tests run in their own work dir so they never replace real results or
+# stop real harness servers (only the Docker container name is shared).
+PGV_REAL_WORK="${PGV_WORK:-$HOME/.cache/pgrust/pgvector-work}"
+export PGV_WORK="$PGV_REAL_WORK/selftest"
 . "$here/../common.sh"
 
 fails=0
@@ -108,10 +112,61 @@ test_tap_ref() {
     fail "tap ref: 015_hnsw_vector_duplicates (see $PGV_WORK/tap/ref/prove)"
   fi
   if assert_reference_clean; then pass "tap: reference trees untouched"; else fail "tap: reference trees modified"; fi
+  # Global constraint: clusters use --no-locale (Cluster.pm otherwise inherits the shell's locale).
+  if grep -q 'initialized with locale "C"' \
+    "$PGV_WORK/tap/ref/log/015_hnsw_vector_duplicates/regress_log_015_hnsw_vector_duplicates" 2>/dev/null; then
+    pass "tap: clusters use --no-locale"
+  else
+    fail "tap: clusters not initialized with locale C"
+  fi
+}
+
+# Review focus 4 for TAP: pgrust mode must not count a C server's passes.
+test_tap_identity() {
+  local w="$PGV_WORK/tap-identity"
+  if PGV_WORK="$w" PGRUST_BIN="$PG_VEC/bin/postgres" \
+    "$here/../run-tap.sh" pgrust 015_hnsw_vector_duplicates.pl >"$w.log" 2>&1; then
+    fail "tap pgrust mode refuses a C server"
+  elif grep -q 'not a pgrust server' "$w.log"; then
+    pass "tap pgrust mode refuses a C server"
+  else
+    fail "tap pgrust mode refuses a C server: wrong error (see $w.log)"
+  fi
+}
+
+# Self-tests must never replace the results of a real run.
+test_selftest_isolation() {
+  local sentinel="$PGV_REAL_WORK/regress/ref/.selftest-sentinel"
+  mkdir -p "$(dirname "$sentinel")"
+  : >"$sentinel"
+  "$here/../run-regress.sh" ref bit >/dev/null 2>&1 || true
+  if [ -e "$sentinel" ]; then pass "self-tests leave real results alone"; else fail "self-tests wiped $PGV_REAL_WORK/regress/ref"; fi
+  rm -f "$sentinel"
+}
+
+# A stale pidfile (crash, reboot, pid reuse) must never get an unrelated process signalled.
+test_server_stop_stale_pidfile() {
+  local pid
+  # perl restores default SIGINT handling (bash ignores SIGINT in background jobs).
+  perl -e '$SIG{INT} = "DEFAULT"; sleep 300' &
+  pid=$!
+  mkdir -p "$PGV_WORK"
+  echo "$pid" >"$PGV_WORK/ref.pid"
+  "$here/../server.sh" stop ref >/dev/null 2>&1 || true
+  sleep 0.5
+  if kill -0 "$pid" 2>/dev/null; then
+    pass "stale pidfile: unrelated process untouched"
+  else
+    fail "stale pidfile: unrelated process was signalled"
+  fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  rm -f "$PGV_WORK/ref.pid"
 }
 
 test_docker() {
-  local ext coll
+  local ext coll before after
+  before="$(docker volume ls -q -f dangling=true | wc -l | tr -d ' ')"
   if ! "$here/../docker-ref.sh" up >/dev/null 2>&1; then
     fail "docker: up"
     return
@@ -122,6 +177,9 @@ test_docker() {
   coll="$("$here/../docker-ref.sh" psql -Atc "select datcollate from pg_database where datname = 'postgres'" 2>&1 || true)"
   if [ "$coll" = C ]; then pass "docker: C collation"; else fail "docker: datcollate '$coll'"; fi
   if "$here/../docker-ref.sh" down >/dev/null 2>&1; then pass "docker: down"; else fail "docker: down"; fi
+  # The image declares VOLUME; removing the container must not leave it dangling.
+  after="$(docker volume ls -q -f dangling=true | wc -l | tr -d ' ')"
+  if [ "$after" -le "$before" ]; then pass "docker: no leaked volume"; else fail "docker: leaked $((after - before)) anonymous volume(s)"; fi
 }
 
 # --- runner ---

@@ -13,7 +13,7 @@ shift
 case "$cmd" in
   up)
     docker info >/dev/null 2>&1 || die "Docker daemon not reachable; start Docker Desktop"
-    docker rm -f "$name" >/dev/null 2>&1 || true
+    docker rm -f -v "$name" >/dev/null 2>&1 || true
     docker run -d --name "$name" -p "127.0.0.1:$PGV_PORT_DOCKER:5432" \
       -e POSTGRES_HOST_AUTH_METHOD=trust \
       -e POSTGRES_INITDB_ARGS="--no-locale --encoding=UTF8" \
@@ -27,7 +27,7 @@ case "$cmd" in
     done
     die "docker reference did not become ready; see: docker logs $name"
     ;;
-  down) docker rm -f "$name" >/dev/null ;;
+  down) docker rm -f -v "$name" >/dev/null ;;
   psql) "$PG_TOOLS/bin/psql" -X -q -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$PGV_PORT_DOCKER" -U postgres -d postgres "$@" ;;
   *) die "unknown command '$cmd'" ;;
 esac

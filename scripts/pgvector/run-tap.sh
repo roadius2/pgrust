@@ -65,14 +65,22 @@ for t in "${tests[@]}"; do
     export PATH="$bin_path:$PATH"
     export PERL5LIB="$PGV_PERL5LIB${PERL5LIB:+:$PERL5LIB}"
     export TESTDIR="$out" TESTDATADIR="$out/data/$name" TESTLOGDIR="$out/log/$name"
+    # Global constraint: C-locale clusters (Cluster.pm otherwise inherits the shell's).
+    export PG_TEST_INITDB_EXTRA_OPTS="--no-locale --encoding=UTF8"
     PG_REGRESS="$(pg_regress_bin)"
     export PG_REGRESS
     prove -v -I "$PG_SRC/src/test/perl" -I "$PGV_SRC/test/perl" "$t"
   ) >"$out/prove/$name.log" 2>&1; then
-    printf '%s\tok\n' "$name" | tee -a "$out/summary.tsv"
+    result=ok
+    # A pass only counts for pgrust if pgrust actually served it.
+    if [ "$mode" = pgrust ] && ! grep -qs 'starting pgrust' "$out/log/$name"/*.log; then
+      echo "error: $name: not a pgrust server ($PGRUST_BIN never logged 'starting pgrust')" >&2
+      result=FAIL
+    fi
   else
-    printf '%s\tFAIL\n' "$name" | tee -a "$out/summary.tsv"
+    result=FAIL
   fi
+  printf '%s\t%s\n' "$name" "$result" | tee -a "$out/summary.tsv"
 done
 
 passed="$(grep -c $'\tok$' "$out/summary.tsv" || true)"

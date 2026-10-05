@@ -130,6 +130,14 @@ server_stop() {
   local mode="$1" pidfile="$PGV_WORK/$1.pid" pid i
   [ -f "$pidfile" ] || return 0
   pid="$(cat "$pidfile")"
+  # Signal only a postgres binary: after a crash or reboot the pid may be reused.
+  case "$(ps -p "$pid" -o command= 2>/dev/null || true)" in
+    */postgres | */postgres\ *) ;;
+    *)
+      rm -f "$pidfile"
+      return 0
+      ;;
+  esac
   if kill -0 "$pid" 2>/dev/null; then
     kill -INT "$pid"
     for i in $(seq 1 60); do

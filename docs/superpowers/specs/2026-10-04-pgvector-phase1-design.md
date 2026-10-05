@@ -190,7 +190,11 @@ Every error message is copied verbatim with C's SQLSTATE, about 20 per type. Tex
 ## 8. Testing and verification
 
 ### 8.1 Reference builds
-- **Local reference (dev loop):** PostgreSQL 18.6 built from `crates/postgres-18.6-reference`, plus pgvector 0.8.7 built from `crates/pgvector-0.8.7-reference` with the Docker image's compiler flags. Both install into one prefix (default `/tmp/pgrust_pginstall`, which `crates/backend/commands/matview/tests/refresh_freeze_e2e.rs` already probes). This build is needed for two reasons:
+- **Local reference (dev loop):** PostgreSQL 18.6 built from `crates/postgres-18.6-reference`, plus pgvector 0.8.7 built from `crates/pgvector-0.8.7-reference` with the Docker image's compiler flags (`make OPTFLAGS=""`). `scripts/pgvector/build-reference.sh` builds two installs under `$PGREF` (default `~/.cache/pgrust/pgref-18.6`):
+  - `pg`: PostgreSQL 18.6 only. pgrust reads its share directory and uses its `initdb`, `pg_ctl`, `psql` and `pg_regress`.
+  - `pgvec`: a copy of `pg` plus C pgvector, used as the reference server. It's kept separate so pgrust never sees C pgvector's control or upgrade scripts.
+  
+  (An earlier draft named the single prefix `/tmp/pgrust_pginstall`, which `crates/backend/commands/matview/tests/refresh_freeze_e2e.rs` probes. That test can be pointed at `$PGREF/pg` through `PGINSTALL`.) This build is needed for two reasons:
   - C `pg_ctl` and `initdb` require the `postgres` binary's version string to match theirs exactly, so the C tools must be exactly 18.6.
   - Using the same OS as pgrust avoids cross-OS problems when exchanging data directories.
   
@@ -231,8 +235,8 @@ Every error message is copied verbatim with C's SQLSTATE, about 20 per type. Tex
 | # | Milestone | Exit criteria |
 |---|---|---|
 | M0 | Vendor the pgvector reference; build the local reference; write the `scripts/pgvector/` runners. **Spikes:** (1) the hybrid TAP setup running one pgvector TAP test end to end; (2) the regression suite against current pgrust. | One TAP test passes end to end; a baseline report of what passes today |
-| M1 | 0.8.7 catch-up for `vector` and HNSW, plus the seed-42 fix | Regression files `vector_type`, `btree`, `copy` and `hnsw_vector` pass; byte-identical HNSW tier passes for `vector` |
-| M2 | `halfvec`, `sparsevec`, `bit` functions | Regression files `halfvec`, `sparsevec`, `bit` and `cast` pass; exhaustive f16 test passes; exact differential is clean |
+| M1 | 0.8.7 catch-up for `vector` and HNSW, plus the seed-42 fix | Regression files `vector_type` and `hnsw_vector` pass; byte-identical HNSW tier passes for `vector` |
+| M2 | `halfvec`, `sparsevec`, `bit` functions | Regression files `halfvec`, `sparsevec`, `bit`, `cast`, `btree` and `copy` pass (`btree` and `copy` also cover `halfvec` and `sparsevec`, so they move here from M1); exhaustive f16 test passes; exact differential is clean |
 | M3 | HNSW type info and opclasses for all types | Regression files `hnsw_bit`, `hnsw_halfvec` and `hnsw_sparsevec` pass, plus all HNSW TAP tests (serial builds) |
 | M4 | IVFFlat serial port; switch to the verbatim 0.8.7 script and upgrade scripts | Regression files `ivfflat_bit`, `ivfflat_halfvec` and `ivfflat_vector` pass, plus all IVFFlat TAP tests; lookup-coverage test passes. All 14 regression files now pass. |
 | M5 | On-disk tiers | Forward gate passes (clean, crash, 0.8.1 upgrade); reverse report produced |
