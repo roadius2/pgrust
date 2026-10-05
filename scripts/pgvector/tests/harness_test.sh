@@ -103,6 +103,20 @@ test_tap_ref() {
   if assert_reference_clean; then pass "tap: reference trees untouched"; else fail "tap: reference trees modified"; fi
 }
 
+test_docker() {
+  local ext coll
+  if ! "$here/../docker-ref.sh" up >/dev/null 2>&1; then
+    fail "docker: up"
+    return
+  fi
+  pass "docker: up"
+  ext="$("$here/../docker-ref.sh" psql -Atc 'create extension if not exists vector; select extversion from pg_extension where extname = $$vector$$' 2>&1 || true)"
+  if [ "$ext" = 0.8.7 ]; then pass "docker: pgvector 0.8.7"; else fail "docker: extversion '$ext'"; fi
+  coll="$("$here/../docker-ref.sh" psql -Atc "select datcollate from pg_database where datname = 'postgres'" 2>&1 || true)"
+  if [ "$coll" = C ]; then pass "docker: C collation"; else fail "docker: datcollate '$coll'"; fi
+  if "$here/../docker-ref.sh" down >/dev/null 2>&1; then pass "docker: down"; else fail "docker: down"; fi
+}
+
 # --- runner ---
 if [ "$#" -eq 0 ]; then
   # shellcheck disable=SC2046 # intentional splitting: function names have no spaces
