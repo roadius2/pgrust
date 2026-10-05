@@ -173,6 +173,26 @@ fn insert_append_page(
     Ok((nbuf, npage))
 }
 
+// Bound on the AddElementOnDisk page-chain walk (pgrust-only; C trusts the
+// chain). A cycle-free walk visits distinct blocks that all exist: a page is
+// linked only after insert_append_page extended the relation, and HNSW never
+// truncates. So once `walked` reaches the current block count, the chain
+// revisited a block. The count read before the walk goes stale when
+// concurrent inserters extend the relation (and the chain) meanwhile, so it
+// is re-read (smgrnblocks asks the file system outside recovery) before
+// concluding that.
+fn chain_walk_exceeds_bound(
+    walked: BlockNumber,
+    max_blocks: &mut BlockNumber,
+    nblocks: impl FnOnce() -> PgResult<BlockNumber>,
+) -> PgResult<bool> {
+    if walked < *max_blocks {
+        return Ok(false);
+    }
+    *max_blocks = nblocks()?;
+    Ok(walked >= *max_blocks)
+}
+
 // AddElementOnDisk.
 #[allow(clippy::too_many_arguments)]
 fn add_element_on_disk(
@@ -211,18 +231,18 @@ fn add_element_on_disk(
 
     // The page-chain walk below follows on-disk `nextblkno` links, which are
     // untrusted (a hostile/corrupt page image can point them into a cycle).
-    // Bound the walk by the relation's block count: a cycle-free chain visits
-    // only distinct existing blocks, so more than `max_blocks` iterations
-    // proves the chain does not terminate. Each iteration also services
-    // pending interrupts so a long (or cyclic) walk stays cancellable, and a
-    // bound overrun raises a catchable index-corruption error rather than
-    // spinning INSERT forever.
-    let max_blocks = bufmgr::RelationGetNumberOfBlocksInFork(index, ForkNumber::MAIN_FORKNUM)?;
+    // chain_walk_exceeds_bound turns a cycle into a catchable index-corruption
+    // error instead of an endless INSERT. Each iteration also services pending
+    // interrupts so a long walk stays cancellable.
+    let mut max_blocks =
+        bufmgr::RelationGetNumberOfBlocksInFork(index, ForkNumber::MAIN_FORKNUM)?;
     let mut walked: BlockNumber = 0;
 
     loop {
         postgres_seams::check_for_interrupts::call()?;
-        if walked >= max_blocks {
+        if chain_walk_exceeds_bound(walked, &mut max_blocks, || {
+            bufmgr::RelationGetNumberOfBlocksInFork(index, ForkNumber::MAIN_FORKNUM)
+        })? {
             return Err(PgError::error(format!(
                 "hnsw index \"{}\" page chain does not terminate (cycle detected)",
                 index.name()
@@ -872,4 +892,36 @@ pub fn hnswinsert<'mcx>(
     };
     insert_tuple_on_disk(index, &mut support, &img, heap_tid, false)?;
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A stale bound must be refreshed, not reported: a concurrent inserter
+    // appended blocks (and chain pages) after the walk read the block count.
+    #[test]
+    fn chain_walk_bound_refreshes_when_relation_grew() {
+        let mut max_blocks: BlockNumber = 3;
+        let exceeded = chain_walk_exceeds_bound(3, &mut max_blocks, || Ok(5)).unwrap();
+        assert!(!exceeded);
+        assert_eq!(max_blocks, 5);
+    }
+
+    // A real cycle keeps walking past every refreshed bound.
+    #[test]
+    fn chain_walk_bound_reports_cycle_when_relation_did_not_grow() {
+        let mut max_blocks: BlockNumber = 5;
+        assert!(chain_walk_exceeds_bound(5, &mut max_blocks, || Ok(5)).unwrap());
+    }
+
+    // Under the bound the block count is not re-read at all.
+    #[test]
+    fn chain_walk_bound_under_bound_does_not_refresh() {
+        let mut max_blocks: BlockNumber = 5;
+        let exceeded =
+            chain_walk_exceeds_bound(2, &mut max_blocks, || panic!("must not re-read")).unwrap();
+        assert!(!exceeded);
+        assert_eq!(max_blocks, 5);
+    }
 }
