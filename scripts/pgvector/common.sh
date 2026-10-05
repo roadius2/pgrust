@@ -8,6 +8,10 @@
 #   $PG_VEC    Copy of $PG_TOOLS plus C pgvector 0.8.7: the reference server.
 #              Kept separate so pgrust never sees C pgvector's control file
 #              or upgrade scripts.
+#   $PG_VEC_SEEDED  Same as $PG_VEC, but pgvector is built with -DHNSW_MEMORY,
+#              the only configuration in which C seeds the HNSW level RNG
+#              (SeedRandom(42), hnswbuild.c:1134-1136). Oracle of the
+#              byte-identical and iterative-scan tiers; nothing else uses it.
 
 PGV_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PG_SRC="$PGV_REPO/crates/postgres-18.6-reference"
@@ -17,11 +21,13 @@ PGREF="${PGREF:-$HOME/.cache/pgrust/pgref-18.6}"
 PGV_WORK="${PGV_WORK:-$HOME/.cache/pgrust/pgvector-work}"
 PG_TOOLS="$PGREF/pg"
 PG_VEC="$PGREF/pgvec"
+PG_VEC_SEEDED="${PG_VEC_SEEDED:-$PGREF/pgvec-seeded}"
 PGV_PERL5LIB="$PGREF/perl5/lib/perl5"
 
 PGV_PORT_PGRUST=55491
 PGV_PORT_REF=55492
 PGV_PORT_DOCKER=55493
+PGV_PORT_SEEDED=55494
 PGV_DOCKER_IMAGE="pgvector/pgvector:0.8.7-pg18@sha256:2358fcba361ed2233a5ed81b5fe4ca779ccb304120ce531a3bf51c0ed7e2bc11"
 
 die() {
@@ -41,12 +47,14 @@ pg_regress_bin() {
 
 PGRUST_PROFILE="${PGRUST_PROFILE:-fast-profile}"
 PGRUST_BIN="${PGRUST_BIN:-$PGV_REPO/target/$PGRUST_PROFILE/postgres}"
+PAGEMASK_BIN="${PAGEMASK_BIN:-$PGV_REPO/target/$PGRUST_PROFILE/pagemask}"
 PGRUST_SERVER_OPTS=(-c listen_addresses= -c io_method=sync -c max_stack_depth=60000)
 
 port_for() {
   case "$1" in
     pgrust) echo "$PGV_PORT_PGRUST" ;;
     ref) echo "$PGV_PORT_REF" ;;
+    seeded) echo "$PGV_PORT_SEEDED" ;;
     *) die "unknown mode '$1' (expected pgrust or ref)" ;;
   esac
 }
@@ -92,6 +100,8 @@ assert_identity() {
     "pgrust:"*) die "port $port is not a pgrust server: $v" ;;
     "ref:"*"(pgrust "*) die "port $port is a pgrust server, expected the C reference: $v" ;;
     "ref:PostgreSQL 18.6"*) ;;
+    "seeded:"*"(pgrust "*) die "port $port is a pgrust server, expected the seeded C reference: $v" ;;
+    "seeded:PostgreSQL 18.6"*) ;;
     *) die "port $port runs an unexpected server: $v" ;;
   esac
 }
@@ -99,6 +109,8 @@ assert_identity() {
 server_start() {
   local mode="$1" data="$2" port="$3" log
   mkdir -p "$PGV_WORK/sock" "$PGV_WORK/log"
+  # Unix-domain socket paths are limited to 103 bytes on macOS.
+  [ "${#PGV_WORK}" -le 80 ] || die "PGV_WORK is too long for a socket path (${#PGV_WORK} > 80 bytes): $PGV_WORK"
   if "$PG_TOOLS/bin/pg_isready" -q -h "$PGV_WORK/sock" -p "$port"; then
     die "a server is already running on port $port; stop it first (scripts/pgvector/server.sh stop $mode)"
   fi
@@ -118,6 +130,10 @@ server_start() {
       ;;
     ref)
       (exec "$PG_VEC/bin/postgres" -D "$data" -k "$PGV_WORK/sock" -p "$port" -c listen_addresses=) >"$log" 2>&1 &
+      ;;
+    seeded)
+      [ -x "$PG_VEC_SEEDED/bin/postgres" ] || die "missing $PG_VEC_SEEDED; run scripts/pgvector/build-reference.sh"
+      (exec "$PG_VEC_SEEDED/bin/postgres" -D "$data" -k "$PGV_WORK/sock" -p "$port" -c listen_addresses=) >"$log" 2>&1 &
       ;;
     *) die "unknown mode '$mode' (expected pgrust or ref)" ;;
   esac

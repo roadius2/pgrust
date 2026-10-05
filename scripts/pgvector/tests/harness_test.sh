@@ -8,6 +8,8 @@ here="$(cd "$(dirname "$0")" && pwd)"
 PGV_REAL_WORK="${PGV_WORK:-$HOME/.cache/pgrust/pgvector-work}"
 export PGV_WORK="$PGV_REAL_WORK/selftest"
 . "$here/../common.sh"
+# Tests write logs beside their work dirs ("$PGV_WORK/<name>.log").
+mkdir -p "$PGV_WORK"
 
 fails=0
 pass() { printf 'ok   - %s\n' "$1"; }
@@ -182,10 +184,91 @@ test_docker() {
   if [ "$after" -le "$before" ]; then pass "docker: no leaked volume"; else fail "docker: leaked $((after - before)) anonymous volume(s)"; fi
 }
 
+# Byte-identical tier, C vs C: two fresh seeded clusters must produce
+# identical index files for every default case.
+test_bytecmp_ref() {
+  local n want
+  want="$(set -- $("$here/../run-bytecmp.sh" --list) && echo $#)"
+  if "$here/../run-bytecmp.sh" ref >/dev/null 2>&1; then
+    pass "bytecmp ref: exit 0"
+  else
+    fail "bytecmp ref: exit 0 (see $PGV_WORK/bytecmp/ref)"
+  fi
+  n="$(grep -c $'\tok$' "$PGV_WORK/bytecmp/ref/summary.tsv" 2>/dev/null || true)"
+  if [ "$n" = "$want" ]; then pass "bytecmp ref: $want ok"; else fail "bytecmp ref: '$n' ok, want $want"; fi
+  if assert_reference_clean; then pass "bytecmp: reference trees untouched"; else fail "bytecmp: reference trees modified"; fi
+}
+
+# The cases must exercise what they claim (reads the C-vs-C run above):
+# multi-level graphs, a deep m=4 graph, page-split wide tuples, an init fork.
+test_bytecmp_cases() {
+  local f="$PGV_WORK/bytecmp/ref/cases.tsv" c label blocks level
+  if [ ! -s "$f" ]; then
+    fail "bytecmp cases: no $f (run test_bytecmp_ref first)"
+    return
+  fi
+  while IFS=$'\t' read -r c label blocks level; do
+    case "$c:$label" in
+      *:idx_init) [ "$level" = -1 ] && pass "bytecmp $c: empty init fork" || fail "bytecmp $c: init fork entry level $level" ;;
+      m4_golomb:idx) [ "$level" -ge 3 ] && pass "bytecmp $c: graph height $level" || fail "bytecmp $c: graph height $level, want >= 3" ;;
+      wide_golomb:idx) [ "$blocks" -ge 150 ] && pass "bytecmp $c: $blocks blocks" || fail "bytecmp $c: $blocks blocks, want >= 150" ;;
+      *) [ "$level" -ge 1 ] && [ "$blocks" -ge 10 ] && pass "bytecmp $c: $blocks blocks, height $level" ||
+        fail "bytecmp $c: $blocks blocks, height $level (want multi-page, multi-level)" ;;
+    esac
+  done <"$f"
+}
+
+# Negative control: stock C pgvector never seeds (SeedRandom(42) is under
+# #ifdef HNSW_MEMORY), so an unseeded subject must be reported as different.
+test_bytecmp_detects_difference() {
+  local w="$PGV_WORK/bytecmp-neg"
+  if PGV_WORK="$w" PGV_BYTECMP_SUBJECT=ref "$here/../run-bytecmp.sh" ref l2_golomb >"$w.log" 2>&1; then
+    fail "bytecmp flags an unseeded C build"
+  elif grep -q $'^l2_golomb\tFAIL$' "$w/bytecmp/ref/summary.tsv" 2>/dev/null; then
+    pass "bytecmp flags an unseeded C build"
+  else
+    fail "bytecmp flags an unseeded C build: wrong failure (see $w.log)"
+  fi
+}
+
+# Review focus 1: the seed is opt-in. Without SET pgrust.hnsw_build_seed,
+# pgrust builds like stock C and so differs from the seeded oracle.
+test_bytecmp_knob_off() {
+  local w="$PGV_WORK/bytecmp-noseed"
+  if PGV_WORK="$w" PGV_BYTECMP_SEED= "$here/../run-bytecmp.sh" pgrust l2_golomb >"$w.log" 2>&1; then
+    fail "bytecmp: unseeded pgrust differs from the seeded oracle"
+  elif grep -q $'^l2_golomb\tFAIL$' "$w/bytecmp/pgrust/summary.tsv" 2>/dev/null; then
+    pass "bytecmp: unseeded pgrust differs from the seeded oracle"
+  else
+    fail "bytecmp: unseeded pgrust: wrong failure (see $w.log)"
+  fi
+}
+
+# The oracle must be the seeded build, and pgrust mode must refuse a C server.
+test_bytecmp_identity() {
+  local w="$PGV_WORK/bytecmp-ident"
+  if PGV_WORK="$w" PG_VEC_SEEDED="$PG_VEC" "$here/../run-bytecmp.sh" ref l2_golomb >"$w.log" 2>&1; then
+    fail "bytecmp refuses an unseeded oracle"
+  elif grep -q 'not built by the seeded C pgvector' "$w.log"; then
+    pass "bytecmp refuses an unseeded oracle"
+  else
+    fail "bytecmp refuses an unseeded oracle: wrong error (see $w.log)"
+  fi
+  if PGV_WORK="$w" PGRUST_BIN="$PG_VEC/bin/postgres" "$here/../run-bytecmp.sh" pgrust l2_golomb >"$w.log" 2>&1; then
+    fail "bytecmp pgrust mode refuses a C server"
+  elif grep -q 'not a pgrust server' "$w.log"; then
+    pass "bytecmp pgrust mode refuses a C server"
+  else
+    fail "bytecmp pgrust mode refuses a C server: wrong error (see $w.log)"
+  fi
+}
+
 # --- runner ---
 if [ "$#" -eq 0 ]; then
+  # Declaration order (declare -F would sort): a test may read the results of
+  # one declared above it, e.g. test_bytecmp_cases reads test_bytecmp_ref's.
   # shellcheck disable=SC2046 # intentional splitting: function names have no spaces
-  set -- $(declare -F | awk '{print $3}' | grep '^test_')
+  set -- $(sed -n 's/^\(test_[A-Za-z0-9_]*\)() {$/\1/p' "${BASH_SOURCE[0]}")
 fi
 for t in "$@"; do
   echo "# $t"
