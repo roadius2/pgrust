@@ -558,6 +558,20 @@ pub fn fc_vector_accum(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResu
     Ok(image_datum(build_state_array(mcx, &datums)?))
 }
 
+// CreateStateDatums(dim) (vector.c) followed by a copy of one partial state's
+// sums; statedatums[0] is filled in by the caller.
+fn copy_state_datums<'m>(mcx: Mcx<'m>, s: &StateArray<'_>, dim: usize) -> PgResult<PgVec<'m, Datum>> {
+    let mut d: PgVec<'m, Datum> = mcx::vec_with_capacity_in(mcx, dim + 1)?;
+    d.push(Datum::null());
+    for i in 1..=dim {
+        d.push(Datum::from_f64(s.value(i)));
+    }
+    Ok(d)
+}
+
+// vector_combine (vector.c:1211-1284, pgvector 0.8.7; also halfvec_combine's
+// symbol). Branches on the partial states' dimensions, CheckDims every
+// non-empty side, and sets statedatums[0] = n1 + n2 (vector.c:1275).
 pub fn fc_vector_combine(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
     let mcx = fcinfo.result_mcx();
     let s1 = StateArray::check(mcx, fcinfo.arg(0), "vector_combine")?;
@@ -565,38 +579,34 @@ pub fn fc_vector_combine(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgRe
 
     let n1 = s1.value(0);
     let n2 = s2.value(0);
-    let (n, dim, mut datums): (f64, usize, PgVec<'_, Datum>) = if n1 == 0.0 {
-        let dim = s2.state_dims();
-        let mut d: PgVec<'_, Datum> = mcx::vec_with_capacity_in(mcx, dim + 1)?;
-        d.push(Datum::null());
-        for i in 1..=dim {
-            d.push(Datum::from_f64(s2.value(i)));
-        }
-        (n2, dim, d)
-    } else if n2 == 0.0 {
-        let dim = s1.state_dims();
-        let mut d: PgVec<'_, Datum> = mcx::vec_with_capacity_in(mcx, dim + 1)?;
-        d.push(Datum::null());
-        for i in 1..=dim {
-            d.push(Datum::from_f64(s1.value(i)));
-        }
-        (n1, dim, d)
+    let dim1 = s1.state_dims();
+    let dim2 = s2.state_dims();
+
+    let mut datums: PgVec<'_, Datum> = if dim1 == 0 && dim2 == 0 {
+        copy_state_datums(mcx, &s1, 0)?
+    } else if dim1 == 0 {
+        check_dim(dim2)?;
+        copy_state_datums(mcx, &s2, dim2)?
+    } else if dim2 == 0 {
+        check_dim(dim1)?;
+        copy_state_datums(mcx, &s1, dim1)?
     } else {
-        let dim = s1.state_dims();
-        check_expected_dim(dim as i32, s2.state_dims())?;
+        let dim = dim1;
+        check_dim(dim)?;
+        check_expected_dim(dim as i32, dim2)?;
         let mut d: PgVec<'_, Datum> = mcx::vec_with_capacity_in(mcx, dim + 1)?;
         d.push(Datum::null());
         for i in 1..=dim {
             let v = s1.value(i) + s2.value(i);
+            // Check for overflow
             if v.is_infinite() {
                 return Err(Box::new(adt_float::float_overflow_error()));
             }
             d.push(Datum::from_f64(v));
         }
-        (n1 + n2, dim, d)
+        d
     };
-    datums[0] = Datum::from_f64(n);
-    let _ = dim;
+    datums[0] = Datum::from_f64(n1 + n2);
     Ok(image_datum(build_state_array(mcx, &datums)?))
 }
 
@@ -644,5 +654,45 @@ mod tests {
         let v = unsafe { arg_vector(&probe, 0) }.unwrap();
         assert_eq!(v.dim(), 3);
         assert_eq!((v.x(0), v.x(1), v.x(2)), (1.0, 2.5, -3.0));
+    }
+
+    fn combine(m: Mcx<'_>, a: &[f64], b: &[f64]) -> Result<Vec<f64>, String> {
+        let mk = |v: &[f64]| {
+            let e: Vec<Datum> = v.iter().map(|x| Datum::from_f64(*x)).collect();
+            arrayfuncs::construct_array(m, &e, FLOAT8OID, 8, true, b'd').unwrap()
+        };
+        let (a, b) = (mk(a), mk(b));
+        let mut fc = types_fmgr::LocalFcinfo::<2>::new(0);
+        // SAFETY: the context outlives the call.
+        unsafe { fc.set_result_mcx(m) };
+        fc.set_arg(0, Datum::from_usize(a.as_ptr() as usize));
+        fc.set_arg(1, Datum::from_usize(b.as_ptr() as usize));
+        match fc_vector_combine(None, &mut fc) {
+            Ok(d) => {
+                let s = StateArray::check(m, d, "test").unwrap();
+                Ok((0..s.n_items).map(|i| s.value(i)).collect())
+            }
+            Err(e) => Err(e.message().to_string()),
+        }
+    }
+
+    // vector_combine (vector.c:1211-1284, 0.8.7) branches on STATE_DIMS, not
+    // on the counts, and CheckDims every non-empty side.
+    #[test]
+    fn vector_combine_matches_0_8_7() {
+        let ctx = mcx::MemoryContext::new("pgvector-test");
+        let m = ctx.mcx();
+        assert_eq!(combine(m, &[0.0], &[0.0]).unwrap(), vec![0.0]);
+        assert_eq!(combine(m, &[1.0, 2.0], &[3.0, 4.0]).unwrap(), vec![4.0, 6.0]);
+        // n1 == 0 but dims > 0 (0.8.5 copied s2: {3,4,5}).
+        assert_eq!(combine(m, &[0.0, 1.0, 2.0], &[3.0, 4.0, 5.0]).unwrap(), vec![3.0, 5.0, 7.0]);
+        // dim1 == 0 but n1 != 0 (0.8.5: "expected 0 dimensions, not 1").
+        assert_eq!(combine(m, &[5.0], &[3.0, 4.0]).unwrap(), vec![8.0, 4.0]);
+        assert_eq!(combine(m, &[1.0, 2.0], &[3.0, 4.0, 5.0]).unwrap_err(), "expected 1 dimensions, not 2");
+        // regress vector_type (expected lines 723-727): 16,001 dimensions.
+        let big: Vec<f64> = (1..=16002).map(|n| n as f64).collect();
+        for (a, b) in [(&[0.0][..], &big[..]), (&big[..], &[0.0][..]), (&big[..], &big[..])] {
+            assert_eq!(combine(m, a, b).unwrap_err(), "vector cannot have more than 16000 dimensions");
+        }
     }
 }
