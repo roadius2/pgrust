@@ -2,11 +2,14 @@
 //! conversions and the halfvec distance kernels.
 //!
 //! The conversions port the software path halfutils.h takes when neither
-//! F16C_SUPPORT nor FLT16_SUPPORT is defined (halfutils.h:63-239). IEEE
+//! F16C_SUPPORT nor FLT16_SUPPORT is defined (halfutils.h:62-239). IEEE
 //! defines f32<->f16 round-to-nearest-even exactly, so they give the same
 //! bits as the F16C and _Float16 paths; crate pgvector_f16_parity checks
-//! every input. The kernels port the `*Default` loops (halfutils.c:29-207)
-//! in C source order; the x86 F16C dispatch only reorders the f32 sums.
+//! every input. The kernels port the `*Default` loops (halfutils.c:29-207).
+//! Upstream compiles with -fassociative-math -ffp-contract=fast (Makefile:38)
+//! on every target, so the C extension's summation order and fusion are
+//! compiler-chosen, not only under the x86 F16C dispatch. These loops keep C
+//! source order (no reassociation, no fusion), as vec.rs's kernels do.
 
 use types_error::{PgError, PgResult, ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE};
 

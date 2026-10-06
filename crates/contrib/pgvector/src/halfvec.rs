@@ -885,6 +885,29 @@ mod tests {
         assert_eq!(recv(&msg(3, 0, &[0x3C00]), -1).unwrap_err(), "insufficient data left in message");
     }
 
+    // halfvec_send (halfvec.c:405-419): dim, unused 0, then each half's raw
+    // bits, all big-endian. The same bytes C sends for this value (deck io,
+    // `halfvec_send(...)`: \x000600003c004000b8007bff00018000).
+    #[test]
+    fn send_writes_dim_unused_and_raw_halves() {
+        let ctx = mcx::MemoryContext::new("halfvec-test");
+        let m = ctx.mcx();
+        let img = image(m, &[1.0, 2.0, -0.5, 65504.0, 6e-8, -0.0]);
+        let mut fc = types_fmgr::LocalFcinfo::<1>::new(0);
+        // SAFETY: ctx outlives the call.
+        unsafe { fc.set_result_mcx(m) };
+        fc.set_arg(0, Datum::from_usize(img.as_ptr() as usize));
+        let out = fc_halfvec_send(None, &mut fc).unwrap();
+        let mut probe = types_fmgr::LocalFcinfo::<1>::new(0);
+        probe.set_arg(0, out);
+        // SAFETY: out is a live bytea in ctx.
+        let sent = unsafe { probe.arg_varlena_packed(0) }.unwrap();
+        let want = msg(6, 0, &[0x3C00, 0x4000, 0xB800, 0x7BFF, 0x0001, 0x8000]);
+        assert_eq!(sent.data(), &want[..]);
+        let back = recv(sent.data(), -1).unwrap();
+        assert_eq!(back.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), [1.0f32, 2.0, -0.5, 65504.0, half_to_float4(1), -0.0].map(f32::to_bits));
+    }
+
     #[test]
     fn from_payload_rejects_corrupt_images() {
         let corrupt = |p: &[u8]| HalfView::from_payload(p).err().unwrap().message().to_string();

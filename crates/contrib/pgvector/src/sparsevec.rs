@@ -455,8 +455,10 @@ pub fn fc_sparsevec_out(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgRes
         if i > 0 {
             mcx::vec_append_bytes(&mut out, b",")?;
         }
-        // Convert 0-based numbering (C) to 1-based (SQL)
-        let k = numutils::pg_ltoa(v.index(i) + 1, &mut num);
+        // Convert 0-based numbering (C) to 1-based (SQL). C's
+        // `indices[i] + 1` wraps on a corrupt i32::MAX index; so does this,
+        // on every profile.
+        let k = numutils::pg_ltoa(v.index(i).wrapping_add(1), &mut num);
         mcx::vec_append_bytes(&mut out, &num[..k])?;
         mcx::vec_append_bytes(&mut out, b":")?;
         let k = ryu::float_to_shortest_decimal_bufn(v.value(i), &mut scratch);
@@ -1111,6 +1113,53 @@ mod tests {
             v.extend(x.to_bits().to_be_bytes());
         }
         v
+    }
+
+    fn send(m: Mcx<'_>, img: &[u8]) -> Vec<u8> {
+        let mut fc = types_fmgr::LocalFcinfo::<1>::new(0);
+        // SAFETY: m outlives the call.
+        unsafe { fc.set_result_mcx(m) };
+        fc.set_arg(0, Datum::from_usize(img.as_ptr() as usize));
+        let out = fc_sparsevec_send(None, &mut fc).unwrap();
+        let mut probe = types_fmgr::LocalFcinfo::<1>::new(0);
+        probe.set_arg(0, out);
+        // SAFETY: out is a live bytea in m.
+        unsafe { probe.arg_varlena_packed(0) }.unwrap().data().to_vec()
+    }
+
+    // sparsevec_send (sparsevec.c:561-582): dim, nnz, unused 0, the 0-based
+    // indices, then the values, all big-endian. The same bytes C sends (deck
+    // io, `sparsevec_send(...)`).
+    #[test]
+    fn send_writes_header_indices_then_values() {
+        let ctx = mcx::MemoryContext::new("sparsevec-test");
+        let m = ctx.mcx();
+        let img = |s: &str| sparsevec_in_body(m, s.as_bytes(), -1).unwrap();
+        let sent = send(m, &img("{1:1.5,3:-2}/5"));
+        assert_eq!(sent, msg(5, 2, 0, &[0, 2], &[1.5, -2.0]));
+        assert_eq!(recv(&sent, -1).unwrap(), "{1:1.5,3:-2}/5");
+        assert_eq!(send(m, &img("{}/7")), msg(7, 0, 0, &[], &[]));
+        assert_eq!(send(m, &img("{1000000000:1}/1000000000")), msg(1_000_000_000, 1, 0, &[999_999_999], &[1.0]));
+    }
+
+    // sparsevec_out (sparsevec.c:461): C's `indices[i] + 1` wraps on a
+    // corrupt i32::MAX index rather than trapping; so does the port.
+    #[test]
+    fn out_wraps_a_corrupt_max_index_like_c() {
+        let ctx = mcx::MemoryContext::new("sparsevec-test");
+        let m = ctx.mcx();
+        let mut b = SparseBuilder::new(m, 1, 1).unwrap();
+        b.set_index(0, i32::MAX);
+        b.set_value(0, 1.0);
+        let img = b.image();
+        let mut fc = types_fmgr::LocalFcinfo::<1>::new(0);
+        // SAFETY: ctx outlives the call.
+        unsafe { fc.set_result_mcx(m) };
+        fc.set_arg(0, Datum::from_usize(img.as_ptr() as usize));
+        let out = fc_sparsevec_out(None, &mut fc).unwrap();
+        // SAFETY: out is a NUL-terminated cstring in ctx.
+        let text = unsafe { std::ffi::CStr::from_ptr(out.as_usize() as *const std::ffi::c_char) };
+        assert_eq!(text.to_str().unwrap(), "{-2147483648:1}/1");
     }
 
     // Review Focus 2: binary input is validated like sparsevec_recv
