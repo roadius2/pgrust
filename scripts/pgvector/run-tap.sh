@@ -13,7 +13,8 @@ set -euo pipefail
 #  - pg_ctl is a COPY, not a symlink: it looks for "postgres" in its own
 #    resolved directory, and that must be the pgrust shim below. Its version
 #    check needs `postgres -V` to print exactly "postgres (PostgreSQL) 18.6".
-#  - The shim applies pgrust's runtime settings (README quickstart).
+#  - The shim applies pgrust's runtime settings (README quickstart), plus
+#    C's max_parallel_workers_per_gather (see PGRUST_SERVER_OPTS in common.sh).
 make_hybrid_bin() {
   local dir="$1" share
   share="$("$PG_TOOLS/bin/pg_config" --sharedir)"
@@ -26,7 +27,7 @@ ulimit -s 65520 2>/dev/null
 export PGRUST_PGSHAREDIR='$share'
 export PGRUST_TZDIR='$share/timezone'
 export RUST_MIN_STACK=33554432
-exec '$PGRUST_BIN' "\$@" -c io_method=sync -c max_stack_depth=60000
+exec '$PGRUST_BIN' "\$@" -c io_method=sync -c max_stack_depth=60000 -c max_parallel_workers_per_gather=2
 EOF
   chmod +x "$dir/postgres"
 }

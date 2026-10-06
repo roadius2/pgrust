@@ -52,7 +52,12 @@ DIFFRUNNER_BIN="${DIFFRUNNER_BIN:-$PGV_REPO/target/$PGRUST_PROFILE/diffrunner}"
 # Extra listen address for harness servers (default: Unix socket only).
 # run-diff.sh sets 127.0.0.1 because diffrunner speaks TCP only.
 PGV_LISTEN="${PGV_LISTEN:-}"
-PGRUST_SERVER_OPTS=(-c listen_addresses= -c io_method=sync -c max_stack_depth=60000)
+# max_parallel_workers_per_gather=2 pins C's default. pgrust deliberately
+# ships 4 (guc_tables/src/tables.rs:965; same pin as fuzzgen's
+# runner::C_PARITY_GUC_PIN), which changes parallel plans that pgvector's
+# tests depend on (TAP 018's saturating halfvec sum). Keep in step with
+# run-tap.sh's shim.
+PGRUST_SERVER_OPTS=(-c listen_addresses= -c io_method=sync -c max_stack_depth=60000 -c max_parallel_workers_per_gather=2)
 
 port_for() {
   case "$1" in

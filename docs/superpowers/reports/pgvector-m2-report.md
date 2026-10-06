@@ -1,17 +1,17 @@
 # pgvector conformance after M2
 
-Date: 2026-10-06 · pgrust commit: cc4c289b17 (code, after the final-review fix wave; the docs commit follows it) · Reference: PostgreSQL 18.6 + pgvector 0.8.7 (`pgvec`), seeded oracle `pgvec-seeded` (-DHNSW_MEMORY)
+Date: 2026-10-06 · pgrust commit: cc4c289b17 (code, after the final-review fix wave; the docs commit and the TAP 018 harness pin follow it) · Reference: PostgreSQL 18.6 + pgvector 0.8.7 (`pgvec`), seeded oracle `pgvec-seeded` (-DHNSW_MEMORY)
 
 ## Summary
 - **C reference:** 96/96 (regress 14/14, TAP 48/48, bytecmp 10/10, iterscan 7/7, diff 17/17).
-- **pgrust:** 58/96 (regress 8/14, TAP 16/48, bytecmp 10/10, iterscan 7/7, diff 17/17).
+- **pgrust:** 59/96 (regress 8/14, TAP 17/48, bytecmp 10/10, iterscan 7/7, diff 17/17).
   - M1 was 33/79, before the `diff` tier existed.
-  - On regress+TAP, pgrust went from 16/62 to 24/62.
+  - On regress+TAP, pgrust went from 16/62 to 25/62.
 - **Fixed in M2:**
   - regress `bit`, `btree`, `cast`, `copy`, `halfvec`, `sparsevec`;
-  - TAP `033_comparison`, `034_distance_functions`;
+  - TAP `018_aggregates` (with the harness's parallel-worker pin), `033_comparison`, `034_distance_functions`;
   - the new exact-differential tier (`diff`, `scripts/pgvector/run-diff.sh`) is clean.
-- **One row short of the plan's expectation.** TAP `018_aggregates` still fails. Its cause is pgrust's parallel worker count, which is outside M2's code. It is open and awaiting the user (see "Known divergences left open").
+- **TAP `018_aggregates` passes with a harness pin.** It failed only because pgrust plans 4 parallel workers where C plans 2. On the user's decision (2026-10-06), the harness now runs pgrust with C's `max_parallel_workers_per_gather = 2` (see "Known divergences left open").
 - **Gate also green:**
   - `harness_test.sh`: all passed (71 ok).
   - `UT_M2`: 30 passed (lookup 2, bitutils 2, bitvec 2, funcs 2, halfutils 3, halfvec 7, sparsevec 12; 0 in `main_main`).
@@ -24,7 +24,8 @@ Date: 2026-10-06 · pgrust commit: cc4c289b17 (code, after the final-review fix 
 - **How the run was produced.** The table below comes from fresh `run-all.sh ref` and `run-all.sh pgrust` runs on the final binaries, after the final-review fix wave (cc4c289b17).
   - Earlier full runs gave 55/94: with the previous diffrunner, `diff | seeded` failed on 6 ±0 findings.
   - After the ±0 comparator change (aa29a4ec90) they gave 56/94.
-  - The fix wave added the exact `normalize` and `denormal` diff rows, so the total is now 58/96. No other row changed.
+  - The fix wave added the exact `normalize` and `denormal` diff rows, so the total became 58/96. No other row changed.
+  - After the TAP 018 harness pin, a fresh `run-all.sh pgrust` gave 59/96. The only row that changed is `tap | 018_aggregates`, now ok.
 
 ## pgrust results
 | Tier | Test | Result |
@@ -60,7 +61,7 @@ Date: 2026-10-06 · pgrust commit: cc4c289b17 (code, after the final-review fix 
 | tap | 015_hnsw_vector_duplicates | ok |
 | tap | 016_hnsw_inserts | ok |
 | tap | 017_hnsw_filtering | ok |
-| tap | 018_aggregates | FAIL |
+| tap | 018_aggregates | ok |
 | tap | 019_storage | ok |
 | tap | 020_hnsw_bit_build_recall | FAIL |
 | tap | 021_hnsw_bit_insert_recall | FAIL |
@@ -126,10 +127,10 @@ Date: 2026-10-06 · pgrust commit: cc4c289b17 (code, after the final-review fix 
 | diff | seeded | ok |
 | diff | error_locations | ok |
 
-**58/96 passed**
+**59/96 passed**
 
 ## Remaining failures
-Every remaining failure is one of four things: HNSW on the new types (M3), IVFFlat (M4), parallel builds (M6), or TAP 018. I checked each against this run's logs.
+Every remaining failure is one of three things: HNSW on the new types (M3), IVFFlat (M4), or parallel builds (M6). I checked each against this run's logs.
 
 **IVFFlat (M4):**
 - regress `ivfflat_bit`, `ivfflat_halfvec` and `ivfflat_vector` diff only on `access method "ivfflat" does not exist`. `ivfflat_vector` also shows `unrecognized configuration parameter "ivfflat.probes"`.
@@ -140,11 +141,6 @@ Every remaining failure is one of four things: HNSW on the new types (M3), IVFFl
 - TAP `020`–`031` and `038` (13 tests) stop at the same error, for `bit_hamming_ops`, `halfvec_l2_ops` or `sparsevec_l2_ops`.
 
 **Parallel builds (M6):** TAP `012` and `045` fail only on `using \d+ parallel workers`, plus 045's `after 0 tuples` message. This is the same as M1.
-
-**TAP `018_aggregates`: open, awaiting the user.**
-- Assertions 1–15 pass. Then `SELECT sum(v::halfvec) FROM tst;` fails with `ERROR:  value out of range: overflow`, and the script exits.
-- The one assertion after it (`... WHERE r1 < 0`, expecting an empty result) passes when run by hand (Task 6).
-- The cause is pgrust's parallel worker count, not M2's halfvec code. See "Known divergences left open".
 
 ## What M2 established
 **f16 parity for every input, against both C paths.** `pgvector_f16_parity`'s `build.rs` compiles two things from the vendored `halfutils.h`:
@@ -184,21 +180,16 @@ In Task 2, a one-line rounding mutation made 180,323,328 conversions and 2,483,2
 - Evidence: the deck's `limits` section, and Task 6 Step 7.
 
 ## Known divergences left open
-**TAP 018: parallel worker count. Open, awaiting the user.**
+**TAP 018: pgrust's parallel worker default. The harness pins C's (user decision, 2026-10-06).**
 - **Planned workers.** pgrust plans 4 parallel workers for 018's 1M-row table, where C plans 2.
-  - pgrust's `max_parallel_workers_per_gather` boot default is 4 (`guc_tables/src/tables.rs:965`). That alone gives the observed 4. Autotune, when on, would set `(cores/2).clamp(2, 8)` (`guc/src/autotune.rs:188`), but `pgrust.mem_autotune` defaults to off (`tables.rs:754`).
+  - pgrust's `max_parallel_workers_per_gather` boot default is 4 (`guc_tables/src/tables.rs:965`), one of the parallel defaults pgrust deliberately re-tunes. Autotune, when on, would set `(cores/2).clamp(2, 8)` (`guc/src/autotune.rs:188`), but `pgrust.mem_autotune` defaults to off (`tables.rs:754`).
   - C's default is 2, and its log3 sizing still picks 2 even at a limit of 4.
-- **Why the sum overflows.** Each partial `halfvec` sum saturates at `[8192,8192,16384]`. Five partials exceed 65504, so `halfvec_add` raises the float overflow error.
+- **Why the sum overflowed.** Each partial `halfvec` sum saturates at `[8192,8192,16384]`. Five partials exceed 65504, so `halfvec_add` raises the float overflow error.
 - **Evidence it is the worker count:**
   - With `SET max_parallel_workers_per_gather = 2`, pgrust returns C's `[24576,24576,49152]`.
   - C forced to 4 workers fails the same way.
-- **This is a core planner/GUC divergence, not M2 code.** The harness's server options were not changed to hide it.
-- **The user's choices:**
-  - accept 018 as an exception;
-  - pin the harness to 2 workers;
-  - or align the core default.
-
-  018 is re-run after that decision.
+- **Resolution.** Every harness pgrust server now runs with `-c max_parallel_workers_per_gather=2`: `PGRUST_SERVER_OPTS` in `scripts/pgvector/common.sh` and the TAP shim in `run-tap.sh`. This follows the precedent of fuzzgen's `runner::C_PARITY_GUC_PIN`, which pins the same GUC to its C default.
+- **What stays open.** pgrust's own default is unchanged, so stock pgrust still differs from C on parallel plan shape. That is a core decision outside Phase 1.
 
 **Sign of an all-underflow zero (`pgvector-float-rel`, user-approved 2026-10-06).**
 - **What differs.** When every product underflows, pre-M2 `vector` `inner_product`/`<#>` can return `0` where C returns `-0`, or the reverse.
