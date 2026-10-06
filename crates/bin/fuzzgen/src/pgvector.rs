@@ -1,15 +1,17 @@
 //! diffrunner `--pgvector`: the exact-differential tier of the pgvector
 //! Phase 1 spec (§8.2). A fixed deck (pgvector_deck.sql) and a seeded random
 //! arm exercise every vector, halfvec, sparsevec and bit function, cast,
-//! operator and aggregate, their error cases, and exact (non-index)
-//! nearest-neighbour queries against a reference (A) and a subject (B).
+//! operator and aggregate, their send output (bytea and binary COPY), their
+//! error cases, and exact (non-index) nearest-neighbour queries against a
+//! reference (A) and a subject (B). The setup case (CREATE EXTENSION) is a
+//! finding unless it succeeds on A, so a broken reference cannot match.
 //!
 //! Outcomes compare exactly: errors by SQLSTATE and message, rows by text in
-//! row order. Three classify rulings that would widen that are not accepted
-//! here and escalate to ROWSET_DIFF (EXACT_RULINGS): `tie-ordering` (every
-//! ORDER BY in the suite is a total order), `cmp-magnitude` (halfvec_cmp and
-//! sparsevec_cmp return exactly -1/0/1) and `b1-float-ulp` (no float ulp
-//! slack outside the one widening below).
+//! row order, COPY payloads byte for byte. No classify ruling is accepted
+//! here: every one other than `pgvector-float-rel` escalates to ROWSET_DIFF,
+//! among them `tie-ordering` (every ORDER BY in the suite is a total order),
+//! `cmp-magnitude` (halfvec_cmp and sparsevec_cmp return exactly -1/0/1) and
+//! `b1-float-ulp` (no float ulp slack outside the one widening below).
 //!
 //! The one widening is scoped to distance and norm statements: deck sections
 //! `distance` and `norm`, and the seeded distance-function, distance-operator,
@@ -18,12 +20,14 @@
 //! REL_TOL relative (floored at magnitude 1), or are zeros of either sign,
 //! cell by cell in row order, is RULED under `pgvector-float-rel`. pgvector
 //! builds with -fassociative-math and fuses multiply-adds, so its f32
-//! distance sums are not bit-reproducible (spec §2), and the sign of a sum
-//! whose products all underflow follows C's vectorized, fused reduction
-//! order (user-approved 2026-10-06). Elementwise arithmetic, I/O, casts,
-//! aggregates, comparisons, KNN order, the limits and every error compare
-//! exactly, as do non-zero integral numerals and structure in distance and
-//! norm statements.
+//! distance and norm sums are not bit-reproducible (spec §2), and the sign of
+//! a sum whose products all underflow follows C's vectorized, fused
+//! reduction order (user-approved 2026-10-06). Everything else compares
+//! exactly: l2_normalize (deck section `normalize`, seeded normalize
+//! statements), the denormal and underflow cases the floor would hide (deck
+//! section `denormal`), elementwise arithmetic, I/O, casts, aggregates,
+//! comparisons, KNN order, the limits and every error, as do non-zero
+//! integral numerals and structure in distance and norm statements.
 
 use crate::copybin::normalize_user_oids;
 use crate::diff::{classify, Classified, DiffClass, DiffInput, StmtOutcome};
@@ -37,9 +41,6 @@ pub const REL_TOL: f64 = 1e-5;
 pub const RULING_ID: &str = "pgvector-float-rel";
 /// Deck sections whose statements get the REL_TOL widening.
 pub const TOLERANT_SECTIONS: &[&str] = &["distance", "norm"];
-/// classify rulings this suite escalates to ROWSET_DIFF: row order, `*_cmp`
-/// magnitude and float ulp all compare exactly here.
-pub const EXACT_RULINGS: &[&str] = &["tie-ordering", "cmp-magnitude", "b1-float-ulp"];
 
 const DECK: &str = include_str!("pgvector_deck.sql");
 
@@ -68,9 +69,10 @@ pub fn deck() -> Vec<(&'static str, &'static str)> {
     out
 }
 
-/// Run the suite: CREATE EXTENSION ("setup"), the deck's sections, then
-/// `seeded_n` statements from `seed` ("seeded"). Only TOLERANT_SECTIONS and
-/// the seeded statements `seeded_statement` marks tolerant get REL_TOL.
+/// Run the suite: CREATE EXTENSION ("setup", a finding unless it succeeds on
+/// A), the deck's sections, then `seeded_n` statements from `seed`
+/// ("seeded"). Only TOLERANT_SECTIONS and the seeded statements
+/// `seeded_statement` marks tolerant get REL_TOL.
 pub fn run_suite(
     a: &mut dyn Executor,
     b: &mut dyn Executor,
@@ -83,7 +85,7 @@ pub fn run_suite(
     let mut sections = vec![SectionStats { name: "setup".to_string(), ..Default::default() }];
     let mut idx = 0u32;
     let setup = "CREATE EXTENSION IF NOT EXISTS vector;";
-    run_case(a, b, table, ulp_tol, setup, false, idx, &mut sections[0], &mut records);
+    run_case(a, b, table, ulp_tol, setup, false, true, idx, &mut sections[0], &mut records);
     idx += 1;
     for (section, sql) in deck() {
         if sections.last().map(|s| s.name.as_str()) != Some(section) {
@@ -91,14 +93,14 @@ pub fn run_suite(
         }
         let stats = sections.last_mut().unwrap();
         let tolerant = TOLERANT_SECTIONS.contains(&section);
-        run_case(a, b, table, ulp_tol, sql, tolerant, idx, stats, &mut records);
+        run_case(a, b, table, ulp_tol, sql, tolerant, false, idx, stats, &mut records);
         idx += 1;
     }
     let mut seeded = SectionStats { name: "seeded".to_string(), ..Default::default() };
     let mut rng = Rng::new_pure(seed);
     for _ in 0..seeded_n {
         let (sql, tolerant) = seeded_statement(&mut rng);
-        run_case(a, b, table, ulp_tol, &sql, tolerant, idx, &mut seeded, &mut records);
+        run_case(a, b, table, ulp_tol, &sql, tolerant, false, idx, &mut seeded, &mut records);
         idx += 1;
     }
     sections.push(seeded);
@@ -113,13 +115,24 @@ fn run_case(
     ulp_tol: u64,
     sql: &str,
     tolerant: bool,
+    require_a_ok: bool,
     stmt_index: u32,
     stats: &mut SectionStats,
     records: &mut Vec<Record>,
 ) {
     let oa = normalize_user_oids(&a.apply(sql));
     let ob = normalize_user_oids(&b.apply(sql));
-    let c = compare(table, ulp_tol, sql, &oa, &ob, tolerant);
+    let c = match &oa {
+        StmtOutcome::Error { sqlstate, message } if require_a_ok => Classified {
+            class: DiffClass::ErrorDiff,
+            detail: format!("must succeed on A, which failed: {sqlstate}: {message}"),
+        },
+        StmtOutcome::ConnLost { detail } if require_a_ok => Classified {
+            class: DiffClass::ErrorDiff,
+            detail: format!("must succeed on A, which lost its connection: {detail}"),
+        },
+        _ => compare(table, ulp_tol, sql, &oa, &ob, tolerant),
+    };
     stats.cases += 1;
     match &c.class {
         DiffClass::Match => stats.matches += 1,
@@ -131,9 +144,9 @@ fn run_case(
     }
 }
 
-/// classify; escalate the EXACT_RULINGS to ROWSET_DIFF; then, in a
-/// `tolerant` (distance or norm) statement only, rule a row-set divergence
-/// that is tolerance-equal in row order.
+/// classify; escalate every classify ruling to ROWSET_DIFF (none applies in
+/// this suite); then, in a `tolerant` (distance or norm) statement only, rule
+/// a row-set divergence that is tolerance-equal in row order.
 pub fn compare(
     table: &[RuledEntry],
     ulp_tol: u64,
@@ -144,7 +157,7 @@ pub fn compare(
 ) -> Classified {
     let raw = classify(&DiffInput { sql, a: oa, b: ob, ulp_tol, soft_cols: &[], mask_explain_timing: false });
     let raw = match &raw.class {
-        DiffClass::Ruled(id) if EXACT_RULINGS.contains(&id.as_str()) => Classified {
+        DiffClass::Ruled(id) if id != RULING_ID => Classified {
             class: DiffClass::RowsetDiff,
             detail: format!("{id} does not apply in the pgvector suite: {}", raw.detail),
         },
@@ -316,8 +329,9 @@ fn knn_statement(rng: &mut Rng, ty: Ty, dim: usize) -> String {
 
 /// One seeded statement (single line, `;`-terminated) and whether it is a
 /// distance or norm statement, the only seeded kinds that get REL_TOL:
-/// distance functions (0), distance operators (1), norms (3) and the
-/// sparsevec metric arm of kind 6. Everything else compares exactly.
+/// distance functions (0), distance operators (1), the norm arm of kind 3
+/// and the sparsevec metric arm of kind 6. Everything else compares exactly,
+/// l2_normalize (kind 3's other arm) included.
 pub fn seeded_statement(rng: &mut Rng) -> (String, bool) {
     let ty = pick(rng, &[Ty::Vector, Ty::Halfvec, Ty::Sparsevec]);
     let t = ty.name();
@@ -347,8 +361,12 @@ pub fn seeded_statement(rng: &mut Rng) -> (String, bool) {
             }
         },
         3 => {
-            let norm = if ty == Ty::Vector { "vector_norm" } else { "l2_norm" };
-            (format!("SELECT {norm}('{a}'::{t}), l2_normalize('{a}'::{t});"), true)
+            if rng.chance(1, 2) {
+                let norm = if ty == Ty::Vector { "vector_norm" } else { "l2_norm" };
+                (format!("SELECT {norm}('{a}'::{t});"), true)
+            } else {
+                (format!("SELECT l2_normalize('{a}'::{t});"), false)
+            }
         }
         4 => {
             let to = match ty {
@@ -389,13 +407,23 @@ mod tests {
     #[test]
     fn pgvector_deck_is_single_line_statements_in_named_sections() {
         let d = deck();
-        assert_eq!(d.len(), 184, "deck statements");
+        assert_eq!(d.len(), 197, "deck statements");
         for (section, sql) in &d {
             assert!(!section.is_empty(), "statement before any section: {sql}");
-            assert!(sql.starts_with("SELECT ") && sql.ends_with(';'), "{sql}");
+            assert!((sql.starts_with("SELECT ") || sql.starts_with("COPY (")) && sql.ends_with(';'), "{sql}");
         }
-        for want in ["io", "typmod", "cast", "arith", "distance", "norm", "agg", "cmp", "misc", "bit", "knn", "limits"] {
-            assert!(d.iter().any(|(s, _)| *s == want), "missing section {want}");
+        let mut sections: Vec<&str> = d.iter().map(|(s, _)| *s).collect();
+        sections.dedup();
+        let want = [
+            "io", "typmod", "cast", "arith", "distance", "norm", "normalize", "denormal", "agg", "cmp", "misc", "bit",
+            "knn", "limits",
+        ];
+        assert_eq!(sections, want, "sections, in order, each contiguous");
+        // l2_normalize is exact: only in exact sections.
+        for (s, sql) in &d {
+            if sql.contains("l2_normalize(") {
+                assert!(!TOLERANT_SECTIONS.contains(s), "{s}: {sql}");
+            }
         }
     }
 
@@ -415,6 +443,10 @@ mod tests {
         ];
         let stmts = gen(7);
         assert!(stmts.iter().any(|(_, t)| *t) && stmts.iter().any(|(_, t)| !*t), "both kinds occur");
+        // Kind 3 emits a norm (tolerant) or an l2_normalize (exact), never both.
+        assert!(stmts.iter().any(|(s, t)| s.contains("l2_normalize(") && !*t), "exact normalize occurs");
+        assert!(stmts.iter().any(|(s, t)| s.contains("_norm(") && !s.contains("_distance") && *t), "norm occurs");
+        assert!(!stmts.iter().any(|(s, _)| s.contains("l2_normalize(") && s.contains("norm('")), "split");
         for (s, tolerant) in stmts {
             assert!(s.starts_with("SELECT ") && s.ends_with(';') && !s.contains('\n'), "{s}");
             assert_eq!(s.matches('(').count(), s.matches(')').count(), "{s}");
@@ -427,8 +459,8 @@ mod tests {
     fn pgvector_tolerant_sections_are_distance_and_norm() {
         let tolerant: Vec<&str> = deck().iter().map(|(s, _)| *s).filter(|s| TOLERANT_SECTIONS.contains(s)).collect();
         assert_eq!(tolerant.iter().filter(|s| **s == "distance").count(), 20);
-        assert_eq!(tolerant.iter().filter(|s| **s == "norm").count(), 7);
-        assert_eq!(tolerant.len(), 27);
+        assert_eq!(tolerant.iter().filter(|s| **s == "norm").count(), 2);
+        assert_eq!(tolerant.len(), 22);
     }
 
     #[test]
@@ -488,8 +520,8 @@ mod tests {
     #[test]
     fn pgvector_tolerance_applies_only_to_distance_and_norm_statements() {
         let table = crate::ruled::default_table();
-        let exact = "SELECT '[6e-8]'::halfvec * '[1]';";
-        let metric = "SELECT l2_normalize('[0.1]'::vector);";
+        let exact = "SELECT l2_normalize('[0.1]'::vector);";
+        let metric = "SELECT l2_norm('[0.1]'::halfvec);";
         for (x, y) in [("[0]", "[6e-08]"), ("[0.1]", "[0.10000001]")] {
             let c = compare(&table, 4, exact, &vrow(x), &vrow(y), false);
             assert!(is_finding(&c), "{x} vs {y} not a finding in an exact statement: {c:?}");
@@ -545,5 +577,72 @@ mod tests {
         let sql = "SELECT cosine_distance('[1,1]'::vector, '[1,2]');";
         assert_eq!(raw(sql, &a, &b), DiffClass::Ruled("b1-float-ulp".to_string()));
         assert_eq!(compare(&table, 4, sql, &a, &b, true).class, DiffClass::Ruled(RULING_ID.to_string()));
+    }
+
+    #[test]
+    fn pgvector_escalates_every_classify_ruling_but_its_own() {
+        let table = crate::ruled::default_table();
+        let raw = |sql: &str, a: &StmtOutcome, b: &StmtOutcome| {
+            classify(&DiffInput { sql, a, b, ulp_tol: 4, soft_cols: &[], mask_explain_timing: false }).class
+        };
+        // A ledger row outside the old denylist: a B-only parallel-worker
+        // failure is ruled by classify, and must be a finding here.
+        let sql = "SELECT l2_distance('[1]'::vector, '[2]');";
+        let (a, b) = (
+            rows("1"),
+            StmtOutcome::Error {
+                sqlstate: "55000".to_string(),
+                message: "parallel worker failed to initialize".to_string(),
+            },
+        );
+        assert_eq!(raw(sql, &a, &b), DiffClass::Ruled("parallel-worker-init".to_string()));
+        for tolerant in [false, true] {
+            let c = compare(&table, 4, sql, &a, &b, tolerant);
+            assert!(is_finding(&c), "{c:?}");
+            assert!(c.detail.contains("parallel-worker-init does not apply"), "{}", c.detail);
+        }
+    }
+
+    #[test]
+    fn pgvector_copy_payloads_compare_byte_for_byte() {
+        let table = crate::ruled::default_table();
+        let sql = "COPY (VALUES ('[1]'::halfvec)) TO STDOUT (FORMAT binary);";
+        let co = |bytes: &[u8]| StmtOutcome::CopyOut { bytes: bytes.to_vec(), tag: "COPY 1".to_string() };
+        assert_eq!(compare(&table, 4, sql, &co(b"PGCOPY\n\x3c\x00"), &co(b"PGCOPY\n\x3c\x00"), false).class, DiffClass::Match);
+        let c = compare(&table, 4, sql, &co(b"PGCOPY\n\x3c\x00"), &co(b"PGCOPY\n\x3c\x01"), false);
+        assert!(is_finding(&c), "{c:?}");
+    }
+
+    /// Answers every statement with one fixed outcome, CREATE EXTENSION with
+    /// another.
+    struct Canned {
+        setup: StmtOutcome,
+        other: StmtOutcome,
+    }
+
+    impl Executor for Canned {
+        fn apply(&mut self, sql: &str) -> StmtOutcome {
+            if sql.starts_with("CREATE EXTENSION") { self.setup.clone() } else { self.other.clone() }
+        }
+    }
+
+    #[test]
+    fn pgvector_setup_must_succeed_on_a() {
+        let table = crate::ruled::default_table();
+        let ok = StmtOutcome::Command { tag: "CREATE EXTENSION".to_string(), affected: None };
+        let err = StmtOutcome::Error { sqlstate: "58P01".to_string(), message: "could not open extension control file".to_string() };
+        let other = StmtOutcome::Command { tag: "SELECT".to_string(), affected: None };
+        let run = |setup: &StmtOutcome| {
+            let mut a = Canned { setup: setup.clone(), other: other.clone() };
+            let mut b = Canned { setup: setup.clone(), other: other.clone() };
+            run_suite(&mut a, &mut b, &table, 4, 1, 3).1
+        };
+        let s = run(&ok);
+        assert_eq!((s[0].name.as_str(), s[0].matches, s[0].findings), ("setup", 1, 0));
+        // The same error on both sides matches outcome-wise, but setup is a
+        // finding: a reference without the extension must not pass.
+        let s = run(&err);
+        assert_eq!((s[0].name.as_str(), s[0].matches, s[0].findings), ("setup", 0, 1));
+        assert!(s[1..].iter().all(|x| x.findings == 0), "only setup fails");
     }
 }

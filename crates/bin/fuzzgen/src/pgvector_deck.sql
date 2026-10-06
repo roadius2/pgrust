@@ -1,9 +1,13 @@
 -- pgvector exact-differential deck (diffrunner --pgvector; pgvector Phase 1
 -- spec §8.2). One statement per line, each run on both servers. A
 -- `-- section: <name>` line starts a section; other `--` lines and blank
--- lines are skipped. Integer and dyadic data keep float sums exact; the
--- few non-integral distances and norms (sections distance and norm, the
--- only tolerant ones) fall under the pgvector-float-rel ruling.
+-- lines are skipped. Statements start with SELECT or COPY (. Integer and
+-- dyadic data keep float sums exact; the few non-integral distances and
+-- norms (sections distance and norm, the only tolerant ones) fall under the
+-- pgvector-float-rel ruling. Sections normalize and denormal compare
+-- exactly: l2_normalize is elementwise, and the denormal cases have one
+-- non-zero term each (no cancellation, no order dependence) and only
+-- non-negative products that underflow, so fused and unfused sums agree.
 
 -- section: io
 SELECT '[1,2,3]'::vector, '[-1.5,0,2.25]'::vector, ' [ 1 , 2 ] '::vector;
@@ -47,6 +51,8 @@ SELECT '{1:1}/'::sparsevec;
 SELECT '{a:1}/1'::sparsevec;
 SELECT '{1 2}/2'::sparsevec;
 SELECT '{1:}/1'::sparsevec;
+SELECT halfvec_send('[1,2,-0.5,65504,6e-8,-0]'::halfvec), sparsevec_send('{1:1.5,3:-2}/5'::sparsevec), sparsevec_send('{}/7'::sparsevec), sparsevec_send('{1000000000:1}/1000000000'::sparsevec);
+COPY (VALUES ('[1,-2.5,0]'::vector, '[1,-0.5,6e-8]'::halfvec, '{1:1.5,3:-2}/5'::sparsevec), ('[-0,1e-40,3.4e38]', '[65504,-0,-6e-8]', '{}/5')) TO STDOUT (FORMAT binary);
 
 -- section: typmod
 SELECT '[1,2,3]'::vector(3), '[1,2,3]'::halfvec(3), '{}/3'::sparsevec(3);
@@ -133,12 +139,25 @@ SELECT l1_distance('[1,2]'::vector, '[3]');
 
 -- section: norm
 SELECT vector_norm('[3,4]'), l2_norm('[3,4]'::halfvec), l2_norm('{1:3,2:4}/2'::sparsevec), l2_norm('{}/2'::sparsevec);
+SELECT l2_norm('{1:3e37,2:4e37}/2'::sparsevec)::real, l2_norm('[65504,65504]'::halfvec);
+
+-- section: normalize
 SELECT l2_normalize('[3,4]'::vector), l2_normalize('[3,4]'::halfvec), l2_normalize('{1:3,2:4}/2'::sparsevec);
 SELECT l2_normalize('[0,0]'::vector), l2_normalize('[0,0]'::halfvec), l2_normalize('{}/2'::sparsevec);
 SELECT l2_normalize('[0.1,0.2,0.3]'::vector), l2_normalize('[0.1,0.2,0.3]'::halfvec), l2_normalize('{1:0.1,3:0.3}/4'::sparsevec);
 SELECT l2_normalize('[65504]'::halfvec), l2_normalize('[6e-8]'::halfvec), l2_normalize('{1:3e38}/1'::sparsevec);
 SELECT l2_normalize('{1:3e38,2:1e-37}/2'::sparsevec), l2_normalize('{2:3e37,4:3e-37,6:4e37,8:4e-37}/9'::sparsevec);
-SELECT l2_norm('{1:3e37,2:4e37}/2'::sparsevec)::real, vector_norm('[1e-40,1e-40]'), l2_norm('[65504,65504]'::halfvec);
+SELECT l2_normalize('[1e-40,0]'::vector), l2_normalize('{2:1.4e-45}/2'::sparsevec), l2_normalize('[0,6e-8]'::halfvec);
+
+-- section: denormal
+SELECT l2_distance('[1e-20]'::vector, '[0]'), l2_distance('[1e-40]'::vector, '[0]'), l1_distance('[1e-40]'::vector, '[-1e-40]'), l1_distance('[1.4e-45]'::vector, '[0]');
+SELECT inner_product('[1e-40]'::vector, '[1e-5]'), inner_product('[1e-20]'::vector, '[1e-20]'), inner_product('[1e-40]'::vector, '[1e-40]'), '[1e-20]'::vector <#> '[1e-20]';
+SELECT cosine_distance('[1e-20]'::vector, '[2e-20]'), '[1e-40]'::vector <=> '[1e-40]', '[1e-20,0,0,0,0]'::vector <-> '[0,0,0,0,0]', '[0,0,0,1.4e-45]'::vector <+> '[0,0,0,0]';
+SELECT vector_norm('[1e-40]'), vector_norm('[1e-40,1e-40]'), vector_norm('[1.4e-45]');
+SELECT l2_distance('[6e-8]'::halfvec, '[0]'), l1_distance('[6e-8]'::halfvec, '[-6e-8]'), inner_product('[6e-8]'::halfvec, '[6e-8]'), cosine_distance('[6e-8]'::halfvec, '[1.2e-7]');
+SELECT l2_norm('[6e-8]'::halfvec), l2_norm('[6e-8,-6e-8]'::halfvec), '[6e-8]'::halfvec <-> '[1.2e-7]', '[6e-8]'::halfvec <+> '[0]', '[6e-8]'::halfvec <#> '[1]';
+SELECT l2_norm('{1:1e-40}/1'::sparsevec), l2_norm('{1:1.4e-45}/3'::sparsevec), l2_distance('{1:1e-20}/2'::sparsevec, '{}/2'), l2_distance('{1:1e-40}/2'::sparsevec, '{2:1e-40}/2');
+SELECT inner_product('{1:1e-40}/2'::sparsevec, '{1:1e-5}/2'), inner_product('{2:1e-20}/2'::sparsevec, '{2:1e-20}/2'), l1_distance('{1:1e-40}/2'::sparsevec, '{2:-1.4e-45}/2'), '{1:1e-20}/1'::sparsevec <=> '{1:2e-20}/1';
 
 -- section: agg
 SELECT avg(v), sum(v) FROM (VALUES ('[1,2,3]'::halfvec), ('[3,5,7]'), (NULL)) t(v);
@@ -162,6 +181,7 @@ SELECT halfvec_cmp('[1,2]', '[1,2,3]'), halfvec_cmp('[2,3]', '[1,2,3]'), halfvec
 SELECT '{1:1,2:2,3:3}/3'::sparsevec < '{1:1,2:2}/2', '{1:1}/2'::sparsevec = '{1:1}/2', '{1:1}/2'::sparsevec <> '{1:1}/3', '{1:1}/2'::sparsevec >= '{2:1}/2';
 SELECT sparsevec_cmp('{1:1,2:2}/2', '{1:2,2:3,3:4}/3'), sparsevec_cmp('{1:2,2:3}/2', '{1:1,2:2,3:3}/3'), sparsevec_cmp('{2:-1}/3', '{1:1}/3'), sparsevec_cmp('{1:-1}/3', '{2:1}/3');
 SELECT sparsevec_cmp('{}/3', '{3:-1}/3'), sparsevec_cmp('{3:1}/3', '{}/2'), sparsevec_cmp('{1:1}/3', '{1:1,3:-1}/3'), sparsevec_cmp('{1:1,2:5}/2', '{1:1}/1');
+SELECT '{1:2}/2'::sparsevec > '{1:1}/2', '{1:1}/2'::sparsevec > '{1:1}/2', '{}/3'::sparsevec > '{3:-1}/3', '{1:1}/2'::sparsevec <= '{1:1}/3';
 SELECT v FROM (VALUES ('[1,2]'::halfvec), ('[1]'), ('[0,5]'), ('[1,2,0]'), ('[-1]')) t(v) ORDER BY v;
 SELECT v FROM (VALUES ('{1:1}/3'::sparsevec), ('{}/3'), ('{2:-1}/3'), ('{1:-1}/2'), ('{3:2}/3'), ('{}/2')) t(v) ORDER BY v;
 SELECT DISTINCT v FROM (VALUES ('[1,2]'::halfvec), ('[1,2]'), ('[2,1]')) t(v) ORDER BY v;
@@ -177,6 +197,7 @@ SELECT subvector('[1,2,3,4,5]'::halfvec, 2147483647, 10);
 SELECT binary_quantize('[1,0,-1,0.5,-0.5,2,-2,3,0.25]'::vector), binary_quantize('[1,0,-1,0.5,-0.5,2,-2,3,0.25]'::halfvec);
 SELECT binary_quantize('[0,-0]'::halfvec), binary_quantize('[6e-8]'::halfvec), binary_quantize('[-6e-8]'::halfvec);
 SELECT binary_quantize('[1,2,3,-4,5,6,-7,8,1,-2,-3,4,5,-6,7,8,-1,2,3]'::halfvec) <~> binary_quantize('[1,2,3,-4,5,6,-7,8,1,-2,-3,4,5,-6,7,8,-1,2,3]'::vector);
+SELECT pg_typeof('[1]'::vector::halfvec), pg_typeof('[1]'::vector::sparsevec), pg_typeof('[1]'::halfvec::vector), pg_typeof('[1]'::halfvec::sparsevec), pg_typeof('[1]'::halfvec::real[]), pg_typeof('{1:1}/1'::sparsevec::vector), pg_typeof('{1:1}/1'::sparsevec::halfvec), pg_typeof(ARRAY[1]::halfvec), pg_typeof(ARRAY[1]::sparsevec), pg_typeof('[1]'::halfvec + '[1]'), pg_typeof('[1]'::halfvec - '[1]'), pg_typeof('[1]'::halfvec * '[1]'), pg_typeof('[1]'::halfvec || '[1]'), pg_typeof('[1]'::vector + '[1]'), pg_typeof(l2_normalize('[1]'::vector)), pg_typeof(l2_normalize('[1]'::halfvec)), pg_typeof(l2_normalize('{1:1}/1'::sparsevec)), pg_typeof(subvector('[1,2]'::halfvec, 1, 1)), pg_typeof(binary_quantize('[1]'::halfvec)), pg_typeof(l2_norm('[1]'::halfvec)), pg_typeof(l2_norm('{1:1}/1'::sparsevec)), (SELECT pg_typeof(avg(v)) FROM (VALUES ('[1]'::halfvec)) t(v)), (SELECT pg_typeof(sum(v)) FROM (VALUES ('[1]'::halfvec)) t(v)), pg_typeof(halfvec_accum('{0}', '[1]')), pg_typeof(halfvec_avg('{1,1}'));
 
 -- section: bit
 SELECT hamming_distance('111', '111'), hamming_distance('111', '010'), hamming_distance('', ''), jaccard_distance('', '');
