@@ -210,7 +210,7 @@ const FIRST_NORMAL_OID: u32 = 16384;
 /// two engines that ran the same DDL assign user types from their own oid
 /// counters, so the raw values are environment. Builtin-vs-user and shape
 /// mismatches still diff.
-fn normalize_user_oids(o: &StmtOutcome) -> StmtOutcome {
+pub(crate) fn normalize_user_oids(o: &StmtOutcome) -> StmtOutcome {
     match o {
         StmtOutcome::Rows { col_oids, rows } => StmtOutcome::Rows {
             col_oids: col_oids

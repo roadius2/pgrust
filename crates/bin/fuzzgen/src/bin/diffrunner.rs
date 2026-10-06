@@ -107,6 +107,13 @@ usage: diffrunner --a <host:port> --b <host:port> [options]
                       per-side tablespace scratch dirs (paths normalized
                       to <TSDIR> before compare). Names embed --seed.
                       Ignores --count/--xproto/--replay.
+  --pgvector          run the pgvector exact-differential suite (pgvector
+                      Phase 1 spec §8.2) instead of a statement stream:
+                      CREATE EXTENSION vector, the fixed deck
+                      (src/pgvector_deck.sql), then a seeded arm sized by
+                      --count with --seed. Prints one \"pgvector
+                      section=<name> ...\" line per section to stderr.
+                      Ignores --xproto/--replay.
 ";
 
 #[derive(Clone)]
@@ -155,6 +162,7 @@ struct Args {
     copytext: bool,
     copyopts: bool,
     dbddl: bool,
+    pgvector: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -187,6 +195,7 @@ fn parse_args() -> Result<Args, String> {
         copytext: false,
         copyopts: false,
         dbddl: false,
+        pgvector: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -233,6 +242,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--copybin" => args.copybin = true,
             "--copytext" => args.copytext = true,
+            "--pgvector" => args.pgvector = true,
             "--copyopts" => args.copyopts = true,
             "--dbddl" => args.dbddl = true,
             "--help" | "-h" => {
@@ -244,7 +254,7 @@ fn parse_args() -> Result<Args, String> {
     }
     args.a = a.ok_or("--a is required")?;
     args.b = b.ok_or("--b is required")?;
-    if args.copybin || args.copytext || args.copyopts || args.dbddl {
+    if args.copybin || args.copytext || args.copyopts || args.dbddl || args.pgvector {
         // The suites always ride the simple protocol (their COPY FROM
         // feeds are unsupported on the extended path; dbddl owns its own
         // extended-replay pass) and own their decks.
@@ -434,6 +444,39 @@ fn run() -> Result<ExitCode, String> {
             stats.findings
         );
         return Ok(if stats.findings > 0 { ExitCode::from(2) } else { ExitCode::SUCCESS });
+    }
+
+    if args.pgvector {
+        // pgvector exact-differential suite: the deck plus a seeded arm
+        // sized by --count (deterministic in --seed).
+        let table = fuzzgen::ruled::default_table();
+        let (records, sections) =
+            fuzzgen::pgvector::run_suite(&mut *a, &mut *b, &table, args.ulp, args.seed, args.count);
+        let mut findings_out: Box<dyn Write> = match &args.findings {
+            Some(path) => Box::new(
+                std::fs::File::create(path).map_err(|e| format!("open {path}: {e}"))?,
+            ),
+            None => Box::new(std::io::stdout()),
+        };
+        writeln!(
+            findings_out,
+            "{{\"meta\":\"diffrunner\",\"suite\":\"pgvector\",\"seed\":{},\"count\":{},\"guc_pin\":{}}}",
+            args.seed, args.count, args.guc_pin
+        )
+        .map_err(|e| e.to_string())?;
+        for r in &records {
+            writeln!(findings_out, "{}", r.to_jsonl(args.seed)).map_err(|e| e.to_string())?;
+        }
+        drop(findings_out);
+        let mut findings = 0;
+        for s in &sections {
+            eprintln!(
+                "diffrunner: pgvector section={} cases={} matches={} ruled={} findings={}",
+                s.name, s.cases, s.matches, s.ruled, s.findings
+            );
+            findings += s.findings;
+        }
+        return Ok(if findings > 0 { ExitCode::from(2) } else { ExitCode::SUCCESS });
     }
 
     if args.copyopts {

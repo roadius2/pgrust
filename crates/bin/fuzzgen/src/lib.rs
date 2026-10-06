@@ -282,6 +282,7 @@ pub mod part;
 pub mod partalt;
 pub mod partition;
 pub mod pgram;
+pub mod pgvector;
 pub mod plancache;
 pub mod plansel;
 pub mod planner;

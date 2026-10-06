@@ -354,3 +354,12 @@ ref = "sitediff run 2 N-5b: catcache.c RehashCatCache's DEBUG1 fires on the C si
 owner = "sitediff N-5 cosmetics lane (2026-09-10)"
 created = "2026-09-10"
 hits = 0
+
+[[ruling]]
+id = "pgvector-float-rel"
+plane = "rows"
+field = "pgvector-rel"
+ref = "pgvector Phase 1 spec §2 and §8.2: distances are not bit-exact (pgvector builds with -fassociative-math and fused multiply-adds, so its f32 sums follow the compiler's order); the diffrunner --pgvector suite rules a row-set divergence whose differing numerals are non-integral on at least one side and within 1e-5 relative, floored at magnitude 1 (fuzzgen pgvector.rs REL_TOL); integral numerals, structure, row order and errors still compare exactly"
+owner = "pgvector M2 exact-differential tier (scripts/pgvector/run-diff.sh)"
+created = "2026-10-06"
+hits = 0
