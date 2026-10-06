@@ -19,6 +19,11 @@ use types_error::{
 };
 use types_fmgr::{cstring_result, FmgrInfo, FunctionCallInfoBaseData as Fcinfo};
 
+use crate::funcs::{build_state_array, StateArray};
+use crate::halfutils::{
+    half_is_zero, halfvec_cosine_similarity, halfvec_inner_product, halfvec_l1_distance,
+    halfvec_l2_squared_distance,
+};
 use crate::funcs::{arg_vector, cast_array_elems, cast_elem_f32, detoasted_image, image_datum, ArraySite};
 use crate::halfutils::{float4_to_half, float4_to_half_unchecked, half_is_inf, half_is_nan, half_to_float4, Half};
 use crate::vec::{strtof_prefix, vector_isspace as halfvec_isspace, StrtofVal};
@@ -439,6 +444,339 @@ pub fn fc_vector_to_halfvec(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> P
     Ok(image_datum(b.image()))
 }
 
+fn halfvec_2arg(fcinfo: &Fcinfo) -> PgResult<(HalfView<'_>, HalfView<'_>)> {
+    // SAFETY: strict fns — args 0 and 1 are halfvecs.
+    let a = unsafe { arg_halfvec(fcinfo, 0)? };
+    let b = unsafe { arg_halfvec(fcinfo, 1)? };
+    Ok((a, b))
+}
+
+// halfvec_l2_distance (halfvec.c:560-570).
+pub fn fc_halfvec_l2_distance(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = halfvec_2arg(fcinfo)?;
+    check_dims(&a, &b)?;
+    Ok(Datum::from_f64((halfvec_l2_squared_distance(a.dim(), a.xs(), b.xs()) as f64).sqrt()))
+}
+
+// halfvec_l2_squared_distance (halfvec.c:575-585).
+pub fn fc_halfvec_l2_squared_distance(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = halfvec_2arg(fcinfo)?;
+    check_dims(&a, &b)?;
+    Ok(Datum::from_f64(halfvec_l2_squared_distance(a.dim(), a.xs(), b.xs()) as f64))
+}
+
+// halfvec_inner_product (halfvec.c:590-600).
+pub fn fc_halfvec_inner_product(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = halfvec_2arg(fcinfo)?;
+    check_dims(&a, &b)?;
+    Ok(Datum::from_f64(halfvec_inner_product(a.dim(), a.xs(), b.xs()) as f64))
+}
+
+// halfvec_negative_inner_product (halfvec.c:605-615).
+pub fn fc_halfvec_negative_inner_product(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = halfvec_2arg(fcinfo)?;
+    check_dims(&a, &b)?;
+    Ok(Datum::from_f64(-halfvec_inner_product(a.dim(), a.xs(), b.xs()) as f64))
+}
+
+// halfvec_cosine_distance (halfvec.c:620-645).
+pub fn fc_halfvec_cosine_distance(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = halfvec_2arg(fcinfo)?;
+    check_dims(&a, &b)?;
+    let mut similarity = halfvec_cosine_similarity(a.dim(), a.xs(), b.xs());
+    // Keep in range
+    if similarity > 1.0 {
+        similarity = 1.0;
+    } else if similarity < -1.0 {
+        similarity = -1.0;
+    }
+    Ok(Datum::from_f64(1.0 - similarity))
+}
+
+// halfvec_spherical_distance (halfvec.c:652-671).
+pub fn fc_halfvec_spherical_distance(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = halfvec_2arg(fcinfo)?;
+    check_dims(&a, &b)?;
+    let mut distance = halfvec_inner_product(a.dim(), a.xs(), b.xs()) as f64;
+    // Prevent NaN with acos with loss of precision
+    if distance > 1.0 {
+        distance = 1.0;
+    } else if distance < -1.0 {
+        distance = -1.0;
+    }
+    Ok(Datum::from_f64(distance.acos() / core::f64::consts::PI))
+}
+
+// halfvec_l1_distance (halfvec.c:676-686).
+pub fn fc_halfvec_l1_distance(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = halfvec_2arg(fcinfo)?;
+    check_dims(&a, &b)?;
+    Ok(Datum::from_f64(halfvec_l1_distance(a.dim(), a.xs(), b.xs()) as f64))
+}
+
+// halfvec_vector_dims (halfvec.c:691-698).
+pub fn fc_halfvec_vector_dims(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: strict fn — arg0 halfvec.
+    let a = unsafe { arg_halfvec(fcinfo, 0)? };
+    Ok(Datum::from_i32(a.dim() as i32))
+}
+
+// halfvec_l2_norm (halfvec.c:703-720).
+pub fn fc_halfvec_l2_norm(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: strict fn — arg0 halfvec.
+    let a = unsafe { arg_halfvec(fcinfo, 0)? };
+    let mut norm = 0.0f64;
+    for i in 0..a.dim() {
+        let axi = half_to_float4(a.x(i)) as f64;
+        norm += axi * axi;
+    }
+    Ok(Datum::from_f64(norm.sqrt()))
+}
+
+// halfvec_l2_normalize (halfvec.c:725-759).
+pub fn fc_halfvec_l2_normalize(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: strict fn — arg0 halfvec.
+    let a = unsafe { arg_halfvec(fcinfo, 0)? };
+    let mut r = HalfBuilder::new(fcinfo.result_mcx(), a.dim())?;
+    let mut norm = 0.0f64;
+    for i in 0..a.dim() {
+        norm += half_to_float4(a.x(i)) as f64 * half_to_float4(a.x(i)) as f64;
+    }
+    norm = norm.sqrt();
+    // Return zero vector for zero norm
+    if norm > 0.0 {
+        for i in 0..a.dim() {
+            // C passes the double quotient to Float4ToHalfUnchecked(float).
+            r.set(i, float4_to_half_unchecked((half_to_float4(a.x(i)) as f64 / norm) as f32));
+        }
+        // Check for overflow
+        for i in 0..a.dim() {
+            if half_is_inf(r.get(i)) {
+                return Err(Box::new(adt_float::float_overflow_error()));
+            }
+        }
+    }
+    Ok(image_datum(r.image()))
+}
+
+// halfvec_add/sub/mul (halfvec.c:764-879): each result widens to f32 and
+// rounds once (equal to C's _Float16 arithmetic, pgvector_f16_parity).
+fn elementwise(fcinfo: &mut Fcinfo, op: impl Fn(f32, f32) -> f32, check_underflow: bool) -> PgResult<Datum> {
+    let (a, b) = halfvec_2arg(fcinfo)?;
+    check_dims(&a, &b)?;
+    let mut r = HalfBuilder::new(fcinfo.result_mcx(), a.dim())?;
+    for i in 0..a.dim() {
+        r.set(i, float4_to_half_unchecked(op(half_to_float4(a.x(i)), half_to_float4(b.x(i)))));
+    }
+    // Check for overflow (and, for mul, underflow)
+    for i in 0..a.dim() {
+        if half_is_inf(r.get(i)) {
+            return Err(Box::new(adt_float::float_overflow_error()));
+        }
+        if check_underflow && half_is_zero(r.get(i)) && !(half_is_zero(a.x(i)) || half_is_zero(b.x(i))) {
+            return Err(Box::new(adt_float::float_underflow_error()));
+        }
+    }
+    Ok(image_datum(r.image()))
+}
+
+// halfvec_add (halfvec.c:764-798).
+pub fn fc_halfvec_add(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    elementwise(fcinfo, |x, y| x + y, false)
+}
+
+// halfvec_sub (halfvec.c:803-837).
+pub fn fc_halfvec_sub(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    elementwise(fcinfo, |x, y| x - y, false)
+}
+
+// halfvec_mul (halfvec.c:842-879).
+pub fn fc_halfvec_mul(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    elementwise(fcinfo, |x, y| x * y, true)
+}
+
+// halfvec_concat (halfvec.c:884-903).
+pub fn fc_halfvec_concat(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = halfvec_2arg(fcinfo)?;
+    let dim = a.dim() + b.dim();
+    check_dim(dim as i32)?;
+    let mut r = HalfBuilder::new(fcinfo.result_mcx(), dim)?;
+    for i in 0..a.dim() {
+        r.set(i, a.x(i));
+    }
+    for i in 0..b.dim() {
+        r.set(a.dim() + i, b.x(i));
+    }
+    Ok(image_datum(r.image()))
+}
+
+// halfvec_binary_quantize (halfvec.c:908-934): bit i is set when x[i] > 0.
+pub fn fc_halfvec_binary_quantize(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: strict fn — arg0 halfvec.
+    let a = unsafe { arg_halfvec(fcinfo, 0)? };
+    let mut img = crate::bitvec::init_bit_vector(fcinfo.result_mcx(), a.dim())?;
+    for i in 0..a.dim() {
+        if half_to_float4(a.x(i)) > 0.0 {
+            img[8 + i / 8] |= 1 << (7 - (i % 8));
+        }
+    }
+    Ok(image_datum(img))
+}
+
+// halfvec_subvector (halfvec.c:939-981).
+pub fn fc_halfvec_subvector(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: strict fn — arg0 halfvec, args 1-2 int4.
+    let a = unsafe { arg_halfvec(fcinfo, 0)? };
+    let mut start = fcinfo.arg_i32(1);
+    let count = fcinfo.arg_i32(2);
+    if count < 1 {
+        return Err(ereport(ERRCODE_DATA_EXCEPTION, "halfvec must have at least 1 dimension", 954, "halfvec_subvector"));
+    }
+    let adim = a.dim() as i32;
+    // Check if (start + count > a->dim), avoiding integer overflow. a->dim
+    // and count are both positive, so a->dim - count won't overflow.
+    let end = if start > adim - count { adim + 1 } else { start + count };
+    // Indexing starts at 1, like substring
+    if start < 1 {
+        start = 1;
+    } else if start > adim {
+        return Err(ereport(ERRCODE_DATA_EXCEPTION, "halfvec must have at least 1 dimension", 971, "halfvec_subvector"));
+    }
+    let dim = end - start;
+    check_dim(dim)?;
+    let mut r = HalfBuilder::new(fcinfo.result_mcx(), dim as usize)?;
+    for i in 0..dim as usize {
+        r.set(i, a.x((start - 1) as usize + i));
+    }
+    Ok(image_datum(r.image()))
+}
+
+// halfvec_cmp_internal (halfvec.c:986-1008).
+fn halfvec_cmp_internal(a: &HalfView<'_>, b: &HalfView<'_>) -> i32 {
+    let dim = a.dim().min(b.dim());
+    // Check values before dimensions to be consistent with Postgres arrays
+    for i in 0..dim {
+        if half_to_float4(a.x(i)) < half_to_float4(b.x(i)) {
+            return -1;
+        }
+        if half_to_float4(a.x(i)) > half_to_float4(b.x(i)) {
+            return 1;
+        }
+    }
+    if a.dim() < b.dim() {
+        return -1;
+    }
+    if a.dim() > b.dim() {
+        return 1;
+    }
+    0
+}
+
+// halfvec_lt (halfvec.c:1013-1021).
+pub fn fc_halfvec_lt(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = halfvec_2arg(fcinfo)?;
+    Ok(Datum::from_bool(halfvec_cmp_internal(&a, &b) < 0))
+}
+
+// halfvec_le (halfvec.c:1026-1034).
+pub fn fc_halfvec_le(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = halfvec_2arg(fcinfo)?;
+    Ok(Datum::from_bool(halfvec_cmp_internal(&a, &b) <= 0))
+}
+
+// halfvec_eq (halfvec.c:1039-1047).
+pub fn fc_halfvec_eq(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = halfvec_2arg(fcinfo)?;
+    Ok(Datum::from_bool(halfvec_cmp_internal(&a, &b) == 0))
+}
+
+// halfvec_ne (halfvec.c:1052-1060).
+pub fn fc_halfvec_ne(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = halfvec_2arg(fcinfo)?;
+    Ok(Datum::from_bool(halfvec_cmp_internal(&a, &b) != 0))
+}
+
+// halfvec_ge (halfvec.c:1065-1073).
+pub fn fc_halfvec_ge(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = halfvec_2arg(fcinfo)?;
+    Ok(Datum::from_bool(halfvec_cmp_internal(&a, &b) >= 0))
+}
+
+// halfvec_gt (halfvec.c:1078-1086).
+pub fn fc_halfvec_gt(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = halfvec_2arg(fcinfo)?;
+    Ok(Datum::from_bool(halfvec_cmp_internal(&a, &b) > 0))
+}
+
+// halfvec_cmp (halfvec.c:1091-1099).
+pub fn fc_halfvec_cmp(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = halfvec_2arg(fcinfo)?;
+    Ok(Datum::from_i32(halfvec_cmp_internal(&a, &b)))
+}
+
+// CheckStateArray (halfvec.c:166-175), raised from halfvec.c.
+fn check_state_array<'a>(mcx: Mcx<'a>, d: Datum, caller: &str) -> PgResult<StateArray<'a>> {
+    StateArray::check(mcx, d, caller)
+        .map_err(|e| Box::new((*e).with_location("halfvec.c", 173, "CheckStateArray")))
+}
+
+// halfvec_accum (halfvec.c:1104-1160).
+pub fn fc_halfvec_accum(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let mcx = fcinfo.result_mcx();
+    let state = check_state_array(mcx, fcinfo.arg(0), "halfvec_accum")?;
+    // SAFETY: strict fn — arg1 halfvec.
+    let newval = unsafe { arg_halfvec(fcinfo, 1)? };
+
+    let mut dim = state.state_dims();
+    let newarr = dim == 0;
+    if newarr {
+        dim = newval.dim();
+    } else {
+        check_expected_dim(dim as i32, newval.dim() as i32)?;
+    }
+
+    let n = state.value(0) + 1.0;
+    let mut datums: PgVec<'_, Datum> = mcx::vec_with_capacity_in(mcx, dim + 1)?;
+    datums.push(Datum::from_f64(n));
+    if newarr {
+        for i in 0..dim {
+            datums.push(Datum::from_f64(half_to_float4(newval.x(i)) as f64));
+        }
+    } else {
+        for i in 0..dim {
+            let v = state.value(i + 1) + half_to_float4(newval.x(i)) as f64;
+            // Check for overflow
+            if v.is_infinite() {
+                return Err(Box::new(adt_float::float_overflow_error()));
+            }
+            datums.push(Datum::from_f64(v));
+        }
+    }
+    Ok(image_datum(build_state_array(mcx, &datums)?))
+}
+
+// halfvec_avg (halfvec.c:1165-1194).
+pub fn fc_halfvec_avg(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let mcx = fcinfo.result_mcx();
+    let state = check_state_array(mcx, fcinfo.arg(0), "halfvec_avg")?;
+    let n = state.value(0);
+    // SQL defines AVG of no values to be NULL
+    if n == 0.0 {
+        fcinfo.isnull = true;
+        return Ok(Datum::null());
+    }
+    let dim = state.state_dims();
+    check_dim(dim as i32)?;
+    let mut b = HalfBuilder::new(mcx, dim)?;
+    for i in 0..dim {
+        // C passes the double quotient to Float4ToHalf(float).
+        let x = float4_to_half((state.value(i + 1) / n) as f32)?;
+        check_element(x)?;
+        b.set(i, x);
+    }
+    Ok(image_datum(b.image()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,5 +879,30 @@ mod tests {
         let mut ok = vec![0u8; 4 + 4];
         ok[..2].copy_from_slice(&2i16.to_ne_bytes());
         assert_eq!(HalfView::from_payload(&ok).unwrap().dim(), 2);
+    }
+
+    fn image<'m>(m: mcx::Mcx<'m>, v: &[f32]) -> mcx::PgVec<'m, u8> {
+        let mut b = HalfBuilder::new(m, v.len()).unwrap();
+        for (i, x) in v.iter().enumerate() {
+            b.set(i, float4_to_half_unchecked(*x));
+        }
+        b.image()
+    }
+
+    // halfvec.out: halfvec_cmp('[1,2]', '[1,2,3]') = -1,
+    // halfvec_cmp('[2,3]', '[1,2,3]') = 1; values before dimensions.
+    #[test]
+    fn cmp_compares_values_before_dimensions() {
+        let ctx = mcx::MemoryContext::new("halfvec-test");
+        let m = ctx.mcx();
+        let (a, b, c) = (image(m, &[1.0, 2.0]), image(m, &[1.0, 2.0, 3.0]), image(m, &[2.0, 3.0]));
+        fn view(img: &[u8]) -> HalfView<'_> {
+            HalfView::from_payload(&img[4..]).unwrap()
+        }
+        assert_eq!(halfvec_cmp_internal(&view(&a), &view(&b)), -1);
+        assert_eq!(halfvec_cmp_internal(&view(&c), &view(&b)), 1);
+        assert_eq!(halfvec_cmp_internal(&view(&a), &view(&a)), 0);
+        let (z, nz) = (image(m, &[0.0]), image(m, &[-0.0]));
+        assert_eq!(halfvec_cmp_internal(&view(&z), &view(&nz)), 0);
     }
 }
