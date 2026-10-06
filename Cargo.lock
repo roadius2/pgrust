@@ -13909,6 +13909,7 @@ version = "0.0.0"
 dependencies = [
  "adt_float",
  "adt_numeric",
+ "adt_varbit",
  "arrayfuncs",
  "datum",
  "detoast",

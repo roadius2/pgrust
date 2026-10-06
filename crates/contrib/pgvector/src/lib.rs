@@ -5,6 +5,8 @@
 //! M4 (spec §4.6). DIVERGENCE: pg_get_loaded_modules() reports 18.6 for this
 //! library; C reports PG_MODULE_MAGIC_EXT's "0.8.7" (vector.c:49). Revisit in M4.
 
+pub mod bitutils;
+pub mod bitvec;
 pub mod funcs;
 pub mod vec;
 
@@ -49,6 +51,8 @@ fn lookup(function: &str) -> Option<PGFunction> {
         "vector_accum" => fc_vector_accum,
         "vector_combine" => fc_vector_combine,
         "vector_avg" => fc_vector_avg,
+        "hamming_distance" => bitvec::fc_hamming_distance,
+        "jaccard_distance" => bitvec::fc_jaccard_distance,
         "hnswhandler" => fc_hnswhandler,
         _ => return None,
     })
@@ -69,4 +73,51 @@ pub fn init_seams() {
         lookup,
         pg_init: None,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    // Every extension script pgrust ships.
+    const SHIPPED_SCRIPTS: &[(&str, &str)] =
+        &[("vector--0.8.5.sql", include_str!("../extension/vector--0.8.5.sql"))];
+
+    /// The C symbol of every `CREATE FUNCTION ... AS 'MODULE_PATHNAME'` in a
+    /// script: the link symbol after the comma, else the SQL name (which
+    /// CREATE FUNCTION stores as prosrc).
+    fn module_pathname_symbols(script: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for stmt in script.split(';') {
+            let Some(pos) = stmt.find("CREATE FUNCTION ") else { continue };
+            let rest = &stmt[pos + "CREATE FUNCTION ".len()..];
+            let Some(at) = rest.find("AS 'MODULE_PATHNAME'") else { continue };
+            let name = rest[..rest.find('(').expect("argument list")].trim();
+            let after = rest[at + "AS 'MODULE_PATHNAME'".len()..].trim_start();
+            out.push(match after.strip_prefix(',') {
+                Some(link) => link.trim_start().trim_start_matches('\'').split('\'').next().unwrap().to_string(),
+                None => name.to_string(),
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn lookup_coverage_parser_reads_link_symbols() {
+        let sql = "-- halfvec functions\n\nCREATE FUNCTION l2_distance(halfvec, halfvec) RETURNS float8\n\
+                   \tAS 'MODULE_PATHNAME', 'halfvec_l2_distance' LANGUAGE C;\n\n\
+                   CREATE FUNCTION vector_in(cstring) RETURNS vector\n\tAS 'MODULE_PATHNAME' LANGUAGE C;\n\n\
+                   CREATE AGGREGATE avg(vector) (SFUNC = vector_accum, STYPE = double precision[]);";
+        assert_eq!(module_pathname_symbols(sql), vec!["halfvec_l2_distance", "vector_in"]);
+    }
+
+    // Spec §4.6: CREATE EXTENSION stops at the first CREATE FUNCTION whose
+    // symbol `lookup` cannot resolve.
+    #[test]
+    fn lookup_covers_every_module_pathname_symbol() {
+        for (file, script) in SHIPPED_SCRIPTS {
+            let symbols = module_pathname_symbols(script);
+            assert!(symbols.len() >= 35, "{file}: parsed only {} symbols", symbols.len());
+            let missing: Vec<&String> = symbols.iter().filter(|s| super::lookup(s).is_none()).collect();
+            assert!(missing.is_empty(), "{file}: no lookup entry for {missing:?}");
+        }
+    }
 }

@@ -287,3 +287,23 @@ CREATE OPERATOR CLASS vector_l1_ops
 	FOR TYPE vector USING hnsw AS
 	OPERATOR 1 <+> (vector, vector) FOR ORDER BY float_ops,
 	FUNCTION 1 l1_distance(vector, vector);
+
+-- bit functions
+
+CREATE FUNCTION hamming_distance(bit, bit) RETURNS float8
+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION jaccard_distance(bit, bit) RETURNS float8
+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+-- bit operators
+
+CREATE OPERATOR <~> (
+	LEFTARG = bit, RIGHTARG = bit, PROCEDURE = hamming_distance,
+	COMMUTATOR = '<~>'
+);
+
+CREATE OPERATOR <%> (
+	LEFTARG = bit, RIGHTARG = bit, PROCEDURE = jaccard_distance,
+	COMMUTATOR = '<%>'
+);
