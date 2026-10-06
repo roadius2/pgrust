@@ -574,3 +574,31 @@ CREATE OPERATOR CLASS halfvec_ops
 	OPERATOR 4 >= ,
 	OPERATOR 5 > ,
 	FUNCTION 1 halfvec_cmp(halfvec, halfvec);
+
+-- sparsevec type
+
+CREATE TYPE sparsevec;
+
+CREATE FUNCTION sparsevec_in(cstring, oid, integer) RETURNS sparsevec
+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION sparsevec_out(sparsevec) RETURNS cstring
+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION sparsevec_typmod_in(cstring[]) RETURNS integer
+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION sparsevec_recv(internal, oid, integer) RETURNS sparsevec
+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION sparsevec_send(sparsevec) RETURNS bytea
+	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE TYPE sparsevec (
+	INPUT     = sparsevec_in,
+	OUTPUT    = sparsevec_out,
+	TYPMOD_IN = sparsevec_typmod_in,
+	RECEIVE   = sparsevec_recv,
+	SEND      = sparsevec_send,
+	STORAGE   = external
+);

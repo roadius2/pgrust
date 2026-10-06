@@ -10,6 +10,7 @@ pub mod bitvec;
 pub mod funcs;
 pub mod halfutils;
 pub mod halfvec;
+pub mod sparsevec;
 pub mod vec;
 
 use types_fmgr::PGFunction;
@@ -88,6 +89,11 @@ fn lookup(function: &str) -> Option<PGFunction> {
         "halfvec_cmp" => halfvec::fc_halfvec_cmp,
         "halfvec_accum" => halfvec::fc_halfvec_accum,
         "halfvec_avg" => halfvec::fc_halfvec_avg,
+        "sparsevec_in" => sparsevec::fc_sparsevec_in,
+        "sparsevec_out" => sparsevec::fc_sparsevec_out,
+        "sparsevec_typmod_in" => sparsevec::fc_sparsevec_typmod_in,
+        "sparsevec_recv" => sparsevec::fc_sparsevec_recv,
+        "sparsevec_send" => sparsevec::fc_sparsevec_send,
         "hamming_distance" => bitvec::fc_hamming_distance,
         "jaccard_distance" => bitvec::fc_jaccard_distance,
         "hnswhandler" => fc_hnswhandler,

@@ -28,3 +28,4 @@ adt_numeric = { path = "../../backend/utils/adt/numeric" }
 detoast = { path = "../../backend/access/common/detoast" }
 stringinfo = { path = "../../_support/types/stringinfo" }
 adt_varbit = { path = "../../backend/utils/adt/varbit" }
+numutils = { path = "../../backend/utils/adt/numutils" }
