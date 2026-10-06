@@ -2,7 +2,8 @@
 -- spec §8.2). One statement per line, each run on both servers. A
 -- `-- section: <name>` line starts a section; other `--` lines and blank
 -- lines are skipped. Integer and dyadic data keep float sums exact; the
--- few non-integral distances fall under the pgvector-float-rel ruling.
+-- few non-integral distances and norms (sections distance and norm, the
+-- only tolerant ones) fall under the pgvector-float-rel ruling.
 
 -- section: io
 SELECT '[1,2,3]'::vector, '[-1.5,0,2.25]'::vector, ' [ 1 , 2 ] '::vector;

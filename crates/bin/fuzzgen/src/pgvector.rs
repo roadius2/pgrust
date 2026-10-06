@@ -4,14 +4,23 @@
 //! operator and aggregate, their error cases, and exact (non-index)
 //! nearest-neighbour queries against a reference (A) and a subject (B).
 //!
-//! Outcomes compare as everywhere in diffrunner (errors by SQLSTATE and
-//! message, rows by text, float columns by ulp), with one widening scoped to
-//! this suite: a row-set divergence whose differing numerals are
-//! non-integral on at least one side and within REL_TOL relative (floored at
-//! magnitude 1) is RULED under `pgvector-float-rel`. pgvector builds with
-//! -fassociative-math and fuses multiply-adds, so its f32 sums are not
-//! bit-reproducible (spec §2); integral numerals (indices, dimensions, exact
-//! sums), structure, row order and errors still compare exactly.
+//! Outcomes compare exactly: errors by SQLSTATE and message, rows by text in
+//! row order. Three classify rulings that would widen that are not accepted
+//! here and escalate to ROWSET_DIFF (EXACT_RULINGS): `tie-ordering` (every
+//! ORDER BY in the suite is a total order), `cmp-magnitude` (halfvec_cmp and
+//! sparsevec_cmp return exactly -1/0/1) and `b1-float-ulp` (no float ulp
+//! slack outside the one widening below).
+//!
+//! The one widening is scoped to distance and norm statements: deck sections
+//! `distance` and `norm`, and the seeded distance-function, distance-operator,
+//! norm and sparsevec-metric statements. There, a row-set divergence whose
+//! differing numerals are non-integral on at least one side and within
+//! REL_TOL relative (floored at magnitude 1), cell by cell in row order, is
+//! RULED under `pgvector-float-rel`. pgvector builds with -fassociative-math
+//! and fuses multiply-adds, so its f32 distance sums are not bit-reproducible
+//! (spec §2). Elementwise arithmetic, I/O, casts, aggregates, comparisons,
+//! KNN order, the limits and every error compare exactly, as do integral
+//! numerals and structure in distance and norm statements.
 
 use crate::copybin::normalize_user_oids;
 use crate::diff::{classify, Classified, DiffClass, DiffInput, StmtOutcome};
@@ -23,6 +32,11 @@ use crate::runner::{Executor, Record};
 pub const REL_TOL: f64 = 1e-5;
 /// The ledger row (docs/fuzzing/rulings.toml) that rules them.
 pub const RULING_ID: &str = "pgvector-float-rel";
+/// Deck sections whose statements get the REL_TOL widening.
+pub const TOLERANT_SECTIONS: &[&str] = &["distance", "norm"];
+/// classify rulings this suite escalates to ROWSET_DIFF: row order, `*_cmp`
+/// magnitude and float ulp all compare exactly here.
+pub const EXACT_RULINGS: &[&str] = &["tie-ordering", "cmp-magnitude", "b1-float-ulp"];
 
 const DECK: &str = include_str!("pgvector_deck.sql");
 
@@ -52,7 +66,8 @@ pub fn deck() -> Vec<(&'static str, &'static str)> {
 }
 
 /// Run the suite: CREATE EXTENSION ("setup"), the deck's sections, then
-/// `seeded_n` statements from `seed` ("seeded").
+/// `seeded_n` statements from `seed` ("seeded"). Only TOLERANT_SECTIONS and
+/// the seeded statements `seeded_statement` marks tolerant get REL_TOL.
 pub fn run_suite(
     a: &mut dyn Executor,
     b: &mut dyn Executor,
@@ -64,21 +79,23 @@ pub fn run_suite(
     let mut records = Vec::new();
     let mut sections = vec![SectionStats { name: "setup".to_string(), ..Default::default() }];
     let mut idx = 0u32;
-    run_case(a, b, table, ulp_tol, "CREATE EXTENSION IF NOT EXISTS vector;", idx, &mut sections[0], &mut records);
+    let setup = "CREATE EXTENSION IF NOT EXISTS vector;";
+    run_case(a, b, table, ulp_tol, setup, false, idx, &mut sections[0], &mut records);
     idx += 1;
     for (section, sql) in deck() {
         if sections.last().map(|s| s.name.as_str()) != Some(section) {
             sections.push(SectionStats { name: section.to_string(), ..Default::default() });
         }
         let stats = sections.last_mut().unwrap();
-        run_case(a, b, table, ulp_tol, sql, idx, stats, &mut records);
+        let tolerant = TOLERANT_SECTIONS.contains(&section);
+        run_case(a, b, table, ulp_tol, sql, tolerant, idx, stats, &mut records);
         idx += 1;
     }
     let mut seeded = SectionStats { name: "seeded".to_string(), ..Default::default() };
     let mut rng = Rng::new_pure(seed);
     for _ in 0..seeded_n {
-        let sql = seeded_statement(&mut rng);
-        run_case(a, b, table, ulp_tol, &sql, idx, &mut seeded, &mut records);
+        let (sql, tolerant) = seeded_statement(&mut rng);
+        run_case(a, b, table, ulp_tol, &sql, tolerant, idx, &mut seeded, &mut records);
         idx += 1;
     }
     sections.push(seeded);
@@ -92,13 +109,14 @@ fn run_case(
     table: &[RuledEntry],
     ulp_tol: u64,
     sql: &str,
+    tolerant: bool,
     stmt_index: u32,
     stats: &mut SectionStats,
     records: &mut Vec<Record>,
 ) {
     let oa = normalize_user_oids(&a.apply(sql));
     let ob = normalize_user_oids(&b.apply(sql));
-    let c = compare(table, ulp_tol, sql, &oa, &ob);
+    let c = compare(table, ulp_tol, sql, &oa, &ob, tolerant);
     stats.cases += 1;
     match &c.class {
         DiffClass::Match => stats.matches += 1,
@@ -110,10 +128,26 @@ fn run_case(
     }
 }
 
-/// classify, then rule a row-set divergence that is tolerance-equal.
-pub fn compare(table: &[RuledEntry], ulp_tol: u64, sql: &str, oa: &StmtOutcome, ob: &StmtOutcome) -> Classified {
+/// classify; escalate the EXACT_RULINGS to ROWSET_DIFF; then, in a
+/// `tolerant` (distance or norm) statement only, rule a row-set divergence
+/// that is tolerance-equal in row order.
+pub fn compare(
+    table: &[RuledEntry],
+    ulp_tol: u64,
+    sql: &str,
+    oa: &StmtOutcome,
+    ob: &StmtOutcome,
+    tolerant: bool,
+) -> Classified {
     let raw = classify(&DiffInput { sql, a: oa, b: ob, ulp_tol, soft_cols: &[], mask_explain_timing: false });
-    let raw = if raw.class == DiffClass::RowsetDiff && rows_close(oa, ob, REL_TOL) {
+    let raw = match &raw.class {
+        DiffClass::Ruled(id) if EXACT_RULINGS.contains(&id.as_str()) => Classified {
+            class: DiffClass::RowsetDiff,
+            detail: format!("{id} does not apply in the pgvector suite: {}", raw.detail),
+        },
+        _ => raw,
+    };
+    let raw = if tolerant && raw.class == DiffClass::RowsetDiff && rows_close(oa, ob, REL_TOL) {
         Classified {
             class: DiffClass::Ruled(RULING_ID.to_string()),
             detail: format!("numerals within {REL_TOL} relative: {}", raw.detail),
@@ -269,8 +303,11 @@ fn knn_statement(rng: &mut Rng, ty: Ty, dim: usize) -> String {
     format!("SELECT i FROM (VALUES {}) s(i, v) ORDER BY v {op} '{q}'::{t}, i LIMIT 3;", rows.join(", "))
 }
 
-/// One seeded statement: single line, `;`-terminated.
-pub fn seeded_statement(rng: &mut Rng) -> String {
+/// One seeded statement (single line, `;`-terminated) and whether it is a
+/// distance or norm statement, the only seeded kinds that get REL_TOL:
+/// distance functions (0), distance operators (1), norms (3) and the
+/// sparsevec metric arm of kind 6. Everything else compares exactly.
+pub fn seeded_statement(rng: &mut Rng) -> (String, bool) {
     let ty = pick(rng, &[Ty::Vector, Ty::Halfvec, Ty::Sparsevec]);
     let t = ty.name();
     let dim = pick(rng, DIMS);
@@ -282,22 +319,25 @@ pub fn seeded_statement(rng: &mut Rng) -> String {
     match rng.below(8) {
         0 => {
             let f = pick(rng, &["l2_distance", "inner_product", "cosine_distance", "l1_distance"]);
-            format!("SELECT {f}('{a}'::{t}, '{b}'::{t});")
+            (format!("SELECT {f}('{a}'::{t}, '{b}'::{t});"), true)
         }
         1 => {
             let op = pick(rng, &["<->", "<#>", "<=>", "<+>"]);
-            format!("SELECT '{a}'::{t} {op} '{b}'::{t};")
+            (format!("SELECT '{a}'::{t} {op} '{b}'::{t};"), true)
         }
         2 => match ty {
-            Ty::Sparsevec => format!("SELECT '{a}'::{t} < '{b}'::{t}, '{a}'::{t} = '{b}'::{t}, sparsevec_cmp('{a}', '{b}');"),
+            Ty::Sparsevec => (
+                format!("SELECT '{a}'::{t} < '{b}'::{t}, '{a}'::{t} = '{b}'::{t}, sparsevec_cmp('{a}', '{b}');"),
+                false,
+            ),
             _ => {
                 let op = pick(rng, &["+", "-", "*", "||"]);
-                format!("SELECT '{a}'::{t} {op} '{b}'::{t};")
+                (format!("SELECT '{a}'::{t} {op} '{b}'::{t};"), false)
             }
         },
         3 => {
             let norm = if ty == Ty::Vector { "vector_norm" } else { "l2_norm" };
-            format!("SELECT {norm}('{a}'::{t}), l2_normalize('{a}'::{t});")
+            (format!("SELECT {norm}('{a}'::{t}), l2_normalize('{a}'::{t});"), true)
         }
         4 => {
             let to = match ty {
@@ -305,26 +345,29 @@ pub fn seeded_statement(rng: &mut Rng) -> String {
                 Ty::Halfvec => pick(rng, &["vector", "sparsevec", "real[]"]),
                 Ty::Sparsevec => pick(rng, &["vector", "halfvec"]),
             };
-            format!("SELECT '{a}'::{t}::{to};")
+            (format!("SELECT '{a}'::{t}::{to};"), false)
         }
         5 => match ty {
-            Ty::Sparsevec => format!("SELECT '{a}'::{t} <= '{b}'::{t}, '{a}'::{t} <> '{b}'::{t};"),
+            Ty::Sparsevec => (format!("SELECT '{a}'::{t} <= '{b}'::{t}, '{a}'::{t} <> '{b}'::{t};"), false),
             _ => {
                 let c = literal(rng, ty, dim, class);
-                format!("SELECT avg(v), sum(v) FROM (VALUES ('{a}'::{t}), ('{b}'::{t}), ('{c}'::{t})) s(v);")
+                (format!("SELECT avg(v), sum(v) FROM (VALUES ('{a}'::{t}), ('{b}'::{t}), ('{c}'::{t})) s(v);"), false)
             }
         },
         6 => match ty {
-            Ty::Sparsevec => format!(
-                "SELECT l2_norm('{a}'::{t}), sparsevec_l2_squared_distance('{a}', '{b}'), sparsevec_negative_inner_product('{a}', '{b}');"
+            Ty::Sparsevec => (
+                format!(
+                    "SELECT l2_norm('{a}'::{t}), sparsevec_l2_squared_distance('{a}', '{b}'), sparsevec_negative_inner_product('{a}', '{b}');"
+                ),
+                true,
             ),
             _ => {
                 let start = rng.range_i64(-2, dim as i64 + 2);
                 let count = rng.range_i64(-1, dim as i64 + 2);
-                format!("SELECT subvector('{a}'::{t}, {start}, {count}), binary_quantize('{a}'::{t});")
+                (format!("SELECT subvector('{a}'::{t}, {start}, {count}), binary_quantize('{a}'::{t});"), false)
             }
         },
-        _ => knn_statement(rng, ty, dim),
+        _ => (knn_statement(rng, ty, dim), false),
     }
 }
 
@@ -353,10 +396,28 @@ mod tests {
         };
         assert_eq!(gen(1), gen(1));
         assert_ne!(gen(1), gen(2));
-        for s in gen(7) {
+        // The tolerance flag is exactly "names a distance or norm and is not
+        // a KNN query" (KNN order compares exactly).
+        let metric = [
+            "l2_distance(", "inner_product(", "cosine_distance(", "l1_distance(", " <-> ", " <#> ", " <=> ", " <+> ",
+            "norm(",
+        ];
+        let stmts = gen(7);
+        assert!(stmts.iter().any(|(_, t)| *t) && stmts.iter().any(|(_, t)| !*t), "both kinds occur");
+        for (s, tolerant) in stmts {
             assert!(s.starts_with("SELECT ") && s.ends_with(';') && !s.contains('\n'), "{s}");
             assert_eq!(s.matches('(').count(), s.matches(')').count(), "{s}");
+            let names_metric = metric.iter().any(|m| s.contains(m));
+            assert_eq!(tolerant, names_metric && !s.contains(" ORDER BY "), "{s}");
         }
+    }
+
+    #[test]
+    fn pgvector_tolerant_sections_are_distance_and_norm() {
+        let tolerant: Vec<&str> = deck().iter().map(|(s, _)| *s).filter(|s| TOLERANT_SECTIONS.contains(s)).collect();
+        assert_eq!(tolerant.iter().filter(|s| **s == "distance").count(), 20);
+        assert_eq!(tolerant.iter().filter(|s| **s == "norm").count(), 7);
+        assert_eq!(tolerant.len(), 27);
     }
 
     #[test]
@@ -382,13 +443,71 @@ mod tests {
     fn pgvector_compare_rules_tolerance_and_reports_real_divergence() {
         let table = crate::ruled::default_table();
         let sql = "SELECT l2_distance('[0.1]', '[0.2]');";
-        assert_eq!(compare(&table, 4, sql, &rows("0.1"), &rows("0.1")).class, DiffClass::Match);
-        let c = compare(&table, 4, sql, &rows("0.30000001"), &rows("0.3"));
+        assert_eq!(compare(&table, 4, sql, &rows("0.1"), &rows("0.1"), true).class, DiffClass::Match);
+        let c = compare(&table, 4, sql, &rows("0.30000001"), &rows("0.3"), true);
         assert_eq!(c.class, DiffClass::Ruled(RULING_ID.to_string()));
         assert!(c.detail.contains("-fassociative-math"), "ledger reference missing: {}", c.detail);
-        assert_eq!(compare(&table, 4, sql, &rows("0.31"), &rows("0.3")).class, DiffClass::RowsetDiff);
+        assert_eq!(compare(&table, 4, sql, &rows("0.31"), &rows("0.3"), true).class, DiffClass::RowsetDiff);
         let e = |m: &str| StmtOutcome::Error { sqlstate: "22000".to_string(), message: m.to_string() };
-        let c = compare(&table, 4, sql, &e("different halfvec dimensions 2 and 1"), &e("different halfvec dimensions 1 and 2"));
+        let c = compare(&table, 4, sql, &e("different halfvec dimensions 2 and 1"), &e("different halfvec dimensions 1 and 2"), true);
         assert!(!matches!(c.class, DiffClass::Match | DiffClass::Ruled(_)), "{:?}", c.class);
+    }
+
+    /// One vector-typed cell (user type oid, as normalize_user_oids leaves it).
+    fn vrow(v: &str) -> StmtOutcome {
+        StmtOutcome::Rows { col_oids: vec![16384], rows: vec![vec![Some(v.to_string())]] }
+    }
+
+    fn int4_rows(vs: &[&str]) -> StmtOutcome {
+        StmtOutcome::Rows { col_oids: vec![23], rows: vs.iter().map(|v| vec![Some(v.to_string())]).collect() }
+    }
+
+    fn is_finding(c: &Classified) -> bool {
+        !matches!(c.class, DiffClass::Match | DiffClass::Ruled(_))
+    }
+
+    #[test]
+    fn pgvector_tolerance_applies_only_to_distance_and_norm_statements() {
+        let table = crate::ruled::default_table();
+        let exact = "SELECT '[6e-8]'::halfvec * '[1]';";
+        let metric = "SELECT l2_normalize('[0.1]'::vector);";
+        for (x, y) in [("[0]", "[6e-08]"), ("[0.1]", "[0.10000001]")] {
+            let c = compare(&table, 4, exact, &vrow(x), &vrow(y), false);
+            assert!(is_finding(&c), "{x} vs {y} not a finding in an exact statement: {c:?}");
+            let c = compare(&table, 4, metric, &vrow(x), &vrow(y), true);
+            assert_eq!(c.class, DiffClass::Ruled(RULING_ID.to_string()), "{x} vs {y}: {}", c.detail);
+        }
+    }
+
+    #[test]
+    fn pgvector_row_order_and_cmp_magnitude_compare_exactly() {
+        let table = crate::ruled::default_table();
+        let raw = |sql: &str, a: &StmtOutcome, b: &StmtOutcome| {
+            classify(&DiffInput { sql, a, b, ulp_tol: 4, soft_cols: &[], mask_explain_timing: false }).class
+        };
+        // A reorder under ORDER BY: classify alone rules it tie-ordering.
+        let sql = "SELECT i FROM (VALUES (1, '[1]'::vector), (2, '[2]')) s(i, v) ORDER BY v <-> '[0]', i;";
+        let (a, b) = (int4_rows(&["1", "2"]), int4_rows(&["2", "1"]));
+        assert_eq!(raw(sql, &a, &b), DiffClass::Ruled("tie-ordering".to_string()));
+        for tolerant in [false, true] {
+            let c = compare(&table, 4, sql, &a, &b, tolerant);
+            assert_eq!(c.class, DiffClass::RowsetDiff, "{}", c.detail);
+            assert!(c.detail.contains("tie-ordering"), "{}", c.detail);
+        }
+        // *_cmp magnitude: classify alone rules it cmp-magnitude.
+        let sql = "SELECT sparsevec_cmp('{1:1}/2', '{1:2}/2');";
+        let (a, b) = (int4_rows(&["-1"]), int4_rows(&["-2"]));
+        assert_eq!(raw(sql, &a, &b), DiffClass::Ruled("cmp-magnitude".to_string()));
+        let c = compare(&table, 4, sql, &a, &b, false);
+        assert_eq!(c.class, DiffClass::RowsetDiff, "{}", c.detail);
+        // Float ulp: classify alone rules it b1-float-ulp; exact outside the
+        // distance and norm statements, pgvector-float-rel inside them.
+        let sql = "SELECT jaccard_distance('1100', '1010');";
+        let (a, b) = (rows("0.6666666666666667"), rows("0.6666666666666666"));
+        assert_eq!(raw(sql, &a, &b), DiffClass::Ruled("b1-float-ulp".to_string()));
+        assert_eq!(compare(&table, 4, sql, &a, &b, false).class, DiffClass::RowsetDiff);
+        let sql = "SELECT cosine_distance('[1,1]'::vector, '[1,2]');";
+        assert_eq!(raw(sql, &a, &b), DiffClass::Ruled("b1-float-ulp".to_string()));
+        assert_eq!(compare(&table, 4, sql, &a, &b, true).class, DiffClass::Ruled(RULING_ID.to_string()));
     }
 }
