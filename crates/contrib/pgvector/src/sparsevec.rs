@@ -723,10 +723,28 @@ pub fn sparsevec_l2_squared_distance(a: &SparseView<'_>, b: &SparseView<'_>) -> 
     distance
 }
 
-// SparsevecInnerProduct (sparsevec.c:902-933). Upstream builds with
-// -ffp-contract=fast (Makefile:38), and this merge loop compiles to a scalar
-// fmadd chain in source order, so the sum fuses like C's. That makes it bit
-// exact, including the sign of a zero when every product underflows.
+// `distance += x * y` of SparsevecInnerProduct, as C's code generation does it.
+// DIVERGENCE: C defines this sum by its code generation, not its source:
+// upstream builds with -ffp-contract=fast -fno-signed-zeros (Makefile:38).
+// On aarch64, where FMA is baseline, clang emits a scalar fmadd chain for the
+// merge loop (otool on the arm64 reference), so pgrust fuses there too.
+// Elsewhere pgrust keeps the unfused source form. That matches an x86-64 C
+// build without FMA (OPTFLAGS="", as the amd64 pgvector Docker image is built).
+// An x86-64 C build with -march=native (FMA) differs from pgrust in the last
+// bit, and in the sign of an all-underflow zero.
+#[inline]
+fn inner_product_step(distance: f32, x: f32, y: f32) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        x.mul_add(y, distance)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        distance + x * y
+    }
+}
+
+// SparsevecInnerProduct (sparsevec.c:902-933).
 pub fn sparsevec_inner_product(a: &SparseView<'_>, b: &SparseView<'_>) -> f32 {
     let mut distance = 0.0f32;
     let mut bpos = 0usize;
@@ -736,7 +754,7 @@ pub fn sparsevec_inner_product(a: &SparseView<'_>, b: &SparseView<'_>) -> f32 {
             let bi = b.index(j);
             // Only update when the same index
             if ai == bi {
-                distance = a.value(i).mul_add(b.value(j), distance);
+                distance = inner_product_step(distance, a.value(i), b.value(j));
             }
             // Update start for next iteration
             if ai >= bi {
@@ -1182,12 +1200,15 @@ mod tests {
         }
     }
 
-    // inner_product(sparsevec, sparsevec) on the C reference (macOS arm64),
-    // bit for bit, sign of zero included: the merge loop compiles to a
-    // scalar fmadd chain. The first pair is diff tier finding seed=1
-    // stmt_index=1180 (every product underflows; the last one is negative).
+    // inner_product(sparsevec, sparsevec) against C, bit for bit with the sign
+    // of zero included. Each case gives the arm64 C result (the macOS
+    // reference: a fused fmadd chain) and the amd64 C result (the
+    // pgvector/pgvector:0.8.7-pg18 amd64 image, built with OPTFLAGS="", so
+    // unfused). Every case separates the two. The first pair is diff tier
+    // finding seed=1 stmt_index=1180: every product underflows, and the last
+    // one is negative.
     #[test]
-    fn inner_product_fuses_like_c() {
+    fn inner_product_matches_c_per_arch() {
         let ctx = mcx::MemoryContext::new("sparsevec-test");
         let m = ctx.mcx();
         let cases = [
@@ -1195,21 +1216,26 @@ mod tests {
                 "{1:1e-40,2:1.2e-38,3:-1.4e-45,4:1e-40,5:-1.4e-45,6:1e-40,7:1e-40,8:1e-40}/8",
                 "{1:-1.4e-45,2:1.2e-38,3:1.2e-38,5:-1.4e-45,6:-1.4e-45,7:-1.4e-45,8:0}/8",
                 "-0",
+                "0",
             ),
-            ("{1:0.1,2:0.2,3:0.3}/3", "{1:0.4,2:0.5,3:0.6}/3", "0.320000022649765"),
-            ("{1:1.1,2:-2.3,4:0.7}/4", "{1:0.3,2:0.9,4:-1.9}/4", "-3.069999933242798"),
+            ("{1:0.1,2:0.2,3:0.3}/3", "{1:0.4,2:0.5,3:0.6}/3", "0.320000022649765", "0.3199999928474426"),
+            ("{1:1.1,2:-2.3,4:0.7}/4", "{1:0.3,2:0.9,4:-1.9}/4", "-3.069999933242798", "-3.0699996948242188"),
             (
                 "{1:-1.244658,3:-1.052791,5:1.120312,6:-0.725007,10:1.131244,13:-1.870595,14:1.642657}/16",
                 "{1:0.501723,2:0.713599,3:0.125273,4:1.498753,5:-0.959627,7:-0.742455,13:-1.352874,14:-1.795352}/16",
                 "-2.2499096393585205",
+                "-2.2499094009399414",
             ),
         ];
-        for (sa, sb, want) in cases {
+        let bits = |t: &str| t.parse::<f64>().unwrap().to_bits();
+        for (sa, sb, arm64, amd64) in cases {
+            assert_ne!(bits(arm64), bits(amd64), "{sa} . {sb}: case does not separate fused from unfused");
+            let want = if cfg!(target_arch = "aarch64") { arm64 } else { amd64 };
             let (ia, ib) = (sparsevec_in_body(m, sa.as_bytes(), -1).unwrap(), sparsevec_in_body(m, sb.as_bytes(), -1).unwrap());
             let a = SparseView::from_payload(&ia[4..]).unwrap();
             let b = SparseView::from_payload(&ib[4..]).unwrap();
             let got = sparsevec_inner_product(&a, &b) as f64;
-            assert_eq!(got.to_bits(), want.parse::<f64>().unwrap().to_bits(), "{sa} . {sb}: got {got}, C {want}");
+            assert_eq!(got.to_bits(), bits(want), "{sa} . {sb}: got {got}, C {want}");
         }
     }
 
