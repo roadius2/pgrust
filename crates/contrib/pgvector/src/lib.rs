@@ -1,9 +1,17 @@
 //! pgvector (github.com/pgvector/pgvector), ported from 0.8.5 @ 159b79a and
-//! brought to 0.8.7 behavior for the vector type: distance/arithmetic
-//! functions and aggregates. halfvec/sparsevec/bit and ivfflat are unported;
-//! the shipped extension script is still the trimmed vector--0.8.5.sql until
-//! M4 (spec §4.6). DIVERGENCE: pg_get_loaded_modules() reports 18.6 for this
-//! library; C reports PG_MODULE_MAGIC_EXT's "0.8.7" (vector.c:49). Revisit in M4.
+//! brought to 0.8.7 behavior: the vector, halfvec and sparsevec types and
+//! the bit distance functions (I/O, functions, aggregates, casts, btree
+//! opclasses), one module per C file. The HNSW opclasses for halfvec,
+//! sparsevec and bit (M3) and ivfflat (M4) are unported; the shipped
+//! extension script is the trimmed vector--0.8.5.sql grown with upstream
+//! sections (scripts/pgvector/upstream-sql.sh) until M4 (spec §4.6).
+//! DIVERGENCE: pg_get_loaded_modules() reports 18.6 for this library; C
+//! reports PG_MODULE_MAGIC_EXT's "0.8.7" (vector.c:49). Revisit in M4.
+//! DIVERGENCE: errors raised by the pre-M2 vector code (vec.rs, funcs.rs)
+//! carry crate-derived locations, not vector.c's; halfvec_to_vector and
+//! sparsevec_to_vector inherit that through vector's CheckDim helpers.
+//! DIVERGENCE: the sparsevec inner product fuses multiply-adds only on
+//! aarch64, matching C's codegen per target (see sparsevec.rs).
 
 pub mod bitutils;
 pub mod bitvec;

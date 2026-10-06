@@ -101,7 +101,7 @@ These are the same places HNSW is wired in today. Core depends on access-method 
 ### 4.6 Extension SQL
 - At the end of M4, replace the trimmed `vector--0.8.5.sql` with upstream's verbatim `vector--0.8.7.sql`, plus the upgrade scripts `vector--0.8.1--0.8.2.sql` … `vector--0.8.6--0.8.7.sql`, and set `default_version = '0.8.7'`.
 - Until then, the trimmed script grows with each milestone. pgrust's `CREATE FUNCTION` checks the lookup table, so the verbatim script can only ship once every symbol exists.
-- **Lookup-coverage unit test:** parse every shipped script and assert that every `MODULE_PATHNAME` symbol resolves in `lookup`.
+- **Lookup-coverage unit test:** parse every shipped script and assert that every `MODULE_PATHNAME` symbol resolves in `lookup`. (In place since M2: `lookup_covers_every_module_pathname_symbol` in `crates/contrib/pgvector/src/lib.rs`.)
 - **Wasm:** the pgvector crates build for `wasm32-wasip1` today. New crates must too, and parallel builds fall back to serial there.
 
 ## 5. Types and the 0.8.7 catch-up
@@ -217,10 +217,10 @@ Every error message is copied verbatim with C's SQLSTATE, about 20 per type. Tex
 
 | Tier | Method | Pass rule | Gated |
 |---|---|---|---|
-| Unit | Per-crate tests. Exhaustive f32→f16 test: all 2³² inputs against pgvector's C routine, compiled by the test's `build.rs`. Lookup-coverage test (§4.6). Loom tests for the HNSW graph lock protocol. | All pass | Yes |
+| Unit | Per-crate tests. Exhaustive f16 parity (test crate `pgvector_f16_parity`, whose `build.rs` compiles the vendored `halfutils.h` routines and the compiler's `_Float16` path): all 2³² f32 and 2¹⁶ f16 inputs, plus every pair of halves through + − ×. Lookup-coverage test (§4.6). Loom tests for the HNSW graph lock protocol. | All pass | Yes |
 | Regression | `pg_regress` in installcheck mode against a running pgrust server, as pgvector's `make installcheck` runs it (`--inputdir=test --load-extension=vector`), with inputs and expected outputs from `crates/pgvector-0.8.7-reference/test/` (14 files) | Byte for byte. Expected outputs are never edited. Any `-- pgrust:` annotation follows the `regress/overlay` contract and gets a written ruling. | Yes |
 | TAP | `prove` on the 48 `test/t/*.pl` files using a hybrid setup: C `initdb` sits beside C `postgres` for bootstrap, while `pg_ctl` sits beside pgrust's `postgres`, so clusters are created by C and run by pgrust | Pass, or a written reason per exclusion (for example, the WAL tests need pgrust-to-pgrust streaming replication) | Yes |
-| Exact differential | A new vector module in `crates/bin/fuzzgen`, run by `diffrunner --a <reference> --b <pgrust>`. Covers functions, casts, operators, error cases and exact (non-index) nearest-neighbour queries, with special values: zero vectors, denormals, dimension and nnz limits, NaN/inf rejection. | Identical, with distances within a tight relative tolerance (add tolerance comparison to `diffrunner` scoped to vector values if it lacks one). Accepted divergences go in `docs/fuzzing/rulings.toml`. | Yes |
+| Exact differential | diffrunner's `--pgvector` suite (`crates/bin/fuzzgen/src/pgvector.rs`: a fixed SQL deck plus a seeded random arm), run by `scripts/pgvector/run-diff.sh`. Covers functions, casts, operators, aggregates, error cases and exact (non-index) nearest-neighbour queries over integer data, with special values: zero vectors, denormals, −0, f16 range edges, dimension and nnz limits, NaN/inf rejection. Also compares every reachable error's LOCATION (`sqldiff.sh --verbose`). | Identical. In distance and norm statements, numerals that are non-integral on either side may differ within 1e-5 relative, floored at magnitude 1 (ruling `pgvector-float-rel`: pgvector's own f32 sums depend on compiler reassociation and FMA). In the same statements a zero of either sign counts as within tolerance (C's sign of a sum whose products all underflow follows its vectorized, fused reduction order; user-approved 2026-10-06). Row order, comparison results and all other values compare exactly. Other accepted divergences go in `docs/fuzzing/rulings.toml`. | Yes |
 | Approximate differential | Same real-embedding dataset and index parameters on both servers. Recall@10 and @100 against exact ground truth, for HNSW and IVFFlat, all types. | pgrust recall ≥ pgvector recall − 0.01 | Yes |
 | Byte-identical index | Serial HNSW builds with seed 42 on integer-valued data, where float math is exact or rounds once: `pgvec-seeded` against pgrust with `pgrust.hnsw_build_seed = 42`. Index files are compared after masking both with `crates/bin/pagemask generic`. Cases cover tie-free and tie-heavy data, `m = 4`, 2,000 dimensions, an unlogged init fork, and inserts after the build. Two cases are opt-in known divergences: spilling past `maintenance_work_mem` (the build's memory accounting) and cosine (C's `-ffp-contract=fast`). IVFFlat is attempted but is nondeterministic in C. | Every default case identical | HNSW yes |
 | Iterative-scan stop points (M1) | The same seeded, tie-free HNSW index on both servers. Iterative scans whose stop point depends on `hnsw.max_scan_tuples` or on the scan memory cap (`MemoryContextMemAllocated(tmpCtx) > work_mem × hnsw.scan_mem_multiplier`, `hnswscan.c:264`), including a rescan through `LATERAL`. | Same rows in the same order, and the same `Rows Removed by Filter` | Yes |
@@ -234,6 +234,7 @@ Every error message is copied verbatim with C's SQLSTATE, about 20 per type. Tex
   - `run-tap.sh`
   - `run-ondisk.sh`
   - `run-bytecmp.sh` and `run-iterscan.sh` (M1)
+  - `run-diff.sh` (M2), `sqldiff.sh` (M2) and `upstream-sql.sh` (M2)
   - fixture SQL
   - a wrapper that runs every gated tier and prints a pass/fail table
 - The repo has no CI config, so the wrapper is the gate.

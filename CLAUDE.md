@@ -104,12 +104,13 @@ Keep these conventions when porting or changing code.
 
 ## Vector search (fork work)
 
-There is an existing pgvector port (upstream 0.8.5 commit `159b79a`, brought to 0.8.7 behavior for `vector` and HNSW in M1; the SQL script is still the trimmed 0.8.5 one):
-- `crates/contrib/pgvector`: the `vector` type, functions, aggregates and casts.
+There is an existing pgvector port (upstream 0.8.5 commit `159b79a`, brought to 0.8.7 behavior for `vector` and HNSW in M1, with `halfvec`, `sparsevec` and the `bit` functions added in M2; the SQL script is still the trimmed 0.8.5 one, grown with upstream sections by `scripts/pgvector/upstream-sql.sh`):
+- `crates/contrib/pgvector`: the `vector`, `halfvec` and `sparsevec` types and the `bit` distance functions: I/O, functions, aggregates, casts and btree opclasses, one module per C file.
+- `crates/contrib/pgvector_f16_parity`: test-only. Its `build.rs` compiles pgvector's C f16 routines and checks every f16, every f32 and every pair of halves against the port; it is skipped on wasm32.
 - `crates/contrib/pgvector_hnsw` and `pgvector_hnsw_build`: the HNSW AM, using pgvector's page layout and GenericXLog.
 - `crates/_support/types/types_hnsw`.
 
-`halfvec`, `sparsevec`, the `bit` opclasses and `ivfflat` are **not ported**, and the extension script is trimmed to match. The SQL test files in `crates/contrib/pgvector/sql/` have no expected outputs in the repo.
+The HNSW opclasses for `halfvec`, `sparsevec` and `bit` (M3) and `ivfflat` (M4) are **not ported**, and the extension script is trimmed to match.
 
 Direction and roadmap: `docs/Vector Search for pgrust Algorithm & Benchmark Survey.md`. Phase 1 spec: `docs/superpowers/specs/2026-10-04-pgvector-phase1-design.md`; plans in `docs/superpowers/plans/`.
 
@@ -126,6 +127,9 @@ scripts/pgvector/server.sh {start|fresh|stop|psql} {pgrust|ref}  # manual server
 scripts/pgvector/docker-ref.sh {up|down|psql}                  # pgvector/pgvector:0.8.7-pg18 reference (port 55493)
 scripts/pgvector/run-bytecmp.sh {pgrust|ref}                    # HNSW pages vs the seeded C build (pgvec-seeded, -DHNSW_MEMORY)
 scripts/pgvector/run-iterscan.sh {pgrust|ref}                   # iterative-scan stop points vs the seeded C build
+scripts/pgvector/run-diff.sh {pgrust|ref}                       # exact differential: diffrunner --pgvector + error LOCATIONs
+scripts/pgvector/sqldiff.sh {pgrust|ref} [--verbose] <file|->   # one SQL script on fresh ref and subject servers, diffed
+scripts/pgvector/upstream-sql.sh 'SECTION' ...                  # upstream extension-script sections for the trimmed script
 ```
 
-Stock C pgvector never seeds HNSW builds; `SET pgrust.hnsw_build_seed = 42` (an unregistered placeholder option) makes pgrust match the seeded C build. Baselines: `docs/superpowers/reports/pgvector-m0-baseline.md`, `docs/superpowers/reports/pgvector-m1-report.md`.
+Stock C pgvector never seeds HNSW builds; `SET pgrust.hnsw_build_seed = 42` (an unregistered placeholder option) makes pgrust match the seeded C build. Baselines: `docs/superpowers/reports/pgvector-m0-baseline.md`, `docs/superpowers/reports/pgvector-m1-report.md`, `docs/superpowers/reports/pgvector-m2-report.md`.
