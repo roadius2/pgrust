@@ -8,6 +8,7 @@
 pub mod bitutils;
 pub mod bitvec;
 pub mod funcs;
+pub mod halfutils;
 pub mod vec;
 
 use types_fmgr::PGFunction;

@@ -725,6 +725,7 @@ members = [
     "crates/contrib/test_oat_hooks",
     "crates/contrib/exec_hooks",
     "crates/contrib/pgvector",
+    "crates/contrib/pgvector_f16_parity",
     "crates/contrib/pgvector_hnsw",
     "crates/contrib/bloom",
     "crates/contrib/bloom_build",

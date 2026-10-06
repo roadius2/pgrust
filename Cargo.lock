@@ -13929,6 +13929,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgvector_f16_parity"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "pgvector",
+]
+
+[[package]]
 name = "pgvector_hnsw"
 version = "0.0.0"
 dependencies = [

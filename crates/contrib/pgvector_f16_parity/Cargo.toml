@@ -1,0 +1,15 @@
+[package]
+name = "pgvector_f16_parity"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "pgvector_f16_parity"
+path = "src/lib.rs"
+
+[dependencies]
+pgvector = { path = "../pgvector" }
+
+[build-dependencies]
+cc = "1"
