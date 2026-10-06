@@ -321,6 +321,29 @@ pub fn fc_halfvec_to_vector(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> P
     Ok(image_datum(b.image()))
 }
 
+// sparsevec_to_vector (vector.c:1320-1347).
+pub fn fc_sparsevec_to_vector(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: strict fn — arg0 sparsevec, arg1 typmod.
+    let svec = unsafe { crate::sparsevec::arg_sparsevec(fcinfo, 0)? };
+    let typmod = fcinfo.arg_i32(1);
+    let dim = svec.dim();
+    // dim >= 1 (SparseView); vector's limit is 16,000, checked before allocating.
+    check_dim(dim as usize)?;
+    check_expected_dim(typmod, dim as usize)?;
+    let mut r = VecBuilder::new(fcinfo.result_mcx(), dim as usize)?;
+    for i in 0..svec.nnz() {
+        let index = svec.index(i);
+        // Safety check
+        if index < 0 || index >= dim {
+            return Err(PgError::error("index out of bounds")
+                .with_location("vector.c", 1343, "sparsevec_to_vector")
+                .into());
+        }
+        r.set(index as usize, svec.value(i));
+    }
+    Ok(image_datum(r.image()))
+}
+
 fn binary_2arg<'a>(fcinfo: &'a Fcinfo) -> PgResult<(VecView<'a>, VecView<'a>)> {
     // SAFETY: strict fns — args 0 and 1 are vectors.
     let a = unsafe { arg_vector(fcinfo, 0)? };

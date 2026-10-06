@@ -14,8 +14,11 @@ use types_error::{
     ERRCODE_PROGRAM_LIMIT_EXCEEDED,
 };
 use types_fmgr::{cstring_result, FmgrInfo, FunctionCallInfoBaseData as Fcinfo};
+use types_error::ERRCODE_INTERNAL_ERROR;
 
+use crate::funcs::{arg_vector, cast_array_elems, cast_elem_f32, ArraySite};
 use crate::funcs::{detoasted_image, image_datum};
+use crate::halfutils::{half_is_zero, half_to_float4};
 use crate::vec::{strtof_prefix, vector_isspace as sparsevec_isspace, StrtofVal};
 
 pub const SPARSEVEC_MAX_DIM: i32 = 1_000_000_000;
@@ -558,6 +561,427 @@ pub fn fc_sparsevec_send(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgRe
     Ok(types_fmgr::varlena_result(pqformat::pq_endtypsend(buf)))
 }
 
+// CheckDims (sparsevec.c:44-51).
+fn check_dims(a: &SparseView<'_>, b: &SparseView<'_>) -> PgResult<()> {
+    if a.dim() != b.dim() {
+        return Err(ereport(
+            ERRCODE_DATA_EXCEPTION,
+            format!("different sparsevec dimensions {} and {}", a.dim(), b.dim()),
+            50,
+            "CheckDims",
+        ));
+    }
+    Ok(())
+}
+
+fn sparsevec_2arg(fcinfo: &Fcinfo) -> PgResult<(SparseView<'_>, SparseView<'_>)> {
+    // SAFETY: strict fns — args 0 and 1 are sparsevecs.
+    let a = unsafe { arg_sparsevec(fcinfo, 0)? };
+    let b = unsafe { arg_sparsevec(fcinfo, 1)? };
+    Ok((a, b))
+}
+
+// sparsevec (sparsevec.c:588-598): applies the type modifier.
+pub fn fc_sparsevec(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: strict fn — arg0 sparsevec, arg1 typmod.
+    let v = unsafe { arg_sparsevec(fcinfo, 0)? };
+    let typmod = fcinfo.arg_i32(1);
+    check_expected_dim(typmod, v.dim())?;
+    Ok(fcinfo.arg(0))
+}
+
+// vector_to_sparsevec (sparsevec.c:603-642).
+pub fn fc_vector_to_sparsevec(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: strict fn — arg0 vector, arg1 typmod.
+    let v = unsafe { arg_vector(fcinfo, 0)? };
+    let typmod = fcinfo.arg_i32(1);
+    let dim = v.dim() as i32;
+    check_dim(dim)?;
+    check_expected_dim(typmod, dim)?;
+    let nnz = v.iter().filter(|x| *x != 0.0).count();
+    check_nnz(nnz as i32, dim)?;
+    let mut r = SparseBuilder::new(fcinfo.result_mcx(), dim, nnz)?;
+    let mut j = 0usize;
+    for i in 0..v.dim() {
+        if v.x(i) != 0.0 {
+            // Safety check
+            if j >= r.nnz() {
+                return Err(ereport(ERRCODE_INTERNAL_ERROR, "index out of bounds", 633, "vector_to_sparsevec"));
+            }
+            r.set_index(j, i as i32);
+            r.set_value(j, v.x(i));
+            j += 1;
+        }
+    }
+    Ok(image_datum(r.image()))
+}
+
+// halfvec_to_sparsevec (sparsevec.c:647-686).
+pub fn fc_halfvec_to_sparsevec(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: strict fn — arg0 halfvec, arg1 typmod.
+    let v = unsafe { crate::halfvec::arg_halfvec(fcinfo, 0)? };
+    let typmod = fcinfo.arg_i32(1);
+    let dim = v.dim() as i32;
+    check_dim(dim)?;
+    check_expected_dim(typmod, dim)?;
+    let nnz = (0..v.dim()).filter(|&i| !half_is_zero(v.x(i))).count();
+    check_nnz(nnz as i32, dim)?;
+    let mut r = SparseBuilder::new(fcinfo.result_mcx(), dim, nnz)?;
+    let mut j = 0usize;
+    for i in 0..v.dim() {
+        if !half_is_zero(v.x(i)) {
+            // Safety check
+            if j >= r.nnz() {
+                return Err(ereport(ERRCODE_INTERNAL_ERROR, "index out of bounds", 677, "halfvec_to_sparsevec"));
+            }
+            r.set_index(j, i as i32);
+            r.set_value(j, half_to_float4(v.x(i)));
+            j += 1;
+        }
+    }
+    Ok(image_datum(r.image()))
+}
+
+// array_to_sparsevec (sparsevec.c:691-818). C converts each element twice
+// (count pass, fill pass, sparsevec.c:730-799); converting once into
+// `values` gives the same floats and the same first error.
+pub fn fc_array_to_sparsevec(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let mcx = fcinfo.result_mcx();
+    // SAFETY: strict fn — arg0 array, arg1 typmod.
+    let arr = unsafe { detoasted_image(mcx, fcinfo.arg(0))? };
+    let typmod = fcinfo.arg_i32(1);
+    let site = ArraySite { file: "sparsevec.c", func: "array_to_sparsevec", ndim_line: 710, nulls_line: 715 };
+    let (elemtype, elems) = cast_array_elems(mcx, arr, &site)?;
+    let n = elems.len() as i32;
+    check_dim(n)?;
+    check_expected_dim(typmod, n)?;
+    let mut values: PgVec<'_, f32> = mcx::vec_with_capacity_in(mcx, elems.len())?;
+    for d in elems.iter() {
+        match cast_elem_f32(elemtype, *d)? {
+            Some(v) => values.push(v),
+            None => return Err(ereport(ERRCODE_DATA_EXCEPTION, "unsupported array type", 754, "array_to_sparsevec")),
+        }
+    }
+    // IS_NOT_ZERO (sparsevec.c:727): NaN and infinities count as non-zero.
+    let nnz = values.iter().filter(|v| **v != 0.0).count();
+    check_nnz(nnz as i32, n)?;
+    let mut r = SparseBuilder::new(mcx, n, nnz)?;
+    let mut j = 0usize;
+    for (i, v) in values.iter().enumerate() {
+        if *v != 0.0 {
+            // Safety check
+            if j >= r.nnz() {
+                return Err(ereport(ERRCODE_INTERNAL_ERROR, "index out of bounds", 767, "array_to_sparsevec"));
+            }
+            r.set_index(j, i as i32);
+            r.set_value(j, *v);
+            j += 1;
+        }
+    }
+    if j != r.nnz() {
+        return Err(ereport(ERRCODE_INTERNAL_ERROR, "correctness check failed", 811, "array_to_sparsevec"));
+    }
+    // Check elements
+    for i in 0..r.nnz() {
+        check_element(r.value(i))?;
+    }
+    Ok(image_datum(r.image()))
+}
+
+// SparsevecL2SquaredDistance (sparsevec.c:823-866): one merge over the two
+// sorted index lists.
+pub fn sparsevec_l2_squared_distance(a: &SparseView<'_>, b: &SparseView<'_>) -> f32 {
+    let mut distance = 0.0f32;
+    let mut bpos = 0usize;
+    for i in 0..a.nnz() {
+        let ai = a.index(i);
+        let mut bi = -1i32;
+        for j in bpos..b.nnz() {
+            bi = b.index(j);
+            if ai == bi {
+                let diff = a.value(i) - b.value(j);
+                distance += diff * diff;
+            } else if ai > bi {
+                distance += b.value(j) * b.value(j);
+            }
+            // Update start for next iteration
+            if ai >= bi {
+                bpos = j + 1;
+            }
+            // Found or passed it
+            if bi >= ai {
+                break;
+            }
+        }
+        if ai != bi {
+            distance += a.value(i) * a.value(i);
+        }
+    }
+    for j in bpos..b.nnz() {
+        distance += b.value(j) * b.value(j);
+    }
+    distance
+}
+
+// SparsevecInnerProduct (sparsevec.c:902-933).
+pub fn sparsevec_inner_product(a: &SparseView<'_>, b: &SparseView<'_>) -> f32 {
+    let mut distance = 0.0f32;
+    let mut bpos = 0usize;
+    for i in 0..a.nnz() {
+        let ai = a.index(i);
+        for j in bpos..b.nnz() {
+            let bi = b.index(j);
+            // Only update when the same index
+            if ai == bi {
+                distance += a.value(i) * b.value(j);
+            }
+            // Update start for next iteration
+            if ai >= bi {
+                bpos = j + 1;
+            }
+            // Found or passed it
+            if bi >= ai {
+                break;
+            }
+        }
+    }
+    distance
+}
+
+// sparsevec_l1_distance's merge (sparsevec.c:1021-1054), factored out like
+// the L2 and inner-product kernels.
+pub fn sparsevec_l1_distance(a: &SparseView<'_>, b: &SparseView<'_>) -> f32 {
+    let mut distance = 0.0f32;
+    let mut bpos = 0usize;
+    for i in 0..a.nnz() {
+        let ai = a.index(i);
+        let mut bi = -1i32;
+        for j in bpos..b.nnz() {
+            bi = b.index(j);
+            if ai == bi {
+                distance += (a.value(i) - b.value(j)).abs();
+            } else if ai > bi {
+                distance += b.value(j).abs();
+            }
+            // Update start for next iteration
+            if ai >= bi {
+                bpos = j + 1;
+            }
+            // Found or passed it
+            if bi >= ai {
+                break;
+            }
+        }
+        if ai != bi {
+            distance += a.value(i).abs();
+        }
+    }
+    for j in bpos..b.nnz() {
+        distance += b.value(j).abs();
+    }
+    distance
+}
+
+// sparsevec_l2_distance (sparsevec.c:871-881).
+pub fn fc_sparsevec_l2_distance(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = sparsevec_2arg(fcinfo)?;
+    check_dims(&a, &b)?;
+    Ok(Datum::from_f64((sparsevec_l2_squared_distance(&a, &b) as f64).sqrt()))
+}
+
+// sparsevec_l2_squared_distance (sparsevec.c:887-897).
+pub fn fc_sparsevec_l2_squared_distance(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = sparsevec_2arg(fcinfo)?;
+    check_dims(&a, &b)?;
+    Ok(Datum::from_f64(sparsevec_l2_squared_distance(&a, &b) as f64))
+}
+
+// sparsevec_inner_product (sparsevec.c:938-948).
+pub fn fc_sparsevec_inner_product(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = sparsevec_2arg(fcinfo)?;
+    check_dims(&a, &b)?;
+    Ok(Datum::from_f64(sparsevec_inner_product(&a, &b) as f64))
+}
+
+// sparsevec_negative_inner_product (sparsevec.c:953-963).
+pub fn fc_sparsevec_negative_inner_product(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = sparsevec_2arg(fcinfo)?;
+    check_dims(&a, &b)?;
+    Ok(Datum::from_f64(-sparsevec_inner_product(&a, &b) as f64))
+}
+
+// sparsevec_cosine_distance (sparsevec.c:968-1008).
+pub fn fc_sparsevec_cosine_distance(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = sparsevec_2arg(fcinfo)?;
+    check_dims(&a, &b)?;
+    let mut similarity = sparsevec_inner_product(&a, &b) as f64;
+    let mut norma = 0.0f32;
+    for i in 0..a.nnz() {
+        norma += a.value(i) * a.value(i);
+    }
+    let mut normb = 0.0f32;
+    for i in 0..b.nnz() {
+        normb += b.value(i) * b.value(i);
+    }
+    // Use sqrt(a * b) over sqrt(a) * sqrt(b)
+    similarity /= ((norma as f64) * (normb as f64)).sqrt();
+    // Keep in range
+    if similarity > 1.0 {
+        similarity = 1.0;
+    } else if similarity < -1.0 {
+        similarity = -1.0;
+    }
+    Ok(Datum::from_f64(1.0 - similarity))
+}
+
+// sparsevec_l1_distance (sparsevec.c:1013-1057).
+pub fn fc_sparsevec_l1_distance(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = sparsevec_2arg(fcinfo)?;
+    check_dims(&a, &b)?;
+    Ok(Datum::from_f64(sparsevec_l1_distance(&a, &b) as f64))
+}
+
+// sparsevec_vector_dims (sparsevec.c:1064-1071); not in the 0.8.7 SQL.
+pub fn fc_sparsevec_vector_dims(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: strict fn — arg0 sparsevec.
+    let a = unsafe { arg_sparsevec(fcinfo, 0)? };
+    Ok(Datum::from_i32(a.dim()))
+}
+
+// sparsevec_l2_norm (sparsevec.c:1076-1089).
+pub fn fc_sparsevec_l2_norm(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: strict fn — arg0 sparsevec.
+    let a = unsafe { arg_sparsevec(fcinfo, 0)? };
+    let mut norm = 0.0f64;
+    for i in 0..a.nnz() {
+        norm += a.value(i) as f64 * a.value(i) as f64;
+    }
+    Ok(Datum::from_f64(norm.sqrt()))
+}
+
+// sparsevec_l2_normalize (sparsevec.c:1094-1158).
+pub fn fc_sparsevec_l2_normalize(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: strict fn — arg0 sparsevec.
+    let a = unsafe { arg_sparsevec(fcinfo, 0)? };
+    let mcx = fcinfo.result_mcx();
+    let mut r = SparseBuilder::new(mcx, a.dim(), a.nnz())?;
+    let mut norm = 0.0f64;
+    for i in 0..a.nnz() {
+        norm += a.value(i) as f64 * a.value(i) as f64;
+    }
+    norm = norm.sqrt();
+    // Return zero vector for zero norm
+    if norm > 0.0 {
+        let mut zeros = 0usize;
+        for i in 0..a.nnz() {
+            r.set_index(i, a.index(i));
+            // C stores the double quotient into a float.
+            let v = (a.value(i) as f64 / norm) as f32;
+            r.set_value(i, v);
+            if v.is_infinite() {
+                return Err(Box::new(adt_float::float_overflow_error()));
+            }
+            if v == 0.0 {
+                zeros += 1;
+            }
+        }
+        // Allocate a new vector in the unlikely event there are zeros
+        if zeros > 0 {
+            let mut n = SparseBuilder::new(mcx, a.dim(), a.nnz() - zeros)?;
+            let mut j = 0usize;
+            for i in 0..a.nnz() {
+                if r.value(i) == 0.0 {
+                    continue;
+                }
+                // Safety check
+                if j >= n.nnz() {
+                    return Err(ereport(ERRCODE_INTERNAL_ERROR, "index out of bounds", 1144, "sparsevec_l2_normalize"));
+                }
+                n.set_index(j, r.index(i));
+                n.set_value(j, r.value(i));
+                j += 1;
+            }
+            return Ok(image_datum(n.image()));
+        }
+    }
+    Ok(image_datum(r.image()))
+}
+
+// sparsevec_cmp_internal (sparsevec.c:1163-1199).
+fn sparsevec_cmp_internal(a: &SparseView<'_>, b: &SparseView<'_>) -> i32 {
+    let nnz = a.nnz().min(b.nnz());
+    // Check values before dimensions to be consistent with Postgres arrays
+    for i in 0..nnz {
+        if a.index(i) < b.index(i) {
+            return if a.value(i) < 0.0 { -1 } else { 1 };
+        }
+        if a.index(i) > b.index(i) {
+            return if b.value(i) < 0.0 { 1 } else { -1 };
+        }
+        if a.value(i) < b.value(i) {
+            return -1;
+        }
+        if a.value(i) > b.value(i) {
+            return 1;
+        }
+    }
+    if a.nnz() < b.nnz() && b.index(nnz) < a.dim() {
+        return if b.value(nnz) < 0.0 { 1 } else { -1 };
+    }
+    if a.nnz() > b.nnz() && a.index(nnz) < b.dim() {
+        return if a.value(nnz) < 0.0 { -1 } else { 1 };
+    }
+    if a.dim() < b.dim() {
+        return -1;
+    }
+    if a.dim() > b.dim() {
+        return 1;
+    }
+    0
+}
+
+// sparsevec_lt (sparsevec.c:1204-1212).
+pub fn fc_sparsevec_lt(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = sparsevec_2arg(fcinfo)?;
+    Ok(Datum::from_bool(sparsevec_cmp_internal(&a, &b) < 0))
+}
+
+// sparsevec_le (sparsevec.c:1217-1225).
+pub fn fc_sparsevec_le(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = sparsevec_2arg(fcinfo)?;
+    Ok(Datum::from_bool(sparsevec_cmp_internal(&a, &b) <= 0))
+}
+
+// sparsevec_eq (sparsevec.c:1230-1238).
+pub fn fc_sparsevec_eq(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = sparsevec_2arg(fcinfo)?;
+    Ok(Datum::from_bool(sparsevec_cmp_internal(&a, &b) == 0))
+}
+
+// sparsevec_ne (sparsevec.c:1243-1251).
+pub fn fc_sparsevec_ne(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = sparsevec_2arg(fcinfo)?;
+    Ok(Datum::from_bool(sparsevec_cmp_internal(&a, &b) != 0))
+}
+
+// sparsevec_ge (sparsevec.c:1256-1264).
+pub fn fc_sparsevec_ge(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = sparsevec_2arg(fcinfo)?;
+    Ok(Datum::from_bool(sparsevec_cmp_internal(&a, &b) >= 0))
+}
+
+// sparsevec_gt (sparsevec.c:1269-1277).
+pub fn fc_sparsevec_gt(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = sparsevec_2arg(fcinfo)?;
+    Ok(Datum::from_bool(sparsevec_cmp_internal(&a, &b) > 0))
+}
+
+// sparsevec_cmp (sparsevec.c:1282-1290).
+pub fn fc_sparsevec_cmp(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    let (a, b) = sparsevec_2arg(fcinfo)?;
+    Ok(Datum::from_i32(sparsevec_cmp_internal(&a, &b)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,5 +1125,76 @@ mod tests {
         assert_eq!(corrupt(hdr(5, 6, 48)), "corrupt sparsevec datum");
         assert_eq!(corrupt(hdr(5, 2, 8)), "corrupt sparsevec datum");
         assert_eq!(SparseView::from_payload(&hdr(5, 2, 16)).unwrap().nnz(), 2);
+    }
+
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    // A sparse image of a random dense vector with integer values (a third
+    // of them non-zero), plus the dense form.
+    fn random_sparse<'m>(m: Mcx<'m>, r: &mut XorShift, dim: i32) -> (PgVec<'m, u8>, Vec<f32>) {
+        let mut dense = vec![0.0f32; dim as usize];
+        for x in dense.iter_mut() {
+            if r.below(3) == 0 {
+                *x = r.below(9) as f32 - 4.0;
+            }
+        }
+        let nz: Vec<usize> = (0..dense.len()).filter(|&i| dense[i] != 0.0).collect();
+        let mut b = SparseBuilder::new(m, dim, nz.len()).unwrap();
+        for (j, &i) in nz.iter().enumerate() {
+            b.set_index(j, i as i32);
+            b.set_value(j, dense[i]);
+        }
+        (b.image(), dense)
+    }
+
+    // Review Focus 4: the merge kernels against a dense expansion over
+    // disjoint, interleaved, prefix/suffix and empty index sets. Integer
+    // values keep every f32 sum exact, so equality is exact.
+    #[test]
+    fn sparse_kernels_match_dense_expansion() {
+        let ctx = mcx::MemoryContext::new("sparsevec-test");
+        let m = ctx.mcx();
+        let mut r = XorShift(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..5000 {
+            let dim = 1 + r.below(12) as i32;
+            let (ia, da) = random_sparse(m, &mut r, dim);
+            let (ib, db) = random_sparse(m, &mut r, dim);
+            let a = SparseView::from_payload(&ia[4..]).unwrap();
+            let b = SparseView::from_payload(&ib[4..]).unwrap();
+            let l2: f32 = da.iter().zip(&db).map(|(x, y)| (x - y) * (x - y)).sum();
+            let ip: f32 = da.iter().zip(&db).map(|(x, y)| x * y).sum();
+            let l1: f32 = da.iter().zip(&db).map(|(x, y)| (x - y).abs()).sum();
+            assert_eq!(sparsevec_l2_squared_distance(&a, &b), l2, "{da:?} {db:?}");
+            assert_eq!(sparsevec_inner_product(&a, &b), ip, "{da:?} {db:?}");
+            assert_eq!(sparsevec_l1_distance(&a, &b), l1, "{da:?} {db:?}");
+        }
+    }
+
+    // sparsevec.out: sparsevec_cmp follows Postgres array order.
+    #[test]
+    fn cmp_matches_sparsevec_out() {
+        let ctx = mcx::MemoryContext::new("sparsevec-test");
+        let m = ctx.mcx();
+        let img = |s: &str| sparsevec_in_body(m, s.as_bytes(), -1).unwrap();
+        let cmp = |a: &str, b: &str| {
+            let (ia, ib) = (img(a), img(b));
+            sparsevec_cmp_internal(&SparseView::from_payload(&ia[4..]).unwrap(), &SparseView::from_payload(&ib[4..]).unwrap())
+        };
+        assert_eq!(cmp("{1:1,2:2,3:3}/3", "{1:1,2:2,3:3}/3"), 0);
+        assert_eq!(cmp("{1:1,2:2,3:3}/3", "{}/3"), 1);
+        assert_eq!(cmp("{}/3", "{1:1,2:2,3:3}/3"), -1);
+        assert_eq!(cmp("{1:1,2:2}/2", "{1:1,2:2,3:3}/3"), -1);
+        assert_eq!(cmp("{1:1,2:2,3:3}/3", "{1:1,2:2}/2"), 1);
+        assert_eq!(cmp("{1:1,2:2}/2", "{1:2,2:3,3:4}/3"), -1);
+        assert_eq!(cmp("{1:2,2:3}/2", "{1:1,2:2,3:3}/3"), 1);
     }
 }

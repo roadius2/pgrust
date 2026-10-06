@@ -13,9 +13,9 @@ use mcx::{Mcx, PgVec};
 use stringinfo::StringInfo;
 use types_core::FLOAT4OID;
 use types_error::{
-    PgError, PgResult, SqlState, ERRCODE_DATA_EXCEPTION, ERRCODE_INVALID_PARAMETER_VALUE,
-    ERRCODE_INVALID_TEXT_REPRESENTATION, ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE,
-    ERRCODE_PROGRAM_LIMIT_EXCEEDED,
+    PgError, PgResult, SqlState, ERRCODE_DATA_EXCEPTION, ERRCODE_INTERNAL_ERROR,
+    ERRCODE_INVALID_PARAMETER_VALUE, ERRCODE_INVALID_TEXT_REPRESENTATION,
+    ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE, ERRCODE_PROGRAM_LIMIT_EXCEEDED,
 };
 use types_fmgr::{cstring_result, FmgrInfo, FunctionCallInfoBaseData as Fcinfo};
 
@@ -775,6 +775,26 @@ pub fn fc_halfvec_avg(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResul
         b.set(i, x);
     }
     Ok(image_datum(b.image()))
+}
+
+// sparsevec_to_halfvec (halfvec.c:1199-1225).
+pub fn fc_sparsevec_to_halfvec(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: strict fn — arg0 sparsevec, arg1 typmod.
+    let svec = unsafe { crate::sparsevec::arg_sparsevec(fcinfo, 0)? };
+    let typmod = fcinfo.arg_i32(1);
+    let dim = svec.dim();
+    check_dim(dim)?;
+    check_expected_dim(typmod, dim)?;
+    let mut r = HalfBuilder::new(fcinfo.result_mcx(), dim as usize)?;
+    for i in 0..svec.nnz() {
+        let index = svec.index(i);
+        // Safety check
+        if index < 0 || index >= dim {
+            return Err(ereport(ERRCODE_INTERNAL_ERROR, "index out of bounds", 1219, "sparsevec_to_halfvec"));
+        }
+        r.set(index as usize, float4_to_half(svec.value(i))?);
+    }
+    Ok(image_datum(r.image()))
 }
 
 #[cfg(test)]
