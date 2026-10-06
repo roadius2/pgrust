@@ -15,12 +15,15 @@
 //! `distance` and `norm`, and the seeded distance-function, distance-operator,
 //! norm and sparsevec-metric statements. There, a row-set divergence whose
 //! differing numerals are non-integral on at least one side and within
-//! REL_TOL relative (floored at magnitude 1), cell by cell in row order, is
-//! RULED under `pgvector-float-rel`. pgvector builds with -fassociative-math
-//! and fuses multiply-adds, so its f32 distance sums are not bit-reproducible
-//! (spec §2). Elementwise arithmetic, I/O, casts, aggregates, comparisons,
-//! KNN order, the limits and every error compare exactly, as do integral
-//! numerals and structure in distance and norm statements.
+//! REL_TOL relative (floored at magnitude 1), or are zeros of either sign,
+//! cell by cell in row order, is RULED under `pgvector-float-rel`. pgvector
+//! builds with -fassociative-math and fuses multiply-adds, so its f32
+//! distance sums are not bit-reproducible (spec §2), and the sign of a sum
+//! whose products all underflow follows C's vectorized, fused reduction
+//! order (user-approved 2026-10-06). Elementwise arithmetic, I/O, casts,
+//! aggregates, comparisons, KNN order, the limits and every error compare
+//! exactly, as do non-zero integral numerals and structure in distance and
+//! norm statements.
 
 use crate::copybin::normalize_user_oids;
 use crate::diff::{classify, Classified, DiffClass, DiffInput, StmtOutcome};
@@ -178,9 +181,9 @@ fn rows_close(oa: &StmtOutcome, ob: &StmtOutcome, rel: f64) -> bool {
 }
 
 /// Two cell texts that differ only in numerals that are non-integral on at
-/// least one side and within `rel` (relative, floored at magnitude 1). The
-/// structural characters of vector, halfvec, sparsevec and real[] text are
-/// their own tokens and must match.
+/// least one side and within `rel` (relative, floored at magnitude 1), or
+/// that are zeros of either sign. The structural characters of vector,
+/// halfvec, sparsevec and real[] text are their own tokens and must match.
 pub fn cells_close(x: &str, y: &str, rel: f64) -> bool {
     if x == y {
         return true;
@@ -212,7 +215,15 @@ fn is_integral(t: &str) -> bool {
     !d.is_empty() && d.bytes().all(|c| c.is_ascii_digit())
 }
 
+/// "0", "-0", "0.0", "-0.0", ...: a numeral that parses to a zero.
+fn is_zero(t: &str) -> bool {
+    matches!(t.parse::<f64>(), Ok(x) if x == 0.0)
+}
+
 fn numerals_close(a: &str, b: &str, rel: f64) -> bool {
+    if is_zero(a) && is_zero(b) {
+        return true; // a zero of either sign (user-approved, see module doc)
+    }
     if is_integral(a) && is_integral(b) {
         return false; // already known unequal
     }
@@ -421,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn pgvector_cells_close_widens_only_non_integral_numerals() {
+    fn pgvector_cells_close_widens_only_non_integral_numerals_and_zeros() {
         assert!(cells_close("0.30000001", "0.3", REL_TOL));
         assert!(cells_close("[0.1,0.2000001]", "[0.1,0.2]", REL_TOL));
         assert!(cells_close("{1:0.5,3:0.25000003}/4", "{1:0.5,3:0.25}/4", REL_TOL));
@@ -433,6 +444,14 @@ mod tests {
         assert!(!cells_close("[1,2]", "[1,2,3]", REL_TOL)); // shape
         assert!(!cells_close("Infinity", "3.4e+38", REL_TOL));
         assert!(!cells_close("NaN", "0", REL_TOL));
+        // A zero of either sign (C's sign of an all-underflow sum follows its
+        // vectorized, fused reduction order); nothing else integral widens.
+        assert!(cells_close("-0", "0", REL_TOL));
+        assert!(cells_close("[0,-0]", "[0,0]", REL_TOL));
+        assert!(cells_close("-0.0", "0", REL_TOL));
+        assert!(!cells_close("0", "1", REL_TOL));
+        assert!(!cells_close("-0", "-1", REL_TOL));
+        assert!(!cells_close("-0", "NaN", REL_TOL));
     }
 
     fn rows(v: &str) -> StmtOutcome {
@@ -476,6 +495,23 @@ mod tests {
             assert!(is_finding(&c), "{x} vs {y} not a finding in an exact statement: {c:?}");
             let c = compare(&table, 4, metric, &vrow(x), &vrow(y), true);
             assert_eq!(c.class, DiffClass::Ruled(RULING_ID.to_string()), "{x} vs {y}: {}", c.detail);
+        }
+    }
+
+    #[test]
+    fn pgvector_zero_of_either_sign_is_equal_only_in_distance_and_norm_statements() {
+        let table = crate::ruled::default_table();
+        let metric = "SELECT '[1e-40,-1.4e-45]'::vector <#> '[1e-40,1.2e-38]';";
+        let exact = "SELECT '[0,0]'::halfvec * '[1,-1]';";
+        for (a, b) in [(rows("-0"), rows("0")), (vrow("[0,-0]"), vrow("[0,0]"))] {
+            let c = compare(&table, 4, metric, &a, &b, true);
+            assert_eq!(c.class, DiffClass::Ruled(RULING_ID.to_string()), "{a:?} vs {b:?}: {}", c.detail);
+            let c = compare(&table, 4, exact, &a, &b, false);
+            assert!(is_finding(&c), "{a:?} vs {b:?} not a finding in an exact statement: {c:?}");
+        }
+        for (x, y) in [("25", "26"), ("0", "1")] {
+            let c = compare(&table, 4, metric, &rows(x), &rows(y), true);
+            assert!(is_finding(&c), "{x} vs {y} not a finding in a distance statement: {c:?}");
         }
     }
 
