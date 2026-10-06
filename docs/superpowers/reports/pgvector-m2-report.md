@@ -1,29 +1,30 @@
 # pgvector conformance after M2
 
-Date: 2026-10-06 · pgrust commit: aa29a4ec90 (code: the server as of d8208e1a9a, plus the diffrunner comparator change in aa29a4ec90; the docs commit follows it) · Reference: PostgreSQL 18.6 + pgvector 0.8.7 (`pgvec`), seeded oracle `pgvec-seeded` (-DHNSW_MEMORY)
+Date: 2026-10-06 · pgrust commit: cc4c289b17 (code, after the final-review fix wave; the docs commit follows it) · Reference: PostgreSQL 18.6 + pgvector 0.8.7 (`pgvec`), seeded oracle `pgvec-seeded` (-DHNSW_MEMORY)
 
 ## Summary
-- **C reference:** 94/94 (regress 14/14, TAP 48/48, bytecmp 10/10, iterscan 7/7, diff 15/15).
-- **pgrust:** 56/94 (regress 8/14, TAP 16/48, bytecmp 10/10, iterscan 7/7, diff 15/15).
+- **C reference:** 96/96 (regress 14/14, TAP 48/48, bytecmp 10/10, iterscan 7/7, diff 17/17).
+- **pgrust:** 58/96 (regress 8/14, TAP 16/48, bytecmp 10/10, iterscan 7/7, diff 17/17).
   - M1 was 33/79, before the `diff` tier existed.
   - On regress+TAP, pgrust went from 16/62 to 24/62.
 - **Fixed in M2:**
   - regress `bit`, `btree`, `cast`, `copy`, `halfvec`, `sparsevec`;
   - TAP `033_comparison`, `034_distance_functions`;
   - the new exact-differential tier (`diff`, `scripts/pgvector/run-diff.sh`) is clean.
-- **Short of the plan's 57/94.** TAP `018_aggregates` still fails. Its cause is pgrust's parallel worker count, which is outside M2's code. It is open and awaiting the user (see "Known divergences left open").
+- **One row short of the plan's expectation.** TAP `018_aggregates` still fails. Its cause is pgrust's parallel worker count, which is outside M2's code. It is open and awaiting the user (see "Known divergences left open").
 - **Gate also green:**
   - `harness_test.sh`: all passed (71 ok).
-  - `UT_M2`: 27 passed (lookup 2, bitutils 2, bitvec 2, funcs 2, halfutils 3, halfvec 6, sparsevec 10; 0 in `main_main`).
+  - `UT_M2`: 30 passed (lookup 2, bitutils 2, bitvec 2, funcs 2, halfutils 3, halfvec 7, sparsevec 12; 0 in `main_main`).
   - `UT_PARITY`: 3 passed.
-  - `UT_FUZZ pgvector:: rulings:: ruled::`: 21 passed (8 + 10 + 3).
+  - `UT_FUZZ pgvector:: rulings:: ruled::`: 24 passed (11 + 10 + 3).
   - `lint-determinism`: PASS (0 violations, 41 warnings).
   - `lint-seam-installs`: PASS (0 violations, 22 allowlisted).
   - `build-reference.sh --verify`: ok (11 checks).
   - Both reference trees print nothing from `git status --porcelain --ignored`.
-- **How the run was produced.** The table below comes from a full `run-all.sh pgrust` on the final binaries, after the ±0 comparator change (aa29a4ec90).
-  - An earlier full run on the same server, with the previous diffrunner, gave 55/94.
-  - The only row that differed was `diff | seeded` (FAIL; 6 findings, all ±0, see "What M2 established").
+- **How the run was produced.** The table below comes from fresh `run-all.sh ref` and `run-all.sh pgrust` runs on the final binaries, after the final-review fix wave (cc4c289b17).
+  - Earlier full runs gave 55/94: with the previous diffrunner, `diff | seeded` failed on 6 ±0 findings.
+  - After the ±0 comparator change (aa29a4ec90) they gave 56/94.
+  - The fix wave added the exact `normalize` and `denormal` diff rows, so the total is now 58/96. No other row changed.
 
 ## pgrust results
 | Tier | Test | Result |
@@ -114,6 +115,8 @@ Date: 2026-10-06 · pgrust commit: aa29a4ec90 (code: the server as of d8208e1a9a
 | diff | arith | ok |
 | diff | distance | ok |
 | diff | norm | ok |
+| diff | normalize | ok |
+| diff | denormal | ok |
 | diff | agg | ok |
 | diff | cmp | ok |
 | diff | misc | ok |
@@ -123,7 +126,7 @@ Date: 2026-10-06 · pgrust commit: aa29a4ec90 (code: the server as of d8208e1a9a
 | diff | seeded | ok |
 | diff | error_locations | ok |
 
-**56/94 passed**
+**58/96 passed**
 
 ## Remaining failures
 Every remaining failure is one of four things: HNSW on the new types (M3), IVFFlat (M4), parallel builds (M6), or TAP 018. I checked each against this run's logs.
@@ -157,15 +160,18 @@ In Task 2, a one-line rounding mutation made 180,323,328 conversions and 2,483,2
 **halfvec arithmetic equals native `_Float16`.** For every pair of halves (2³² pairs) through `+`, `−` and `×`, widening to f32 and rounding once gives the reference's `_Float16` bits. The only exception is NaN payloads, and `CheckElement` rejects NaN before any arithmetic.
 
 **The `diff` tier is clean on seeds 1 and 2.**
-- **Deck.** The 184 deck statements in 12 sections match exactly at both seeds: 0 ruled, 0 findings.
-- **Seeded arm, seed 1 × 2000:** 1949 match and 51 are ruled.
-- **Seeded arm, seed 2 × 5000:** 4890 match and 110 are ruled.
-- Every ruled record is `pgvector-float-rel`.
-- **Where 6 and 2 of those ruled come from.** They are the pre-M2 `vector` ±0 statements that the user's 2026-10-06 decision rules (see below).
-- **Counts before that decision:** 45 ruled + 6 findings at seed 1, and 108 ruled + 2 findings at seed 2.
-  - The seed-2 figures are from Task 8's run on 1c0a2704fc.
-  - This task's first full run reproduced the seed-1 figures on the final server.
-  - Both seeds were re-run after the change (`run-diff.sh pgrust`, and `PGV_DIFF_SEED=2 PGV_DIFF_COUNT=5000 run-diff.sh pgrust`). Each newly ruled statement is one of the 8 former findings: seed 1 stmts 322, 441, 1080, 1197, 1729 and 2038; seed 2 stmts 541 and 3311.
+- **Deck.** All 197 deck statements, in 14 sections, match exactly at both seeds: 0 ruled, 0 findings. Among them:
+  - the exact `normalize` and `denormal` sections;
+  - send output: `halfvec_send`/`sparsevec_send` as bytea, and a binary `COPY ... TO STDOUT` over all three types, compared byte for byte;
+  - the sparsevec `>` and `<=` operators;
+  - a `pg_typeof` check of result types, since the suite's OID normalization merges the three types.
+- **Seeded arm, seed 1 × 2000:** 1947 match and 53 are ruled.
+- **Seeded arm, seed 2 × 5000:** 4910 match and 90 are ruled.
+- **What gets ruled.** Every ruled record is `pgvector-float-rel`, on a distance or norm statement. No `l2_normalize` statement is ruled; seeded normalize statements compare exactly.
+- **History of the counts.** The fix wave split seeded kind 3 into a norm statement and an `l2_normalize` statement. That shifts the seeded stream, so these counts are not comparable to the earlier ones:
+  - **before the user's ±0 decision:** 45 ruled + 6 findings at seed 1, and 108 ruled + 2 findings at seed 2 (seed 2 from Task 8's run on 1c0a2704fc);
+  - **after it, before the fix wave:** 51 and 110 ruled. The 6 + 2 newly ruled statements were exactly the former ±0 findings: seed 1 stmts 322, 441, 1080, 1197, 1729 and 2038; seed 2 stmts 541 and 3311.
+  - Of those 8 statements, only the old seed-1 stmt 1197 recurs in the new streams (now seed-1 stmt 1238), and it is still ruled.
 - **Fixed during triage.** Task 8 found 5 sparsevec findings and fixed them by fusing the sparse inner product on aarch64.
 
 **Error locations are identical at all 49 sites `scripts/pgvector/sql/error-locations.sql` covers.** `sqldiff.sh --verbose` shows 49 `LOCATION:` lines on each side.
@@ -180,7 +186,7 @@ In Task 2, a one-line rounding mutation made 180,323,328 conversions and 2,483,2
 ## Known divergences left open
 **TAP 018: parallel worker count. Open, awaiting the user.**
 - **Planned workers.** pgrust plans 4 parallel workers for 018's 1M-row table, where C plans 2.
-  - pgrust's `max_parallel_workers_per_gather` boot default is 4 (`guc_tables/src/tables.rs:965`; autotune `guc/src/autotune.rs:188`, `(cores/2).clamp(2, 8)`).
+  - pgrust's `max_parallel_workers_per_gather` boot default is 4 (`guc_tables/src/tables.rs:965`). That alone gives the observed 4. Autotune, when on, would set `(cores/2).clamp(2, 8)` (`guc/src/autotune.rs:188`), but `pgrust.mem_autotune` defaults to off (`tables.rs:754`).
   - C's default is 2, and its log3 sizing still picks 2 even at a limit of 4.
 - **Why the sum overflows.** Each partial `halfvec` sum saturates at `[8192,8192,16384]`. Five partials exceed 65504, so `halfvec_add` raises the float overflow error.
 - **Evidence it is the worker count:**
@@ -198,23 +204,27 @@ In Task 2, a one-line rounding mutation made 180,323,328 conversions and 2,483,2
 - **What differs.** When every product underflows, pre-M2 `vector` `inner_product`/`<#>` can return `0` where C returns `-0`, or the reverse.
 - **Cause.** C sums in clang's arm64 vectorized, fused reduction order: 4×4 `fmla` lanes, a `faddp` tree, then a scalar `fmadd` tail. pgrust keeps source order (an M1 decision).
 - **The amd64 C build, which does not fuse (`OPTFLAGS=""`), also returns `0` on seed-1 stmt 322**, where pgrust returns `-0` (Task 8). So the sign depends on the reduction order the compiler picks, not only on fusion.
-- **The user chose option (b)** (commit aa29a4ec90): in distance and norm statements, a zero of either sign counts as within tolerance.
+- **The user chose option (b)** (commit aa29a4ec90): in distance and norm statements, a zero of either sign counts as within tolerance. The approval rests on the sign of a sum, so it does not cover `l2_normalize`, which is elementwise and compares exactly.
 - **Option (a) was not taken.** It would port C's arm64 reduction tree into `vec.rs`: about 25 lines, which is over Task 8's ~20-line pre-M2 exception, and specific to the arch and compiler.
 - **Still exact:** outside distance and norm statements, a signed-zero difference is still a finding. Non-zero integral numerals, NaN and Infinity also stay exact.
 
-**Scope of `pgvector-float-rel`** (Task 7 ruling, `docs/fuzzing/rulings.toml`).
-- **Where it applies.** It covers only distance and norm statements: deck sections `distance` and `norm`, plus the seeded distance-function, distance-operator, norm and sparsevec-metric kinds.
+**Scope of `pgvector-float-rel`** (Task 7 ruling, narrowed by the final-review fix wave; `docs/fuzzing/rulings.toml`).
+- **Where it applies.** Distance and norm statements only:
+  - deck sections `distance` and `norm`;
+  - the seeded distance-function, distance-operator and norm statements, and the sparsevec-metric arm.
 - **What it allows.** There, numerals that are non-integral on either side may differ within 1e-5 relative, floored at magnitude 1. Zeros of either sign count as equal.
 - **Everything else compares exactly:**
-  - row order: the suite escalates `tie-ordering`;
-  - `*_cmp` magnitudes: it escalates `cmp-magnitude`;
-  - float ulps: it escalates `b1-float-ulp`;
-  - elementwise arithmetic, I/O, casts, aggregates, KNN, limits and errors.
+  - `l2_normalize`: the deck's `normalize` section and the seeded normalize statements;
+  - the denormal and underflow cases the 1e-5 floor would hide: the deck's `denormal` section;
+  - every classify ruling other than `pgvector-float-rel`, which escalates to a finding (an allowlist): row order (`tie-ordering`), `*_cmp` magnitudes (`cmp-magnitude`), float ulps (`b1-float-ulp`), and any other ledger row that matches;
+  - elementwise arithmetic, I/O and send output, casts, aggregates, KNN, limits and errors.
+- **Setup must succeed.** CREATE EXTENSION is a finding unless it succeeds on A. `run-diff.sh` rejects diffrunner exit codes other than 0 and 2, and requires every section line to parse.
 - **Numerals are classed by spelling.** An exponent-form numeral such as `1e+06` counts as non-integral, so it would be ruled equal to `1000000` in a distance or norm statement.
 
 **Pre-M2 `vector` error locations.**
 - These errors report `pgvector.c:0`, a crate-derived location, because `types_error/src/source_map_table.rs` has no `pgvector` row. This is the open M1 item.
 - `halfvec_to_vector` and `sparsevec_to_vector` inherit it through vector's `check_dim`/`check_expected_dim` (`CheckDim`). The crate header marks this `DIVERGENCE`.
+- So does `halfvec_combine`, which M2 ships as an alias of `vector_combine` (as upstream's script does). It reports `pgvector.c:0` where C reports `CheckExpectedDim, vector.c:88`, for example on `halfvec_combine('{1,2}', '{1,2,3}')`.
 - `fc_array_to_vector` (`funcs.rs`) duplicates M2's `cast_array_elems`/`cast_elem_f32`.
   - The plan required this (Task 3 ruling): routing vector through the shared helpers changes its LOCATIONs.
   - So the duplication closes together with this item.
@@ -226,15 +236,15 @@ In Task 2, a one-line rounding mutation made 180,323,328 conversions and 2,483,2
   - halfvec `+ − ×`, halfvec and sparsevec `l2_normalize`, and `halfvec_accum` hit this, and so do `vector` and core float.
 - **`numeric_float4`** (`crates/backend/utils/adt/numeric/src/ops.rs:836`).
   - pgrust reports `float.c:0`, where C reports `float4in_internal, float.c:288`.
-  - Every `numeric[]` array cast hits it; for example, `'{1e39}'::numeric[]::halfvec` and `::sparsevec`.
+  - Casts whose numeric element overflows float4 hit it; for example, `'{1e39}'::numeric[]::halfvec` and `::sparsevec`.
 
 **Sparse kernels.**
-- **The inner product fuses multiply-adds on aarch64 only** (`inner_product_step`, `DIVERGENCE` in `sparsevec.rs`). That matches C's codegen per target: the arm64 reference fuses (`fmadd`), and the amd64 Docker build (`OPTFLAGS=""`) does not. An x86-64 C build with `-march=native` would differ in the last bit and in the sign of an all-underflow zero.
+- **The inner product fuses multiply-adds on aarch64 only** (`inner_product_step`, `DIVERGENCE` in `sparsevec.rs`). That matches C's codegen per target: the arm64 reference fuses (`fmadd`), and the amd64 Docker build (`OPTFLAGS=""`) does not. An x86-64 C build with `-march=native` can differ in the last bit and in the sign of an all-underflow zero.
 - **The L2 and L1 merges keep pgrust's source-order, unfused arithmetic.**
   - C's L2 merge fuses (`fmadd`, with a vectorized trailing loop; Task 8 disassembly).
   - C's L1 codegen was not inspected.
   - On non-integer data either merge can drift in the last bit, and the drift is ruled in distance statements.
-- **Note for M3.** HNSW traversal will call these kernels, so a byte-compare case on non-integer sparse data may need the same per-target treatment.
+- **Required M3 task.** Unlike the inner product, the sparse L2 (and L1) merges stay unfused on aarch64, while C fuses at least L2. HNSW traversal will call these kernels, so per-target fusion of those merges must land in M3, before `sparsevec_l2_ops` and before M5's identical-approximate-results gate.
 
 **Other open items:**
 - **Findings-file block (deferred by Task 7 ruling).** The `diffrunner.rs` raw-fs budget in `lint-determinism.allow` went from 7 to 8 because of the `--pgvector` findings-file write. That block is now duplicated across five suites: copybin, copytext, copyopts, dbddl and pgvector. Extracting a shared helper would shrink the budget again.
@@ -246,7 +256,8 @@ In Task 2, a one-line rounding mutation made 180,323,328 conversions and 2,483,2
 - **wasm.** `wasm/wasm-build.sh` was not run, because the toolchain `nightly-2026-07-17` is not installed. The parity crate is wasm-safe by construction: its `build.rs` returns early on wasm32, and its tests are compiled out there (`cfg(pgv_c_half)`).
 - **x86.** The C reference's x86 F16C and AVX-512 dispatch paths are not exercised on this arm64 host. They are expected first on Linux, in M5. The x86 choice for the sparse inner product was checked once, against the amd64 Docker image under emulation (Task 8).
 - **Binary-only error sites.** The recv functions are covered by unit tests (`recv_validates_like_c` for halfvec and for sparsevec), not by the LOCATION check.
-- **Untested path.** The zero-dropping reallocation path of `sparsevec` `l2_normalize` (`sparsevec.rs`) has no test.
+- **recv is checked only by unit tests.** The diff tier compares send output against C (bytea and binary `COPY ... TO STDOUT`), and unit tests pin the send bytes. But no tier feeds C-produced binary into pgrust's recv: regress `copy.sql` round-trips pgrust to pgrust.
+- **sparsevec `l2_normalize`'s zero-dropping path** is exercised by the deck's `normalize` section (`{1:3e38,2:1e-37}/2` and the `/9` case), and the output matches C. It has no unit test.
 - **M1's two M3 prerequisites carry forward unchanged** (`pgvector-m1-report.md`, "Coverage limits"):
   - **Scan memory-charge emission order** is checked end to end at only one cap transition. Before M3 rewrites `scan.rs`, add either an event-stream diff or a larger iterscan tier.
   - **Review Focus 2** (a wrong-dimension query errors before the empty-index return; the insert and build `HnswCheckDim` sites) has no committed test. M3 should add a durable C-vs-pgrust SQL diff check for it.

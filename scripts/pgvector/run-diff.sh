@@ -2,9 +2,12 @@
 # Exact-differential tier (spec §8.2): diffrunner's --pgvector suite against
 # the C reference (A) and a subject (B), plus the error-location check.
 # Every vector, halfvec, sparsevec and bit function, cast, operator and
-# aggregate, their errors, and exact (non-index) nearest-neighbour queries
-# must match; numerals non-integral on either side may differ within 1e-5
-# relative (ruling pgvector-float-rel, docs/fuzzing/rulings.toml).
+# aggregate, their send output, their errors, and exact (non-index)
+# nearest-neighbour queries must match exactly, with one tolerance (ruling
+# pgvector-float-rel, docs/fuzzing/rulings.toml) in distance and norm
+# statements only: there, numerals non-integral on either side may differ
+# within 1e-5 relative (floored at magnitude 1), and a zero of either sign
+# counts as equal. Everything else, l2_normalize included, compares exactly.
 #
 # usage: run-diff.sh {pgrust|ref}
 #   pgrust: B is pgrust.  ref: B is the seeded C build (must always pass).
@@ -49,11 +52,16 @@ set -e
 server_stop ref
 server_stop "$subject"
 [ "${PGV_KEEP_DATA:-}" = 1 ] || rm -rf "$out/data"
-[ "$rc" -le 2 ] || die "diffrunner failed (exit $rc); see $out/diffrunner.log"
+# 0: clean; 2: findings. Anything else (1: a usage or connection error) is
+# not a result.
+[ "$rc" -eq 0 ] || [ "$rc" -eq 2 ] || die "diffrunner failed (exit $rc); see $out/diffrunner.log"
 
-sed -n 's/^diffrunner: pgvector section=\([a-z_]*\) .* findings=\([0-9]*\)$/\1 \2/p' \
+sed -n 's/^diffrunner: pgvector section=\([^ ]*\) .* findings=\([0-9]*\)$/\1 \2/p' \
   "$out/diffrunner.log" >"$out/sections.txt"
 [ -s "$out/sections.txt" ] || die "no section results in $out/diffrunner.log"
+nlines=$(grep -c '^diffrunner: pgvector section=' "$out/diffrunner.log" || true)
+nparsed=$(wc -l <"$out/sections.txt" | tr -d ' ')
+[ "$nparsed" -eq "$nlines" ] || die "parsed $nparsed of $nlines section lines in $out/diffrunner.log"
 : >"$out/summary.tsv"
 while read -r name findings; do
   if [ "$findings" = 0 ]; then r=ok; else r=FAIL; fi
