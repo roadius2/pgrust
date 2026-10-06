@@ -295,6 +295,28 @@ test_iterscan_cases() {
   if [ -n "$l" ] && [ "$l" -lt 10 ]; then pass "iterscan lateral_64k first loop hits the cap ($l of 10 rows)"; else fail "iterscan lateral_64k: first loop returned '$l' rows, want < 10 (cap not hit)"; fi
 }
 
+# sqldiff, C vs C: one script gives identical sessions on the reference and
+# the seeded build, error lines included.
+test_sqldiff_ref() {
+  if printf '%s\n' "SELECT '[1,2,3]'::vector;" "SELECT '[1,2'::vector;" |
+    "$here/../sqldiff.sh" ref - >"$PGV_WORK/sqldiff-ref.log" 2>&1; then
+    pass "sqldiff ref: identical"
+  else
+    fail "sqldiff ref: identical (see $PGV_WORK/sqldiff-ref.log)"
+  fi
+}
+
+# Negative control: version() differs between C and pgrust.
+test_sqldiff_detects_difference() {
+  if echo 'SELECT version();' | "$here/../sqldiff.sh" pgrust - >"$PGV_WORK/sqldiff-neg.log" 2>&1; then
+    fail "sqldiff flags a difference"
+  elif grep -q 'DIFFERENT' "$PGV_WORK/sqldiff-neg.log"; then
+    pass "sqldiff flags a difference"
+  else
+    fail "sqldiff flags a difference: wrong failure (see $PGV_WORK/sqldiff-neg.log)"
+  fi
+}
+
 # --- runner ---
 if [ "$#" -eq 0 ]; then
   # Declaration order (declare -F would sort): a test may read the results of

@@ -9,6 +9,7 @@ pub mod bitutils;
 pub mod bitvec;
 pub mod funcs;
 pub mod halfutils;
+pub mod halfvec;
 pub mod vec;
 
 use types_fmgr::PGFunction;
@@ -52,6 +53,16 @@ fn lookup(function: &str) -> Option<PGFunction> {
         "vector_accum" => fc_vector_accum,
         "vector_combine" => fc_vector_combine,
         "vector_avg" => fc_vector_avg,
+        "halfvec_in" => halfvec::fc_halfvec_in,
+        "halfvec_out" => halfvec::fc_halfvec_out,
+        "halfvec_typmod_in" => halfvec::fc_halfvec_typmod_in,
+        "halfvec_recv" => halfvec::fc_halfvec_recv,
+        "halfvec_send" => halfvec::fc_halfvec_send,
+        "halfvec" => halfvec::fc_halfvec,
+        "array_to_halfvec" => halfvec::fc_array_to_halfvec,
+        "halfvec_to_float4" => halfvec::fc_halfvec_to_float4,
+        "vector_to_halfvec" => halfvec::fc_vector_to_halfvec,
+        "halfvec_to_vector" => fc_halfvec_to_vector,
         "hamming_distance" => bitvec::fc_hamming_distance,
         "jaccard_distance" => bitvec::fc_jaccard_distance,
         "hnswhandler" => fc_hnswhandler,

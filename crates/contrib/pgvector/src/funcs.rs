@@ -21,12 +21,12 @@ pub(crate) fn image_datum(img: PgVec<'_, u8>) -> Datum {
 }
 
 // SAFETY contract of callers: arg i is a non-null vector varlena (strict fns).
-unsafe fn arg_vector<'a>(fcinfo: &'a Fcinfo, i: usize) -> PgResult<VecView<'a>> {
+pub(crate) unsafe fn arg_vector<'a>(fcinfo: &'a Fcinfo, i: usize) -> PgResult<VecView<'a>> {
     let v = unsafe { fcinfo.arg_varlena_packed(i)? };
     VecView::from_payload(v.data())
 }
 
-unsafe fn detoasted_image<'m>(mcx: Mcx<'m>, d: Datum) -> PgResult<&'m [u8]> {
+pub(crate) unsafe fn detoasted_image<'m>(mcx: Mcx<'m>, d: Datum) -> PgResult<&'m [u8]> {
     let p = d.as_usize() as *const u8;
     unsafe {
         if varatt::varatt_is_4b_u(p) {
@@ -236,6 +236,65 @@ pub fn fc_array_to_vector(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgR
     Ok(image_datum(b.image()))
 }
 
+/// Where an array cast's two up-front ereports sit in its C file.
+pub(crate) struct ArraySite {
+    pub file: &'static str,
+    pub func: &'static str,
+    pub ndim_line: i32,
+    pub nulls_line: i32,
+}
+
+// The array casts' shared prologue (halfvec.c:453-464, sparsevec.c:707-718):
+// reject a multi-dimensional array or one holding NULLs, then deconstruct it.
+// fc_array_to_vector keeps its own copy (pre-M2 code, unchanged).
+pub(crate) fn cast_array_elems<'m>(
+    mcx: Mcx<'m>,
+    arr: &[u8],
+    site: &ArraySite,
+) -> PgResult<(Oid, PgVec<'m, Datum>)> {
+    if arrayfuncs::arr_ndim(arr) > 1 {
+        return Err(PgError::error("array must be 1-D")
+            .with_sqlstate(ERRCODE_DATA_EXCEPTION)
+            .with_location(site.file, site.ndim_line, site.func)
+            .into());
+    }
+    if arrayfuncs::arr_hasnull(arr) && arrayfuncs::array_contains_nulls(arr) {
+        return Err(PgError::error("array must not contain nulls")
+            .with_sqlstate(ERRCODE_NULL_VALUE_NOT_ALLOWED)
+            .with_location(site.file, site.nulls_line, site.func)
+            .into());
+    }
+    let elemtype: Oid = arrayfuncs::arr_elemtype(arr);
+    // numeric is not in builtin_meta: varlena, int-aligned.
+    let (elmlen, elmbyval, elmalign) = if elemtype == NUMERICOID {
+        (-1, false, b'i')
+    } else {
+        arrayfuncs::construct::builtin_meta(elemtype)?
+    };
+    let (elems, _nulls) = arrayfuncs::deconstruct_array(mcx, arr, elmlen, elmbyval, elmalign, true)?;
+    Ok((elemtype, elems))
+}
+// int4 and float8 to float implicitly (halfvec.c:474, 479; sparsevec.c:763)
+// and numeric through numeric_float4. None: unsupported element type.
+pub(crate) fn cast_elem_f32(elemtype: Oid, d: Datum) -> PgResult<Option<f32>> {
+    Ok(Some(match elemtype {
+        INT4OID => d.as_i32() as f32,
+        FLOAT8OID => d.as_f64() as f32,
+        FLOAT4OID => d.as_f32(),
+        NUMERICOID => {
+            let p = d.as_usize() as *const u8;
+            // SAFETY: non-null numeric element datum inside the array image.
+            let payload = unsafe {
+                let total = varatt::varsize_any(p);
+                let hdr = if varatt::varatt_is_1b(p) { 1 } else { 4 };
+                core::slice::from_raw_parts(p.add(hdr), total - hdr)
+            };
+            adt_numeric::ops::numeric_float4(adt_numeric::Num::from_payload(payload))?
+        }
+        _ => return Ok(None),
+    }))
+}
+
 pub fn fc_vector_to_float4(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
     // SAFETY: strict fn — arg0 vector.
     let v = unsafe { arg_vector(fcinfo, 0)? };
@@ -246,6 +305,20 @@ pub fn fc_vector_to_float4(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> Pg
     }
     let img = arrayfuncs::construct_array(mcx, &datums, FLOAT4OID, 4, true, b'i')?;
     Ok(image_datum(img))
+}
+
+// halfvec_to_vector (vector.c:538-557).
+pub fn fc_halfvec_to_vector(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: strict fn — arg0 halfvec, arg1 typmod.
+    let v = unsafe { crate::halfvec::arg_halfvec(fcinfo, 0)? };
+    let typmod = fcinfo.arg_i32(1);
+    check_dim(v.dim())?;
+    check_expected_dim(typmod, v.dim())?;
+    let mut b = VecBuilder::new(fcinfo.result_mcx(), v.dim())?;
+    for i in 0..v.dim() {
+        b.set(i, crate::halfutils::half_to_float4(v.x(i)));
+    }
+    Ok(image_datum(b.image()))
 }
 
 fn binary_2arg<'a>(fcinfo: &'a Fcinfo) -> PgResult<(VecView<'a>, VecView<'a>)> {

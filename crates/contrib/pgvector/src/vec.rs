@@ -163,7 +163,7 @@ pub fn check_dims(a: &VecView<'_>, b: &VecView<'_>) -> PgResult<()> {
     Ok(())
 }
 
-fn vector_isspace(ch: u8) -> bool {
+pub(crate) fn vector_isspace(ch: u8) -> bool {
     // upstream vector.c vector_isspace includes '\v' (0x0b) and '\f' (0x0c).
     matches!(ch, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
 }
