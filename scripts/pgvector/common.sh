@@ -48,6 +48,10 @@ pg_regress_bin() {
 PGRUST_PROFILE="${PGRUST_PROFILE:-fast-profile}"
 PGRUST_BIN="${PGRUST_BIN:-$PGV_REPO/target/$PGRUST_PROFILE/postgres}"
 PAGEMASK_BIN="${PAGEMASK_BIN:-$PGV_REPO/target/$PGRUST_PROFILE/pagemask}"
+DIFFRUNNER_BIN="${DIFFRUNNER_BIN:-$PGV_REPO/target/$PGRUST_PROFILE/diffrunner}"
+# Extra listen address for harness servers (default: Unix socket only).
+# run-diff.sh sets 127.0.0.1 because diffrunner speaks TCP only.
+PGV_LISTEN="${PGV_LISTEN:-}"
 PGRUST_SERVER_OPTS=(-c listen_addresses= -c io_method=sync -c max_stack_depth=60000)
 
 port_for() {
@@ -125,15 +129,15 @@ server_start() {
       (
         pgrust_env
         ulimit -s 65520
-        exec "$PGRUST_BIN" -D "$data" -k "$PGV_WORK/sock" -p "$port" "${PGRUST_SERVER_OPTS[@]}"
+        exec "$PGRUST_BIN" -D "$data" -k "$PGV_WORK/sock" -p "$port" "${PGRUST_SERVER_OPTS[@]}" -c "listen_addresses=$PGV_LISTEN"
       ) >"$log" 2>&1 &
       ;;
     ref)
-      (exec "$PG_VEC/bin/postgres" -D "$data" -k "$PGV_WORK/sock" -p "$port" -c listen_addresses=) >"$log" 2>&1 &
+      (exec "$PG_VEC/bin/postgres" -D "$data" -k "$PGV_WORK/sock" -p "$port" -c "listen_addresses=$PGV_LISTEN") >"$log" 2>&1 &
       ;;
     seeded)
       [ -x "$PG_VEC_SEEDED/bin/postgres" ] || die "missing $PG_VEC_SEEDED; run scripts/pgvector/build-reference.sh"
-      (exec "$PG_VEC_SEEDED/bin/postgres" -D "$data" -k "$PGV_WORK/sock" -p "$port" -c listen_addresses=) >"$log" 2>&1 &
+      (exec "$PG_VEC_SEEDED/bin/postgres" -D "$data" -k "$PGV_WORK/sock" -p "$port" -c "listen_addresses=$PGV_LISTEN") >"$log" 2>&1 &
       ;;
     *) die "unknown mode '$mode' (expected pgrust or ref)" ;;
   esac

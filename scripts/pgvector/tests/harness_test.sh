@@ -317,6 +317,34 @@ test_sqldiff_detects_difference() {
   fi
 }
 
+# Exact differential, C vs C: the reference and the seeded build agree on
+# every section, error locations included.
+test_diff_ref() {
+  local n
+  if "$here/../run-diff.sh" ref >"$PGV_WORK/diff-ref.log" 2>&1; then
+    pass "diff ref: exit 0"
+  else
+    fail "diff ref: exit 0 (see $PGV_WORK/diff-ref.log)"
+  fi
+  n="$(grep -c $'\tok$' "$PGV_WORK/diff/ref/summary.tsv" 2>/dev/null || true)"
+  if [ "$n" = 15 ]; then pass "diff ref: 15 ok"; else fail "diff ref: '$n' ok, want 15"; fi
+}
+
+# Negative control: a B side without l2_normalize(halfvec) must be reported
+# in the deck section that calls it.
+test_diff_detects_difference() {
+  local w="$PGV_WORK/diff-neg"
+  if PGV_WORK="$w" PGV_DIFF_COUNT=50 \
+    PGV_DIFF_PERTURB_B="CREATE EXTENSION vector; ALTER EXTENSION vector DROP FUNCTION l2_normalize(halfvec); DROP FUNCTION l2_normalize(halfvec)" \
+    "$here/../run-diff.sh" ref >"$w.log" 2>&1; then
+    fail "diff flags a missing function"
+  elif grep -q $'^norm\tFAIL$' "$w/diff/ref/summary.tsv" 2>/dev/null; then
+    pass "diff flags a missing function"
+  else
+    fail "diff flags a missing function: wrong failure (see $w.log)"
+  fi
+}
+
 # --- runner ---
 if [ "$#" -eq 0 ]; then
   # Declaration order (declare -F would sort): a test may read the results of

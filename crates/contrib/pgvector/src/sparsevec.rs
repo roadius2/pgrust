@@ -723,7 +723,10 @@ pub fn sparsevec_l2_squared_distance(a: &SparseView<'_>, b: &SparseView<'_>) -> 
     distance
 }
 
-// SparsevecInnerProduct (sparsevec.c:902-933).
+// SparsevecInnerProduct (sparsevec.c:902-933). Upstream builds with
+// -ffp-contract=fast (Makefile:38), and this merge loop compiles to a scalar
+// fmadd chain in source order, so the sum fuses like C's. That makes it bit
+// exact, including the sign of a zero when every product underflows.
 pub fn sparsevec_inner_product(a: &SparseView<'_>, b: &SparseView<'_>) -> f32 {
     let mut distance = 0.0f32;
     let mut bpos = 0usize;
@@ -733,7 +736,7 @@ pub fn sparsevec_inner_product(a: &SparseView<'_>, b: &SparseView<'_>) -> f32 {
             let bi = b.index(j);
             // Only update when the same index
             if ai == bi {
-                distance += a.value(i) * b.value(j);
+                distance = a.value(i).mul_add(b.value(j), distance);
             }
             // Update start for next iteration
             if ai >= bi {
@@ -1176,6 +1179,37 @@ mod tests {
             assert_eq!(sparsevec_l2_squared_distance(&a, &b), l2, "{da:?} {db:?}");
             assert_eq!(sparsevec_inner_product(&a, &b), ip, "{da:?} {db:?}");
             assert_eq!(sparsevec_l1_distance(&a, &b), l1, "{da:?} {db:?}");
+        }
+    }
+
+    // inner_product(sparsevec, sparsevec) on the C reference (macOS arm64),
+    // bit for bit, sign of zero included: the merge loop compiles to a
+    // scalar fmadd chain. The first pair is diff tier finding seed=1
+    // stmt_index=1180 (every product underflows; the last one is negative).
+    #[test]
+    fn inner_product_fuses_like_c() {
+        let ctx = mcx::MemoryContext::new("sparsevec-test");
+        let m = ctx.mcx();
+        let cases = [
+            (
+                "{1:1e-40,2:1.2e-38,3:-1.4e-45,4:1e-40,5:-1.4e-45,6:1e-40,7:1e-40,8:1e-40}/8",
+                "{1:-1.4e-45,2:1.2e-38,3:1.2e-38,5:-1.4e-45,6:-1.4e-45,7:-1.4e-45,8:0}/8",
+                "-0",
+            ),
+            ("{1:0.1,2:0.2,3:0.3}/3", "{1:0.4,2:0.5,3:0.6}/3", "0.320000022649765"),
+            ("{1:1.1,2:-2.3,4:0.7}/4", "{1:0.3,2:0.9,4:-1.9}/4", "-3.069999933242798"),
+            (
+                "{1:-1.244658,3:-1.052791,5:1.120312,6:-0.725007,10:1.131244,13:-1.870595,14:1.642657}/16",
+                "{1:0.501723,2:0.713599,3:0.125273,4:1.498753,5:-0.959627,7:-0.742455,13:-1.352874,14:-1.795352}/16",
+                "-2.2499096393585205",
+            ),
+        ];
+        for (sa, sb, want) in cases {
+            let (ia, ib) = (sparsevec_in_body(m, sa.as_bytes(), -1).unwrap(), sparsevec_in_body(m, sb.as_bytes(), -1).unwrap());
+            let a = SparseView::from_payload(&ia[4..]).unwrap();
+            let b = SparseView::from_payload(&ib[4..]).unwrap();
+            let got = sparsevec_inner_product(&a, &b) as f64;
+            assert_eq!(got.to_bits(), want.parse::<f64>().unwrap().to_bits(), "{sa} . {sb}: got {got}, C {want}");
         }
     }
 

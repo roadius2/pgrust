@@ -13,6 +13,7 @@ port_for "$mode" >/dev/null
 "$here/run-tap.sh" "$mode" || true
 "$here/run-bytecmp.sh" "$mode" || true
 "$here/run-iterscan.sh" "$mode" || true
+"$here/run-diff.sh" "$mode" || true
 
 report="$PGV_WORK/report-$mode.md"
 total=0
@@ -20,7 +21,7 @@ passed=0
 {
   printf '# pgvector conformance: %s\n\n' "$mode"
   printf '| Tier | Test | Result |\n|---|---|---|\n'
-  for tier in regress tap bytecmp iterscan; do
+  for tier in regress tap bytecmp iterscan diff; do
     f="$PGV_WORK/$tier/$mode/summary.tsv"
     if [ ! -s "$f" ]; then
       printf '| %s | (no results) | FAIL |\n' "$tier"
