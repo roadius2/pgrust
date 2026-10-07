@@ -1,8 +1,8 @@
 //! pgvector (github.com/pgvector/pgvector), ported from 0.8.5 @ 159b79a and
 //! brought to 0.8.7 behavior: the vector, halfvec and sparsevec types and
 //! the bit distance functions (I/O, functions, aggregates, casts, btree
-//! opclasses), one module per C file. The HNSW opclasses for halfvec,
-//! sparsevec and bit (M3) and ivfflat (M4) are unported; the shipped
+//! opclasses), one module per C file. The HNSW opclasses for all four types
+//! are shipped (M3); ivfflat (M4) is unported, and the shipped
 //! extension script is the trimmed vector--0.8.5.sql grown with upstream
 //! sections (scripts/pgvector/upstream-sql.sh) until M4 (spec §4.6).
 //! DIVERGENCE: pg_get_loaded_modules() reports 18.6 for this library; C
@@ -128,6 +128,7 @@ fn lookup(function: &str) -> Option<PGFunction> {
         "hamming_distance" => bitvec::fc_hamming_distance,
         "jaccard_distance" => bitvec::fc_jaccard_distance,
         "hnswhandler" => fc_hnswhandler,
+        "hnsw_halfvec_support" | "hnsw_bit_support" | "hnsw_sparsevec_support" => fc_hnsw_type_support,
         _ => return None,
     })
 }
@@ -139,6 +140,17 @@ fn fc_hnswhandler(
     _fcinfo: &mut types_fmgr::FunctionCallInfoBaseData,
 ) -> types_error::PgResult<datum::Datum> {
     panic!("hnswhandler: the closed AM set dispatches via IndexAmKind, never through fmgr")
+}
+
+// CREATE FUNCTION validation targets only: pgvector_hnsw resolves an
+// opclass's support proc 3 by its C symbol to a static HnswTypeInfo
+// (hnsw_get_type_info, spec §5.4), never through fmgr. SQL cannot call
+// them, because their only argument is `internal`.
+fn fc_hnsw_type_support(
+    _f: Option<&mut types_fmgr::FmgrInfo>,
+    _fcinfo: &mut types_fmgr::FunctionCallInfoBaseData,
+) -> types_error::PgResult<datum::Datum> {
+    panic!("hnsw_*_support: pgvector_hnsw resolves support proc 3 by symbol, never through fmgr")
 }
 
 pub fn init_seams() {
