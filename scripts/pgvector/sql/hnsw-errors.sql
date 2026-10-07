@@ -20,5 +20,5 @@ SELECT * FROM v ORDER BY val <-> '[1,2]' LIMIT 1;
 SELECT * FROM v ORDER BY val <=> '[1,2]' LIMIT 1;
 INSERT INTO v VALUES ('[1,2,3]'), ('[4,5,6]');
 SELECT * FROM v ORDER BY val <-> '[1,2]' LIMIT 1;
-SELECT count(*) FROM (SELECT * FROM v ORDER BY val <-> NULL LIMIT 5) s;
+SELECT count(*) FROM (SELECT * FROM v ORDER BY val <-> (SELECT NULL::vector) LIMIT 5) s;
 SELECT * FROM v ORDER BY val <-> '[1,2,3]' LIMIT 1;
