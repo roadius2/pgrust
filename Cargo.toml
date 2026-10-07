@@ -732,6 +732,8 @@ members = [
     "crates/_support/types/types_bloom",
     "crates/contrib/pgvector_hnsw_build",
     "crates/_support/types/types_hnsw",
+    "crates/_support/types/types_ivfflat",
+    "crates/contrib/pgvector_ivfflat",
     "crates/contrib/hstore",
     "crates/contrib/pg_trgm",
     "crates/contrib/btree_gin",

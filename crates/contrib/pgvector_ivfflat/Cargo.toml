@@ -1,0 +1,30 @@
+[package]
+name = "pgvector_ivfflat"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "pgvector_ivfflat"
+path = "src/lib.rs"
+
+[dependencies]
+mcx = { path = "../../_support/mcx" }
+datum = { path = "../../_support/types/datum" }
+types_core = { path = "../../_support/types/types_core" }
+types_error = { path = "../../_support/types/types_error" }
+types_fmgr = { path = "../../_support/types/fmgr" }
+types_tuple = { path = "../../_support/types/types_tuple" }
+types_rel = { path = "../../_support/types/rel" }
+types_storage = { path = "../../_support/types/types_storage" }
+types_ivfflat = { path = "../../_support/types/types_ivfflat" }
+bufmgr = { path = "../../backend/storage/buffer/bufmgr" }
+bufmgr_seams = { path = "../../backend/storage/buffer/bufmgr_seams" }
+generic_xlog = { path = "../../backend/access/transam/generic_xlog" }
+fmgr_seams = { path = "../../backend/utils/fmgr/fmgr_seams" }
+init_small = { path = "../../backend/utils/init/init_small" }
+detoast = { path = "../../backend/access/common/detoast" }
+tupdesc = { path = "../../backend/access/common/tupdesc" }
+tuplesort = { path = "../../backend/utils/sort/tuplesort" }
+pgvector = { path = "../pgvector" }
+adt_varbit = { path = "../../backend/utils/adt/varbit" }

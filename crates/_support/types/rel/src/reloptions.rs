@@ -109,6 +109,12 @@ pub struct HnswOptions {
     pub ef_construction: i32,
 }
 
+// IvfflatOptions (pgvector ivfflat.h:138-142).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IvfflatOptions {
+    pub lists: i32,
+}
+
 /// contrib/bloom's parsed reloptions: types_bloom::BloomOptions (length already
 /// converted bits -> words, C bloptions contract).
 pub use types_bloom::BloomOptions;
@@ -208,6 +214,7 @@ pub enum RdOptions {
     Brin(BrinOptions),
     Pgrcolumnar(PgrcolumnarOptions),
     Hnsw(HnswOptions),
+    Ivfflat(IvfflatOptions),
     Bloom(BloomOptions),
 }
 
@@ -247,7 +254,7 @@ impl RdOptions {
             RdOptions::Gist(o) => Some(o.fillfactor),
             RdOptions::SpGist(o) => Some(o.fillfactor),
             RdOptions::View(_) | RdOptions::Gin(_) | RdOptions::Brin(_)
-            | RdOptions::Pgrcolumnar(_) | RdOptions::Hnsw(_) | RdOptions::Bloom(_) => None,
+            | RdOptions::Pgrcolumnar(_) | RdOptions::Hnsw(_) | RdOptions::Ivfflat(_) | RdOptions::Bloom(_) => None,
         }
     }
 
@@ -311,6 +318,14 @@ impl RdOptions {
     pub fn hnsw(&self) -> Option<&HnswOptions> {
         match self {
             RdOptions::Hnsw(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn ivfflat(&self) -> Option<&IvfflatOptions> {
+        match self {
+            RdOptions::Ivfflat(o) => Some(o),
             _ => None,
         }
     }

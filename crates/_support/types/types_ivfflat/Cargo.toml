@@ -1,0 +1,12 @@
+[package]
+name = "types_ivfflat"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+types_core = { path = "../types_core" }
+types_error = { path = "../types_error" }
+types_fmgr = { path = "../fmgr" }
+types_storage = { path = "../types_storage" }
+pairingheap = { path = "../../../backend/lib/pairingheap" }

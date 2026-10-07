@@ -26,6 +26,27 @@ use types_fmgr::PGFunction;
 
 const LIBRARY: &str = "vector";
 
+// ClanguageId (pg_language.dat).
+const C_LANGUAGE_ID: types_core::Oid = 13;
+
+/// The C symbol a `LANGUAGE c` support function binds: its `pg_proc.prosrc`,
+/// the name C's fmgr looks up in the library. The vector access methods
+/// resolve their type-info support procs by it (HNSW's 3, IVFFlat's 5; spec
+/// §5.4, §6) instead of calling them. None for a function in any other
+/// language, the way GIN identifies support procs (gin/src/util.rs:84-99),
+/// and for one that is gone.
+pub fn support_proc_symbol(procid: types_core::Oid) -> types_error::PgResult<Option<String>> {
+    let Some(row) = syscache_seams::lookup_pg_proc_fmgr::call(procid)? else {
+        return Ok(None);
+    };
+    if row.prolang != C_LANGUAGE_ID {
+        return Ok(None);
+    }
+    let cx = mcx::MemoryContext::new("pgvector support proc symbol");
+    let prosrc = syscache_seams::lookup_pg_proc_prosrc::call(cx.mcx(), procid)?;
+    Ok(prosrc.map(|s| s.as_str().to_string()))
+}
+
 fn lookup(function: &str) -> Option<PGFunction> {
     use funcs::*;
     Some(match function {

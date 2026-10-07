@@ -593,6 +593,10 @@ fn put_options(buf: &mut Buf<'_>, o: &Option<RdOptions>) {
             put_i32(buf, o.m);
             put_i32(buf, o.ef_construction);
         }
+        Some(RdOptions::Ivfflat(o)) => {
+            put_u8(buf, 12);
+            put_i32(buf, o.lists);
+        }
         Some(RdOptions::Bloom(o)) => {
             put_u8(buf, 11);
             put_i32(buf, o.bloom_length);
@@ -711,6 +715,9 @@ fn parse_options(rd: &mut Rd<'_>) -> Option<Option<RdOptions>> {
                 bit_size,
             })))
         }
+        12 => Some(Some(RdOptions::Ivfflat(types_rel::reloptions::IvfflatOptions {
+            lists: rd.i32()?,
+        }))),
         _ => None,
     }
 }

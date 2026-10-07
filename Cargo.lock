@@ -13922,6 +13922,7 @@ dependencies = [
  "pqformat",
  "ryu",
  "stringinfo",
+ "syscache_seams",
  "types_core",
  "types_error",
  "types_fmgr",
@@ -13959,7 +13960,6 @@ dependencies = [
  "pg_prng",
  "pgvector",
  "postgres_seams",
- "syscache_seams",
  "transam_xlog_seams",
  "types_core",
  "types_error",
@@ -14001,6 +14001,31 @@ dependencies = [
  "types_storage",
  "types_tuple",
  "xloginsert",
+]
+
+[[package]]
+name = "pgvector_ivfflat"
+version = "0.0.0"
+dependencies = [
+ "adt_varbit",
+ "bufmgr",
+ "bufmgr_seams",
+ "datum",
+ "detoast",
+ "fmgr_seams",
+ "generic_xlog",
+ "init_small",
+ "mcx",
+ "pgvector",
+ "tupdesc",
+ "tuplesort",
+ "types_core",
+ "types_error",
+ "types_fmgr",
+ "types_ivfflat",
+ "types_rel",
+ "types_storage",
+ "types_tuple",
 ]
 
 [[package]]
@@ -20605,6 +20630,17 @@ dependencies = [
  "types_error",
  "types_fmgr",
  "types_tuple",
+]
+
+[[package]]
+name = "types_ivfflat"
+version = "0.1.0"
+dependencies = [
+ "pairingheap",
+ "types_core",
+ "types_error",
+ "types_fmgr",
+ "types_storage",
 ]
 
 [[package]]

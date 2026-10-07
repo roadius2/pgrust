@@ -113,8 +113,8 @@ fn sparsevec_check_value(img: &[u8]) -> PgResult<()> {
 
 // The type info a support proc 3 names, by its C symbol. C calls the proc
 // and gets a pointer to its static HnswTypeInfo; pgrust maps the symbol to
-// the same static table, as amapi resolves hnswhandler (spec §5.4), so the
-// hnsw_*_support functions are never called through fmgr.
+// the same static table (spec §5.4), so the hnsw_*_support functions are
+// never called through fmgr.
 pub fn hnsw_type_info_for_symbol(symbol: &str) -> Option<&'static HnswTypeInfo> {
     Some(match symbol {
         "hnsw_halfvec_support" => &HALFVEC_TYPE_INFO,
@@ -124,8 +124,9 @@ pub fn hnsw_type_info_for_symbol(symbol: &str) -> Option<&'static HnswTypeInfo> 
     })
 }
 
-// HnswGetTypeInfo (hnswutils.c:1398-1416). The symbol is pg_proc.prosrc,
-// what C's fmgr looks up in the library.
+// HnswGetTypeInfo (hnswutils.c:1398-1416). The symbol is a LANGUAGE c proc's
+// pg_proc.prosrc (pgvector::support_proc_symbol), what C's fmgr looks up in
+// the library.
 // DIVERGENCE: C calls any proc 3 and trusts the pointer it returns; pgrust
 // knows only pgvector's three support functions and raises otherwise.
 pub fn hnsw_get_type_info(index: &Relation<'_>) -> PgResult<&'static HnswTypeInfo> {
@@ -133,10 +134,8 @@ pub fn hnsw_get_type_info(index: &Relation<'_>) -> PgResult<&'static HnswTypeInf
     if procid == InvalidOid {
         return Ok(&VECTOR_TYPE_INFO);
     }
-    let cx = mcx::MemoryContext::new("hnsw type info");
-    let prosrc = syscache_seams::lookup_pg_proc_prosrc::call(cx.mcx(), procid)?;
-    let symbol = prosrc.as_ref().map(|s| s.as_str()).unwrap_or("");
-    hnsw_type_info_for_symbol(symbol).ok_or_else(|| {
+    let symbol = pgvector::support_proc_symbol(procid)?.unwrap_or_default();
+    hnsw_type_info_for_symbol(&symbol).ok_or_else(|| {
         PgError::error(format!(
             "hnsw type support function \"{symbol}\" of index \"{}\" is not supported",
             index.name()
