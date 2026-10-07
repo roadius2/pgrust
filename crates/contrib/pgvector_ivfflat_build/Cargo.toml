@@ -1,0 +1,35 @@
+[package]
+name = "pgvector_ivfflat_build"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "pgvector_ivfflat_build"
+path = "src/lib.rs"
+
+[dependencies]
+mcx = { path = "../../_support/mcx" }
+datum = { path = "../../_support/types/datum" }
+types_core = { path = "../../_support/types/types_core" }
+types_error = { path = "../../_support/types/types_error" }
+types_fmgr = { path = "../../_support/types/fmgr" }
+types_tuple = { path = "../../_support/types/types_tuple" }
+types_rel = { path = "../../_support/types/rel" }
+types_storage = { path = "../../_support/types/types_storage" }
+types_ivfflat = { path = "../../_support/types/types_ivfflat" }
+bufmgr = { path = "../../backend/storage/buffer/bufmgr" }
+xloginsert = { path = "../../backend/access/transam/xloginsert" }
+execindexing = { path = "../../backend/executor/execindexing" }
+nbtree = { path = "../../backend/access/nbtree/nbtree" }
+backend_progress = { path = "../../backend/utils/activity/backend_progress" }
+init_small = { path = "../../backend/utils/init/init_small" }
+elog = { path = "../../backend/utils/error/elog" }
+postgres_seams = { path = "../../backend/tcop/postgres_seams" }
+guc_seams = { path = "../../backend/utils/misc/guc_seams" }
+pg_prng = { path = "../../common/pg_prng" }
+sampling = { path = "../../backend/utils/misc/sampling" }
+pgvector_ivfflat = { path = "../pgvector_ivfflat" }
+
+[dev-dependencies]
+pgvector = { path = "../pgvector" }

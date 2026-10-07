@@ -4,7 +4,7 @@ mod array_typanalyze;
 mod pgrc2_fold;
 mod range_typanalyze;
 mod ts_typanalyze;
-pub mod sampling;
+pub use ::sampling;
 
 use backend_progress::progress::*;
 use backend_progress::{

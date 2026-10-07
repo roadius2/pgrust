@@ -1,3 +1,8 @@
+//! sampling.c (utils/misc): BlockSampler (Knuth's Algorithm S) and Vitter's
+//! reservoir sampling. ANALYZE and pgvector's IVFFlat build share it; its own
+//! crate keeps pgvector_ivfflat_build off commands_analyze, which sits above
+//! indexam.
+
 use pg_prng::PgPrng;
 use types_core::BlockNumber;
 

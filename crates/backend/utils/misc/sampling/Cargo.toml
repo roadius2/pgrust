@@ -1,0 +1,9 @@
+[package]
+name = "sampling"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+pg_prng = { path = "../../../../common/pg_prng" }
+types_core = { path = "../../../../_support/types/types_core" }
