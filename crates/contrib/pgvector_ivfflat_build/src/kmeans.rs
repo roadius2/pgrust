@@ -3,6 +3,7 @@
 //! the center checks.
 
 use datum::Datum;
+use mcx::{Mcx, PgVec};
 use pgvector_ivfflat::utils::{
     elog_error, index_collation, index_getprocinfo, ivfflat_check_memory_usage, ivfflat_norm_vectors,
     ivfflat_optional_proc_info, vector_array_size, VectorArray,
@@ -17,6 +18,11 @@ use types_rel::Relation;
 // (proc 3; InitCenters and ElkanKmeans, reached only when there are samples),
 // the optional k-means norm (proc 4) and the optional norm (proc 2,
 // CheckNorms). Fetched once up front instead of in each callee.
+// DIVERGENCE: C fetches proc 3 inside ElkanKmeans, after
+// IvfflatCheckMemoryUsage (ivfkmeans.c:290, then :297); ivfflat_kmeans
+// fetches it first. So a hand-written opclass without proc 3 whose build
+// also exceeds maintenance_work_mem raises `missing support function 3`
+// here, where C raises `memory required is ...`.
 pub struct KmeansProcs {
     pub collation: Oid,
     pub distance: Option<FmgrInfo>,
@@ -33,13 +39,29 @@ fn random_int() -> u32 {
     pg_prng::global_prng(|p| p.next_u32())
 }
 
+// kmeansCtx (ivfkmeans.c:556-558).
+const KMEANS_CONTEXT: &str = "Ivfflat kmeans temporary context";
+
+// An array of `n` elements in the k-means context, filled with `value`:
+// palloc, or palloc_extended(.., MCXT_ALLOC_HUGE) when `huge`. A failed
+// allocation raises palloc's ERROR (`out of memory`, or `invalid memory
+// alloc request size` past MaxAllocSize without HUGE) instead of aborting
+// the process, as a failed `vec!` would.
+fn kmeans_alloc<'m, T: Copy>(mcx: Mcx<'m>, n: usize, value: T, huge: bool) -> PgResult<PgVec<'m, T>> {
+    let mut v = if huge { mcx::vec_with_capacity_huge_in(mcx, n)? } else { mcx::vec_with_capacity_in(mcx, n)? };
+    v.resize(n, value);
+    Ok(v)
+}
+
 // DatumGetFloat8(FunctionCall2Coll(procinfo, collation, a, b)).
 fn distance(procinfo: &mut FmgrInfo, collation: Oid, a: Datum, b: Datum) -> PgResult<f64> {
     Ok(types_fmgr::function_call2_coll(procinfo, collation, a, b)?.as_f64())
 }
 
-// InitCenters (ivfkmeans.c:23-91): k-means++.
+// InitCenters (ivfkmeans.c:23-91): k-means++. `weight` lives in `mcx`, the
+// k-means context.
 fn init_centers(
+    mcx: Mcx<'_>,
     procinfo: &mut FmgrInfo,
     collation: Oid,
     samples: &VectorArray<'_>,
@@ -49,7 +71,7 @@ fn init_centers(
     let num_centers = centers.maxlen;
     let num_samples = samples.length;
     let nc = num_centers as usize;
-    let mut weight = vec![f32::MAX; num_samples as usize];
+    let mut weight = kmeans_alloc(mcx, num_samples as usize, f32::MAX, false)?;
 
     // Choose an initial center uniformly at random
     let first = (random_int() % samples.length as u32) as i32;
@@ -102,9 +124,14 @@ fn norm_centers(type_info: &IvfflatTypeInfo, collation: Oid, centers: &mut Vecto
 }
 
 // RandomCenters (ivfkmeans.c:110-133): quick approach if we have no data.
-fn random_centers(procs: &KmeansProcs, centers: &mut VectorArray<'_>, type_info: &IvfflatTypeInfo) -> PgResult<()> {
+fn random_centers(
+    mcx: Mcx<'_>,
+    procs: &KmeansProcs,
+    centers: &mut VectorArray<'_>,
+    type_info: &IvfflatTypeInfo,
+) -> PgResult<()> {
     let dimensions = centers.dim;
-    let mut x = vec![0.0f32; dimensions as usize];
+    let mut x = kmeans_alloc(mcx, dimensions as usize, 0.0f32, false)?;
 
     // Fill with random data
     while centers.length < centers.maxlen {
@@ -210,8 +237,10 @@ fn compute_new_centers(
 
 // ElkanKmeans (ivfkmeans.c:238-485). Elkan requires the distance to satisfy
 // the triangle inequality: L2 distance for L2 (not L2 squared like the index
-// scan), angular distance for inner product and cosine.
+// scan), angular distance for inner product and cosine. Its buffers and new
+// centers live in `mcx`, the k-means context.
 fn elkan_kmeans(
+    mcx: Mcx<'_>,
     procs: &mut KmeansProcs,
     samples: &VectorArray<'_>,
     centers: &mut VectorArray<'_>,
@@ -266,22 +295,21 @@ fn elkan_kmeans(
 
     // Allocate space
     // Use float instead of double to save memory
-    let mut agg = vec![0.0f32; nc * dimensions as usize];
-    let mut center_counts = vec![0i32; nc];
-    let mut closest_centers = vec![0i32; ns];
-    let mut lower_bound = vec![0.0f32; ns * nc];
-    let mut upper_bound = vec![0.0f32; ns];
-    let mut s = vec![0.0f32; nc];
-    let mut halfcdist = vec![0.0f32; nc * nc];
-    let mut newcdist = vec![0.0f32; nc];
+    let mut agg = kmeans_alloc(mcx, nc * dimensions as usize, 0.0f32, false)?;
+    let mut center_counts = kmeans_alloc(mcx, nc, 0i32, false)?;
+    let mut closest_centers = kmeans_alloc(mcx, ns, 0i32, false)?;
+    let mut lower_bound = kmeans_alloc(mcx, ns * nc, 0.0f32, true)?;
+    let mut upper_bound = kmeans_alloc(mcx, ns, 0.0f32, false)?;
+    let mut s = kmeans_alloc(mcx, nc, 0.0f32, false)?;
+    let mut halfcdist = kmeans_alloc(mcx, nc * nc, 0.0f32, true)?;
+    let mut newcdist = kmeans_alloc(mcx, nc, 0.0f32, false)?;
 
     // Initialize new centers
-    let new_centers_cx = mcx::MemoryContext::new("Ivfflat kmeans new centers");
-    let mut new_centers = VectorArray::init(new_centers_cx.mcx(), num_centers, dimensions, centers.itemsize)?;
+    let mut new_centers = VectorArray::init(mcx, num_centers, dimensions, centers.itemsize)?;
     new_centers.length = num_centers;
 
     // Pick initial centers
-    init_centers(procinfo, collation, samples, centers, &mut lower_bound)?;
+    init_centers(mcx, procinfo, collation, samples, centers, &mut lower_bound)?;
 
     // Assign each x to its closest initial center c(x) = argmin d(x,c)
     for j in 0..ns {
@@ -435,8 +463,8 @@ fn elkan_kmeans(
 }
 
 // CheckElements (ivfkmeans.c:490-512): ensure no NaN or infinite values.
-fn check_elements(centers: &VectorArray<'_>, type_info: &IvfflatTypeInfo) -> PgResult<()> {
-    let mut scratch = vec![0.0f32; centers.dim as usize];
+fn check_elements(mcx: Mcx<'_>, centers: &VectorArray<'_>, type_info: &IvfflatTypeInfo) -> PgResult<()> {
+    let mut scratch = kmeans_alloc(mcx, centers.dim as usize, 0.0f32, false)?;
     for i in 0..centers.length {
         scratch.fill(0.0);
         // /fp:fast may not propagate NaN with MSVC, but that's alright
@@ -475,11 +503,16 @@ fn check_norms(centers: &VectorArray<'_>, procs: &mut KmeansProcs) -> PgResult<(
 }
 
 // CheckCenters (ivfkmeans.c:539-547): detect issues with centers.
-fn check_centers(centers: &VectorArray<'_>, type_info: &IvfflatTypeInfo, procs: &mut KmeansProcs) -> PgResult<()> {
+fn check_centers(
+    mcx: Mcx<'_>,
+    centers: &VectorArray<'_>,
+    type_info: &IvfflatTypeInfo,
+    procs: &mut KmeansProcs,
+) -> PgResult<()> {
     if centers.length != centers.maxlen {
         return Err(elog_error("Not enough centers. Please report a bug.", "ivfkmeans.c", 543, "CheckCenters"));
     }
-    check_elements(centers, type_info)?;
+    check_elements(mcx, centers, type_info)?;
     check_norms(centers, procs)
 }
 
@@ -505,7 +538,9 @@ pub fn ivfflat_kmeans(
     kmeans(&mut procs, samples, centers, type_info, memory_used)
 }
 
-// IvfflatKmeans' body over resolved support procs.
+// IvfflatKmeans' body over resolved support procs. Everything it allocates
+// lives in the k-means context, C's kmeansCtx (ivfkmeans.c:556-569), which
+// goes on return.
 pub fn kmeans(
     procs: &mut KmeansProcs,
     samples: &VectorArray<'_>,
@@ -513,12 +548,14 @@ pub fn kmeans(
     type_info: &IvfflatTypeInfo,
     memory_used: usize,
 ) -> PgResult<()> {
+    let kmeans_cx = mcx::MemoryContext::new(KMEANS_CONTEXT);
+    let mcx = kmeans_cx.mcx();
     if samples.length == 0 {
-        random_centers(procs, centers, type_info)?;
+        random_centers(mcx, procs, centers, type_info)?;
     } else {
-        elkan_kmeans(procs, samples, centers, type_info, memory_used)?;
+        elkan_kmeans(mcx, procs, samples, centers, type_info, memory_used)?;
     }
-    check_centers(centers, type_info, procs)
+    check_centers(mcx, centers, type_info, procs)
 }
 
 #[cfg(test)]
@@ -618,6 +655,29 @@ mod tests {
         }
     }
 
+    // ElkanKmeans' buffers (ivfkmeans.c:303-310) are sized by user input
+    // (lists, samples) and capped only by maintenance_work_mem, which any
+    // user can SET. A failed allocation raises palloc's per-statement ERROR
+    // and never aborts the server: `out of memory` when the allocator
+    // refuses a request (2^62 bytes, through palloc_extended(MCXT_ALLOC_HUGE)),
+    // and `invalid memory alloc request size` past MaxAllocSize without HUGE.
+    #[test]
+    fn ivf_kmeans_buffers_raise_out_of_memory() {
+        let ctx = mcx::MemoryContext::new(KMEANS_CONTEXT);
+        let m = ctx.mcx();
+        let e = kmeans_alloc(m, 1usize << 60, 0.0f32, true).unwrap_err();
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_OUT_OF_MEMORY);
+        assert_eq!(e.message(), "out of memory");
+        assert_eq!(
+            e.detail(),
+            Some("Failed on request of size 4611686018427387904 in memory context \"Ivfflat kmeans temporary context\".")
+        );
+        let e = kmeans_alloc(m, 1usize << 28, 0.0f32, false).unwrap_err();
+        assert_eq!(e.message(), "invalid memory alloc request size 1073741824");
+        let v = kmeans_alloc(m, 3, 7i32, false).unwrap();
+        assert_eq!(&v[..], &[7, 7, 7]);
+    }
+
     // CheckCenters and CheckElements (ivfkmeans.c:490-547).
     #[test]
     fn ivf_check_centers_rejects_short_arrays_and_nan() {
@@ -625,13 +685,13 @@ mod tests {
         let m = ctx.mcx();
         let mut procs = KmeansProcs { collation: 0, distance: None, kmeans_norm: None, norm: None };
         let short = sample_array(m, 2, &[[1.0, 1.0]]);
-        let e = check_centers(&short, &VECTOR_TYPE_INFO, &mut procs).unwrap_err();
+        let e = check_centers(m, &short, &VECTOR_TYPE_INFO, &mut procs).unwrap_err();
         assert_eq!(e.message(), "Not enough centers. Please report a bug.");
         let nan = sample_array(m, 2, &[[1.0, 1.0], [f32::NAN, 0.0]]);
-        let e = check_centers(&nan, &VECTOR_TYPE_INFO, &mut procs).unwrap_err();
+        let e = check_centers(m, &nan, &VECTOR_TYPE_INFO, &mut procs).unwrap_err();
         assert_eq!(e.message(), "NaN detected. Please report a bug.");
         let inf = sample_array(m, 1, &[[f32::INFINITY, 0.0]]);
-        let e = check_centers(&inf, &VECTOR_TYPE_INFO, &mut procs).unwrap_err();
+        let e = check_centers(m, &inf, &VECTOR_TYPE_INFO, &mut procs).unwrap_err();
         assert_eq!(e.message(), "Infinite value detected. Please report a bug.");
     }
 }

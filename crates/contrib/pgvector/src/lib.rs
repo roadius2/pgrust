@@ -240,6 +240,13 @@ fn fc_ivfflat_bit_support(
 // their GUC prefixes (hnsw.c:111, ivfflat.c:58); the GUCs and reloptions
 // they define are static here, and BitvecInit and HalfvecInit only pick CPU
 // dispatch, which this port does not need.
+// DIVERGENCE: C loads `vector`, and so runs _PG_init, on a session's first
+// open of an hnsw or ivfflat index (InitIndexAmRoutine -> GetIndexAmRoutine
+// -> OidFunctionCall0(amhandler), relcache.c:1432, amapi.c:38). pgrust
+// resolves the handlers by name (amapi's resolve_extension_handler) and
+// never loads the library there, so the prefix reservation can happen later
+// than in C, and pg_get_loaded_modules() can omit `vector` until a vector
+// function is called. The fix is in core amapi.
 fn pg_init() -> types_error::PgResult<()> {
     guc::MarkGUCPrefixReserved("hnsw");
     guc::MarkGUCPrefixReserved("ivfflat");

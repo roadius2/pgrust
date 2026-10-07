@@ -138,8 +138,10 @@ fn index_getprocid(index: &Relation<'_>, procnum: u16) -> Oid {
     index.rd_support.get(procnum as usize - 1).copied().unwrap_or(InvalidOid)
 }
 
-// index_getprocinfo(index, 1, procnum) (indexam.c:917-955). Not reachable
-// from SQL: CREATE OPERATOR CLASS checks the procs an ivfflat opclass has.
+// index_getprocinfo(index, 1, procnum) (indexam.c:917-955). Reachable from
+// SQL: ivfflathandler sets no amadjustmembers and ivfflatvalidate returns
+// true (ivfflat.c:173-176, 297), so a hand-written opclass without FUNCTION 1
+// (or, with samples, FUNCTION 3) reaches this elog during a build.
 pub fn index_getprocinfo(index: &Relation<'_>, procnum: u16) -> PgResult<FmgrInfo> {
     let procid = index_getprocid(index, procnum);
     if procid == InvalidOid {
@@ -360,10 +362,14 @@ impl<'s> XlogPage<'s> {
     }
 
     // The shared tail of IvfflatAppendPage (ivfutils.c:185-207) and
-    // InsertTuple's new page (ivfinsert.c:143-171): register `newbuf` as a
-    // full image in this record, link this page to it, initialize it,
-    // commit, unlock this buffer, and start a new record on `newbuf`
-    // registered with `next_flags`.
+    // InsertTuple's new page (ivfinsert.c:143-171): link this page to
+    // `newbuf`, register `newbuf` as a full image in this record, initialize
+    // it, commit, unlock this buffer, and start a new record on `newbuf`
+    // registered with `next_flags`. C registers `newbuf` before setting
+    // nextblkno (ivfutils.c:190-193, ivfinsert.c:152-159). Here the write
+    // through `self.page` comes first, because `register_buffer` reborrows
+    // the whole state mutably; both images belong to one record whose deltas
+    // GenericXLogFinish computes, so the order is unobservable.
     pub fn link_new_page(
         mut self,
         index: &Relation<'_>,
@@ -371,8 +377,8 @@ impl<'s> XlogPage<'s> {
         next_flags: i32,
         mcx: Mcx<'s>,
     ) -> PgResult<XlogPage<'s>> {
-        let newpage = self.state.register_buffer(newbuf, GENERIC_XLOG_FULL_IMAGE)?.as_mut_ptr();
         set_page_nextblkno(self.page_mut(), bufmgr::BufferGetBlockNumber(newbuf));
+        let newpage = self.state.register_buffer(newbuf, GENERIC_XLOG_FULL_IMAGE)?.as_mut_ptr();
         // SAFETY: newbuf's registered image, a whole page.
         ivfflat_init_page(unsafe { core::slice::from_raw_parts_mut(newpage, BLCKSZ) });
         GenericXLogFinish(self.state)?;
