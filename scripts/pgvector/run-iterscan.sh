@@ -36,7 +36,13 @@ big_relaxed_256k:relaxed_order:256kB:1:20000:40:bigknn
 big_strict_128k:strict_order:128kB:1:20000:40:bigknn
 big_ef100_128k:relaxed_order:128kB:1:20000:100:bigknn
 big_lateral_128k:relaxed_order:128kB:1:20000:40:biglateral
-big_exhaust_4MB:relaxed_order:4MB:1:20000:40:bigknn"
+big_exhaust_4MB:relaxed_order:4MB:1:20000:40:bigknn
+halfvec_64k:relaxed_order:64kB:1:20000:40:halfvec_l2
+halfvec_cosine_64k:relaxed_order:64kB:1:20000:40:halfvec_cosine
+sparsevec_64k:relaxed_order:64kB:1:20000:40:sparsevec_l2
+sparsevec_cosine_drop_64k:relaxed_order:64kB:1:20000:40:sparsevec_cosine_drop
+bit_hamming_64k:relaxed_order:64kB:1:20000:40:bit_hamming
+bit_jaccard_64k:relaxed_order:64kB:1:20000:40:bit_jaccard"
 MEMORY="${PGV_ITERSCAN_MEMORY-on}"
 
 # tst: tie-free Golomb-ruler data (see run-bytecmp.sh l2_golomb), so the
@@ -45,6 +51,9 @@ MEMORY="${PGV_ITERSCAN_MEMORY-on}"
 # 2^24, so f32 rounds them, identically on both sides. Its index is
 # byte-identical to C's (run-bytecmp.sh big_golomb), and C's in-memory graph
 # spans several 1 MB blocks.
+# hv, sv, bv: one table per type, each with two indexes (the ORDER BY
+# operator picks one). Their data has ties, which pop in C's pairing-heap
+# order (M1), and every build reseeds with 42.
 setup_sql() {
   cat <<'SQL'
 SET max_parallel_maintenance_workers = 0;
@@ -57,6 +66,18 @@ CREATE INDEX tst_v_idx ON tst USING hnsw (v vector_l2_ops);
 CREATE TABLE big (i int4, v vector(3));
 INSERT INTO big SELECT i, ARRAY[2*10007*k + (k*k) % 10007, 0, 0]::vector FROM (SELECT i, (i * 37) % 10007 AS k FROM generate_series(0, 9999) i) s;
 CREATE INDEX big_v_idx ON big USING hnsw (v vector_l2_ops);
+CREATE TABLE hv (i int4, v halfvec(3));
+INSERT INTO hv SELECT i, ARRAY[1 + i % 17, 1 + (i * 7) % 23, 1 + (i * 13) % 31] FROM generate_series(0, 999) i;
+CREATE INDEX hv_l2_idx ON hv USING hnsw (v halfvec_l2_ops);
+CREATE INDEX hv_cosine_idx ON hv USING hnsw (v halfvec_cosine_ops);
+CREATE TABLE sv (i int4, v sparsevec(3));
+INSERT INTO sv SELECT i, ARRAY[i % 17, 1 + (i * 7) % 23, (i * 13) % 31]::vector::sparsevec FROM generate_series(0, 999) i;
+CREATE INDEX sv_l2_idx ON sv USING hnsw (v sparsevec_l2_ops);
+CREATE INDEX sv_cosine_idx ON sv USING hnsw (v sparsevec_cosine_ops);
+CREATE TABLE bv (i int4, v bit(64));
+INSERT INTO bv SELECT i, ('x' || substr(md5(i::text), 1, 16))::bit(64) FROM generate_series(0, 999) i;
+CREATE INDEX bv_hamming_idx ON bv USING hnsw (v bit_hamming_ops);
+CREATE INDEX bv_jaccard_idx ON bv USING hnsw (v bit_jaccard_ops);
 SQL
 }
 
@@ -69,6 +90,14 @@ query_sql() {
     bigknn) echo "SELECT i FROM big WHERE i % 1000 = 0 ORDER BY v <-> '[100000000,0,0]' LIMIT 11" ;;
     # Every one of the three loops hits the 128kB cap.
     biglateral) echo "SELECT q.x, t.i FROM (VALUES (100000000), (25000000), (175000000)) q(x) CROSS JOIN LATERAL (SELECT i FROM big WHERE i % 1000 = 0 ORDER BY v <-> ARRAY[q.x, 0, 0]::vector LIMIT 11) t" ;;
+    halfvec_l2) echo "SELECT i FROM hv WHERE i % 100 = 0 ORDER BY v <-> '[1000,1000,1000]' LIMIT 11" ;;
+    halfvec_cosine) echo "SELECT i FROM hv WHERE i % 100 = 0 ORDER BY v <=> '[1,2,3]' LIMIT 11" ;;
+    sparsevec_l2) echo "SELECT i FROM sv WHERE i % 100 = 0 ORDER BY v <-> '{1:1000,2:1000,3:1000}/3' LIMIT 11" ;;
+    # 1e-30 normalizes to zero: sparsevec_l2_normalize's zero-dropping
+    # path, charged to tmpCtx as two vectors and a pfree (Review Focus 2).
+    sparsevec_cosine_drop) echo "SELECT i FROM sv WHERE i % 100 = 0 ORDER BY v <=> '{1:3e38,3:1e-30}/3' LIMIT 11" ;;
+    bit_hamming) echo "SELECT i FROM bv WHERE i % 100 = 0 ORDER BY v <~> ('x' || substr(md5('q'), 1, 16))::bit(64) LIMIT 11" ;;
+    bit_jaccard) echo "SELECT i FROM bv WHERE i % 100 = 0 ORDER BY v <%> ('x' || substr(md5('q'), 1, 16))::bit(64) LIMIT 11" ;;
     *) die "unknown query '$1'" ;;
   esac
 }

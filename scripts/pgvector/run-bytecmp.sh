@@ -29,11 +29,16 @@ set -euo pipefail
 # Default cases. *_golomb data are tie-free: x = 2*p*k + (k*k % p) is an
 # Erdos-Turan Golomb ruler, so all pairwise distances differ. *_grid and dups
 # have many equal distances, which exercises C's pairingheap tie order.
-CASES="l2_golomb l1_golomb m4_golomb wide_golomb unlogged_golomb insert_golomb l2_grid ip_grid dups insert_grid big_golomb"
+CASES="l2_golomb l1_golomb m4_golomb wide_golomb unlogged_golomb insert_golomb l2_grid ip_grid dups insert_grid big_golomb halfvec_l2_grid halfvec_cosine_grid sparsevec_l2_grid sparsevec_l2_frac sparsevec_cosine_grid insert_sparsevec_cosine wide_sparsevec bit_hamming bit_jaccard bq_expression"
 # Opt-in only (known divergences, run by name): spill cosine
 
 GOLOMB1009='ARRAY[2*1009*k + (k*k) % 1009, 0, 0]::vector'
 GRID='ARRAY[i % 17, (i * 7) % 23, (i * 13) % 31]::vector'
+# The same grid as typed arrays; _POS has no zero coordinate (cosine needs
+# a non-zero norm). MD5BITS: 64 pseudo-random bits per row.
+GRID3='ARRAY[i % 17, (i * 7) % 23, (i * 13) % 31]'
+GRID3_POS='ARRAY[1 + i % 17, 1 + (i * 7) % 23, 1 + (i * 13) % 31]'
+MD5BITS="('x' || substr(md5(i::text), 1, 16))::bit(64)"
 SEED="${PGV_BYTECMP_SEED-42}"
 
 # Print one case's SQL. Each case ends by selecting "rel|<label>|<relfile>"
@@ -121,6 +126,77 @@ SQL
 CREATE TABLE $1 (id int, v vector(3));
 INSERT INTO $1 SELECT k, ARRAY[2*10007*k + (k*k) % 10007, 0, 0]::vector FROM (SELECT (i * 37) % 10007 AS k FROM generate_series(0, 9999) i) s;
 CREATE INDEX $1_idx ON $1 USING hnsw (v vector_l2_ops);
+SQL
+      ;;
+    halfvec_l2_grid | halfvec_cosine_grid)
+      # Small integers are exact halves. Cosine: products of normalized
+      # halves are exact in f32, so C's fused sums equal pgrust's.
+      local ops=halfvec_l2_ops grid="$GRID3"
+      if [ "$1" = halfvec_cosine_grid ]; then ops=halfvec_cosine_ops; grid="$GRID3_POS"; fi
+      cat <<SQL
+CREATE TABLE $1 (id int, v halfvec(3));
+INSERT INTO $1 SELECT i, $grid::halfvec FROM generate_series(1, 1000) i;
+CREATE INDEX $1_idx ON $1 USING hnsw (v $ops);
+SQL
+      ;;
+    sparsevec_l2_grid | sparsevec_cosine_grid)
+      # 0 to 3 non-zeros per row. Cosine: the normalized values' inner
+      # products fuse on arm64 in C and in pgrust alike.
+      local ops=sparsevec_l2_ops grid="$GRID3"
+      if [ "$1" = sparsevec_cosine_grid ]; then ops=sparsevec_cosine_ops; grid="$GRID3_POS"; fi
+      cat <<SQL
+CREATE TABLE $1 (id int, v sparsevec(3));
+INSERT INTO $1 SELECT i, $grid::vector::sparsevec FROM generate_series(1, 1000) i;
+CREATE INDEX $1_idx ON $1 USING hnsw (v $ops);
+SQL
+      ;;
+    sparsevec_l2_frac)
+      # Non-integer values, so the L2 sums round. With at most 3 non-zeros
+      # no L2 tail reaches 4 entries, so C and pgrust round every step alike
+      # (fused on arm64: sparsevec.rs fmadd_step).
+      cat <<SQL
+CREATE TABLE $1 (id int, v sparsevec(3));
+INSERT INTO $1 SELECT i, ARRAY[(i % 17)::real * 0.37::real, ((i * 7) % 23)::real * 0.53::real, ((i * 13) % 31)::real * 0.71::real]::vector::sparsevec FROM generate_series(1, 1000) i;
+CREATE INDEX $1_idx ON $1 USING hnsw (v sparsevec_l2_ops);
+SQL
+      ;;
+    insert_sparsevec_cosine)
+      # Inserts after the build normalize on the on-disk path.
+      cat <<SQL
+CREATE TABLE $1 (id int, v sparsevec(3));
+INSERT INTO $1 SELECT i, $GRID3_POS::vector::sparsevec FROM generate_series(1, 800) i;
+CREATE INDEX $1_idx ON $1 USING hnsw (v sparsevec_cosine_ops);
+INSERT INTO $1 SELECT i, $GRID3_POS::vector::sparsevec FROM generate_series(801, 1000) i;
+SQL
+      ;;
+    wide_sparsevec)
+      # Review Focus 1: 1,000 non-zeros in 1e9 dimensions, 8,016-byte values
+      # TOASTed in the heap. Each neighbor tuple goes on the next page, and
+      # the 20 inserts after the build append pages. Values are distinct.
+      local sv="('{' || (SELECT string_agg((j * 999983)::text || ':' || CASE WHEN j = 1 THEN i ELSE (i * j) % 7 + 1 END, ',') FROM generate_series(1, 1000) j) || '}/1000000000')::sparsevec"
+      cat <<SQL
+CREATE TABLE $1 (id int, v sparsevec(1000000000));
+INSERT INTO $1 SELECT i, $sv FROM generate_series(1, 80) i;
+CREATE INDEX $1_idx ON $1 USING hnsw (v sparsevec_l2_ops);
+INSERT INTO $1 SELECT i, $sv FROM generate_series(81, 100) i;
+SQL
+      ;;
+    bit_hamming | bit_jaccard)
+      # Hamming distances are small integers: many ties, popped in C's
+      # pairing-heap order.
+      cat <<SQL
+CREATE TABLE $1 (id int, v bit(64));
+INSERT INTO $1 SELECT i, $MD5BITS FROM generate_series(1, 1000) i;
+CREATE INDEX $1_idx ON $1 USING hnsw (v $1_ops);
+SQL
+      ;;
+    bq_expression)
+      # Review Focus 5: pgvector's binary-quantization pattern. The index
+      # attribute is the cast's bit(64), not the vector column.
+      cat <<SQL
+CREATE TABLE $1 (id int, v vector(64));
+INSERT INTO $1 SELECT i, (SELECT array_agg(CASE WHEN substr(md5(i::text || ':' || j::text), 1, 1) < '8' THEN 1 ELSE -1 END) FROM generate_series(1, 64) j)::vector(64) FROM generate_series(1, 1000) i;
+CREATE INDEX $1_idx ON $1 USING hnsw ((binary_quantize(v)::bit(64)) bit_hamming_ops);
 SQL
       ;;
     spill)

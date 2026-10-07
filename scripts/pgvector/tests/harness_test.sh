@@ -305,6 +305,12 @@ test_iterscan_cases() {
     l="$(grep -c "^$x|" "$PGV_WORK/iterscan/ref/oracle.big_lateral_128k.out" 2>/dev/null || true)"
     if [ -n "$l" ] && [ "$l" -lt 10 ]; then pass "iterscan big_lateral_128k loop $x hits the cap ($l of 10 rows)"; else fail "iterscan big_lateral_128k loop $x: '$l' rows, want < 10"; fi
   done
+  # The type cases stop on the 64kB cap (on the seeded build when the M3 plan
+  # was written: 139, 132, 139, 223, 663 and 608 of 990 rows removed).
+  for x in halfvec_64k halfvec_cosine_64k sparsevec_64k sparsevec_cosine_drop_64k bit_hamming_64k bit_jaccard_64k; do
+    a="$(removed "$x")"
+    if [ -n "$a" ] && [ "$a" -lt 990 ]; then pass "iterscan $x stops early ($a removed)"; else fail "iterscan $x: removed '$a', want < 990"; fi
+  done
   # Every case compares a memory trace.
   for f in "$PGV_WORK"/iterscan/ref/oracle.*.out; do
     n="$(grep -c '^memory: ' "$f" || true)"
