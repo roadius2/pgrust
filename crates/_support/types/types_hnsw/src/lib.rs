@@ -124,4 +124,7 @@ pub struct HnswScanOpaqueData<'mcx> {
     // so->v.tids (hnswscan.c:60): NULL until GetScanItems' layer-0 search.
     pub visited: Option<TidHash>,
     pub discarded: Option<ScanDiscardedHeap>,
+    // pgrust.hnsw_memory at hnswbeginscan: print C's -DHNSW_MEMORY
+    // ShowMemoryUsage line after each search batch.
+    pub show_memory: bool,
 }

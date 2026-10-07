@@ -280,7 +280,7 @@ test_iterscan_ref() {
 # case on the memory cap, the 300-tuple case on hnsw.max_scan_tuples, and a
 # doubled multiplier must scan further. 990 rows fail the filter in total.
 test_iterscan_cases() {
-  local a b t l
+  local a b t l x f n
   removed() { sed -n 's/^Rows Removed by Filter: //p' "$PGV_WORK/iterscan/ref/oracle.$1.out" | head -1; }
   a="$(removed relaxed_64k)"
   b="$(removed relaxed_64k_x2)"
@@ -293,6 +293,36 @@ test_iterscan_cases() {
   # rescan-after-cap coverage would silently vanish.
   l="$(grep -c '^1000000|' "$PGV_WORK/iterscan/ref/oracle.lateral_64k.out" 2>/dev/null || true)"
   if [ -n "$l" ] && [ "$l" -lt 10 ]; then pass "iterscan lateral_64k first loop hits the cap ($l of 10 rows)"; else fail "iterscan lateral_64k: first loop returned '$l' rows, want < 10 (cap not hit)"; fi
+  # big: the 64kB and 256kB caps stop early, at increasing depths; 4MB scans
+  # the whole index (9,990 rows fail its filter); every LATERAL loop hits the
+  # 128kB cap.
+  a="$(removed big_relaxed_64k)"
+  b="$(removed big_relaxed_256k)"
+  if [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ] && [ "$b" -lt 9990 ]; then pass "iterscan big caps stop early ($a, $b removed)"; else fail "iterscan big caps: removed '$a', '$b', want increasing and < 9990"; fi
+  a="$(removed big_exhaust_4MB)"
+  if [ "$a" = 9990 ]; then pass "iterscan big_exhaust_4MB scans the whole index"; else fail "iterscan big_exhaust_4MB: removed '$a', want 9990"; fi
+  for x in 25000000 100000000 175000000; do
+    l="$(grep -c "^$x|" "$PGV_WORK/iterscan/ref/oracle.big_lateral_128k.out" 2>/dev/null || true)"
+    if [ -n "$l" ] && [ "$l" -lt 10 ]; then pass "iterscan big_lateral_128k loop $x hits the cap ($l of 10 rows)"; else fail "iterscan big_lateral_128k loop $x: '$l' rows, want < 10"; fi
+  done
+  # Every case compares a memory trace.
+  for f in "$PGV_WORK"/iterscan/ref/oracle.*.out; do
+    n="$(grep -c '^memory: ' "$f" || true)"
+    if [ "$n" -ge 1 ]; then pass "iterscan $(basename "$f" .out): $n memory lines"; else fail "iterscan $(basename "$f" .out): no memory lines"; fi
+  done
+}
+
+# The memory trace is opt-in: without SET pgrust.hnsw_memory, pgrust prints
+# no memory lines, so the comparison must fail.
+test_iterscan_memory_off() {
+  local w="$PGV_WORK/iterscan-nomem"
+  if PGV_WORK="$w" PGV_ITERSCAN_MEMORY= "$here/../run-iterscan.sh" pgrust relaxed_64k >"$w.log" 2>&1; then
+    fail "iterscan: pgrust without pgrust.hnsw_memory differs"
+  elif grep -q $'^relaxed_64k\tFAIL$' "$w/iterscan/pgrust/summary.tsv" 2>/dev/null; then
+    pass "iterscan: pgrust without pgrust.hnsw_memory differs"
+  else
+    fail "iterscan: pgrust without pgrust.hnsw_memory: wrong failure (see $w.log)"
+  fi
 }
 
 # sqldiff, C vs C: one script gives identical sessions on the reference and

@@ -20,6 +20,43 @@ fn opaque<'a, 'mcx>(
     }
 }
 
+// pgrust.hnsw_memory: a placeholder customized option, deliberately NOT a
+// registered GUC (like pgrust.hnsw_build_seed). Set on, scans print the line
+// C's -DHNSW_MEMORY build prints after each search batch (ShowMemoryUsage,
+// hnswscan.c:126-129, called at :243 and :290), so the iterative-scan tier
+// can diff every batch's tmpCtx size and tuple count against the seeded C
+// build. DIVERGENCE (opt-in only): stock C has no such switch, and pgrust
+// prints only the scan's lines, not -DHNSW_MEMORY's build and vacuum ones
+// (their figures depend on C's allocators, which pgrust does not model).
+fn hnsw_show_memory() -> bool {
+    // Uninstalled seam (unit-test binaries without a guc boot): stock C.
+    if !guc_seams::get_config_option_missing_ok::is_installed() {
+        return false;
+    }
+    parse_show_memory(
+        guc_seams::get_config_option_missing_ok::call("pgrust.hnsw_memory")
+            .ok()
+            .flatten(),
+    )
+}
+
+fn parse_show_memory(value: Option<String>) -> bool {
+    value.is_some_and(|v| {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "true" | "yes" | "1")
+    })
+}
+
+// ShowMemoryUsage (hnswscan.c:126-129).
+fn show_memory_usage(so: &HnswScanOpaqueData<'_>) -> PgResult<()> {
+    elog::ereport(types_error::INFO)
+        .errmsg_internal(format!(
+            "memory: {} KB, tuples: {}",
+            so.tmp_ctx.mem_allocated() / 1024,
+            so.tuples
+        ))
+        .finish(types_error::ErrorLocation::new("hnswscan.c", 128, "ShowMemoryUsage"))
+}
+
 pub fn hnswbeginscan<'mcx>(
     mcx: Mcx<'mcx>,
     index: &Relation<'mcx>,
@@ -51,6 +88,7 @@ pub fn hnswbeginscan<'mcx>(
         w_list: ListShape::NIL,
         visited: None,
         discarded: None,
+        show_memory: hnsw_show_memory(),
     };
     relation_get_index_scan(
         mcx,
@@ -402,6 +440,9 @@ pub fn hnswgettuple(
         lmgr::UnlockPage(&index, HNSW_SCAN_LOCK, types_storage::lock::ShareLock)?;
         r?;
         opaque(scan).first = false;
+        if opaque(scan).show_memory {
+            show_memory_usage(opaque(scan))?;
+        }
     }
 
     loop {
@@ -441,6 +482,9 @@ pub fn hnswgettuple(
             let r = resume_scan_items(scan);
             lmgr::UnlockPage(&index, HNSW_SCAN_LOCK, types_storage::lock::ShareLock)?;
             r?;
+            if opaque(scan).show_memory {
+                show_memory_usage(opaque(scan))?;
+            }
             if opaque(scan).w.is_empty() {
                 break;
             }
@@ -487,3 +531,20 @@ pub fn hnswgettuple(
 // Marker so FmgrInfo stays nameable from this module (support carrier).
 #[allow(dead_code)]
 fn _support_ty(_: &FmgrInfo) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // pgrust.hnsw_memory is on only when set to a true boolean spelling.
+    #[test]
+    fn parse_show_memory_accepts_on_values() {
+        for v in ["on", "ON", " true ", "yes", "1"] {
+            assert!(parse_show_memory(Some(v.to_string())), "{v}");
+        }
+        for v in ["off", "0", "", "2"] {
+            assert!(!parse_show_memory(Some(v.to_string())), "{v}");
+        }
+        assert!(!parse_show_memory(None));
+    }
+}

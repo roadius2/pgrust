@@ -29,7 +29,7 @@ set -euo pipefail
 # Default cases. *_golomb data are tie-free: x = 2*p*k + (k*k % p) is an
 # Erdos-Turan Golomb ruler, so all pairwise distances differ. *_grid and dups
 # have many equal distances, which exercises C's pairingheap tie order.
-CASES="l2_golomb l1_golomb m4_golomb wide_golomb unlogged_golomb insert_golomb l2_grid ip_grid dups insert_grid"
+CASES="l2_golomb l1_golomb m4_golomb wide_golomb unlogged_golomb insert_golomb l2_grid ip_grid dups insert_grid big_golomb"
 # Opt-in only (known divergences, run by name): spill cosine
 
 GOLOMB1009='ARRAY[2*1009*k + (k*k) % 1009, 0, 0]::vector'
@@ -110,6 +110,17 @@ CREATE TABLE $1 (id int, v vector(3));
 INSERT INTO $1 SELECT i, $GRID FROM generate_series(1, 800) i;
 CREATE INDEX $1_idx ON $1 USING hnsw (v vector_l2_ops);
 INSERT INTO $1 SELECT i, $GRID FROM generate_series(801, 1000) i;
+SQL
+      ;;
+    big_golomb)
+      # 10,000 rows (p = 10007): C's in-memory graph (about 6 MB) spans
+      # several 1 MB Generation blocks, so this checks that SelectNeighbors'
+      # tie-break by element id still follows C's by address (M1 report).
+      # run-iterscan.sh's `big` table builds this same index.
+      cat <<SQL
+CREATE TABLE $1 (id int, v vector(3));
+INSERT INTO $1 SELECT k, ARRAY[2*10007*k + (k*k) % 10007, 0, 0]::vector FROM (SELECT (i * 37) % 10007 AS k FROM generate_series(0, 9999) i) s;
+CREATE INDEX $1_idx ON $1 USING hnsw (v vector_l2_ops);
 SQL
       ;;
     spill)

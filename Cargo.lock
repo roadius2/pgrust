@@ -13948,6 +13948,7 @@ dependencies = [
  "elog",
  "fmgr_seams",
  "generic_xlog",
+ "guc_seams",
  "guc_tables",
  "init_small",
  "lmgr",
