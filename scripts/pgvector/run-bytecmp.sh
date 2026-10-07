@@ -23,10 +23,12 @@
 # IVFFLAT_BENCH), so only that build is deterministic. HNSW data are mostly
 # integer-valued so float math is exact or rounds once (identical under FMA
 # and reassociation); the non-integer cases (sparsevec_l2_frac and the cosine
-# cases) say in their comments why C and pgrust round alike. IVFFlat data
-# (ivf_*) are well-separated groups of four integer points: every k-means and
-# assignment comparison has a clear winner, and the stored centers are
-# element-wise sums divided once, which C and pgrust round alike. Every case
+# cases) say in their comments why C and pgrust round alike. The vector and
+# halfvec IVFFlat cases (ivf_*) use well-separated groups of four integer
+# points: every k-means and assignment comparison has a clear winner, and the
+# stored centers are element-wise sums divided once, which C and pgrust round
+# alike. ivf_bit_hamming uses md5 bit(64) data, whose integer Hamming
+# distances tie often, so it pins bit's tie order. Every case
 # runs in its own session; insert_* cases build and then insert in ONE
 # session, because on-disk inserts draw levels from the stream the build
 # left behind.
@@ -241,6 +243,7 @@ SQL
       ;;
     ivf_bit_hamming)
       # Hamming distances are integers; bit centers threshold their means.
+      # Nearest-center ties are common, so this case pins the tie order.
       cat <<SQL
 CREATE TABLE $1 (id int, v bit(64));
 INSERT INTO $1 SELECT i, $MD5BITS FROM generate_series(1, 1000) i;

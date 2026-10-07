@@ -1,6 +1,6 @@
 # pgvector conformance after M4
 
-Date: 2026-10-07 · pgrust commit: 38f384cb0e (code: `f57ea4bf3f`'s, Task 5's, the last Rust change; Task 6's `38f384cb0e` changed only the harness, and the M4 docs commit changes no code) · Reference: PostgreSQL 18.6 + pgvector 0.8.7 (`pgvec`), seeded oracle `pgvec-seeded` (-DHNSW_MEMORY -DIVFFLAT_BENCH)
+Date: 2026-10-07 · pgrust commit: 38f384cb0e (code: `f57ea4bf3f`'s, Task 5's; Task 6's `38f384cb0e` changed only the harness, and the M4 docs commit changes no code. The final-review fix wave, `87a34c8584`, changed code after this run; its reruns are under "Fixed after the final review") · Reference: PostgreSQL 18.6 + pgvector 0.8.7 (`pgvec`), seeded oracle `pgvec-seeded` (-DHNSW_MEMORY -DIVFFLAT_BENCH)
 
 ## Summary
 - **C reference:** 129/129 (regress 14/14, TAP 48/48, bytecmp 29/29, iterscan 19/19, diff 19/19).
@@ -23,6 +23,8 @@ Date: 2026-10-07 · pgrust commit: 38f384cb0e (code: `f57ea4bf3f`'s, Task 5's, t
   - `build-reference.sh --verify`: ok (13 checks; M3's 11 plus the two `IVFFLAT_BENCH` markers).
   - Both reference trees print nothing from `git status --porcelain --ignored`.
 - **How the run was produced.** After `build-reference.sh --verify`, `build-pgrust.sh` found `target/fast-profile/postgres` current: cargo finished in 1.7 s without rebuilding, so the binary matches HEAD's Rust, unchanged since `f57ea4bf3f`. Then each command ran once: `run-all.sh ref` (the two lints ran alongside it), then `run-all.sh pgrust`, then `harness_test.sh`, `UT_M4`, `UT_KEEP`, the parity tests and the reference-tree check. Last, `sqldiff.sh pgrust` reran Task 5's extension and IVFFlat scripts (below). The table below is `run-all.sh pgrust`'s report.
+- **Risk for existing clusters: `ALTER EXTENSION vector UPDATE` fails on clusters created by M1–M3 builds.** See "Upgrading from M1–M3 clusters" for the remedy.
+- **Fixed after the final review:** the k-means buffers now allocate fallibly (before, a failed allocation aborted the process and so killed every session), plus four small cleanups. The reruns are green; see the section of that name.
 - **No port fixes in Tasks 5–7.** IVFFlat's first end-to-end run (Task 5) passed the three regression files. The eight `ivf_*` cases were byte-identical on pgrust's first run (Task 6), and `ivfflat-errors.sql` matched with 18 errors and 4 NOTICEs. Task 7's IVFFlat TAP runs failed only the seven parallel-worker assertions, twice in a row, and `KEEP_TAP` stayed 27/27.
 
 ## pgrust results
@@ -187,6 +189,14 @@ Every remaining failure is a parallel build (M6). I checked each against this ru
 - **This run.** `run-all.sh ref` and `harness_test.sh`'s own C-against-C bytecmp run were both clean, so no rerun was needed.
 - **Left unchanged.** Moving the case to opt-in, or redesigning it tie-free, changes an M1 case design. That is the user's call. Until then the `ref` gate can come back red on this case alone, and the remedy is a rerun.
 
+## Upgrading from M1–M3 clusters
+- **What fails.** A cluster whose `vector` extension was created by an M1–M3 build is at pgrust's trimmed `0.8.5`, which has no IVFFlat objects: no `ivfflathandler`, `ivfflat_halfvec_support` or `ivfflat_bit_support`, no `ivfflat` access method and no `ivfflat` opclasses. `ALTER EXTENSION vector UPDATE` runs `vector--0.8.5--0.8.6.sql` (empty) and then `vector--0.8.6--0.8.7.sql`. All 147 statements in that script are `COMMENT ON`. Three of them name IVFFlat functions: `COMMENT ON FUNCTION ivfflathandler(internal)` at line 104, and the two support functions at lines 108 and 110. The first one fails because the function does not exist, and the whole update rolls back. The extension stays at `0.8.5`, and IVFFlat is unavailable in that database.
+- **Remedy.**
+  - Dump and restore. `pg_dump` writes `CREATE EXTENSION` without a version, so the restore installs `0.8.7`. No tier exercises this.
+  - Or `DROP EXTENSION vector`, then `CREATE EXTENSION vector`. Do this only where no column, index or other object depends on the extension: `CASCADE` would drop the dependent columns.
+- **No bridging script ships.** `extension/` is upstream's, byte for byte (spec §4.6, Decision 1; `shipped_scripts_are_upstream_verbatim`), so pgrust cannot ship a script that creates the missing objects before those comments. Upstream's own `0.8.5` has IVFFlat, so upstream's update path needs no bridge.
+- Checked by reading the scripts (the shipped `vector--0.8.6--0.8.7.sql` and `main`'s trimmed `vector--0.8.5.sql`), not by running an update: the trimmed script can no longer be installed.
+
 ## What M4 established
 **IVFFlat, ported serially, for `vector`, `halfvec` and `bit`.**
 - **Crates (spec §4.4):**
@@ -209,7 +219,8 @@ Every remaining failure is a parallel build (M6). I checked each against this ru
 
 **Seeded IVFFlat builds byte-identical to C in all eight cases.**
 - The seeded oracle is rebuilt with `-DIVFFLAT_BENCH`, the only C configuration that seeds IVFFlat builds (`SeedRandom(42)`, `ivfbuild.c:1075-1077`). On pgrust, the placeholder `pgrust.ivfflat_build_seed = 42` makes `ivfflatbuild` reseed at the same point (Decision 2).
-- The data are well-separated groups of four integer points (`256 × grid + {0,1}²`), so every k-means and assignment comparison has a clear winner. The stored centers are element-wise sums divided once, which C and pgrust round alike.
+- The `vector` and `halfvec` cases use well-separated groups of four integer points (`256 × grid + {0,1}²`), so every k-means and assignment comparison has a clear winner. Their stored centers are element-wise sums divided once, which C and pgrust round alike.
+- `ivf_bit_hamming` uses `bit(64)` from md5 under integer Hamming distances. There, nearest-center ties are common: a rough simulation of its data put 9–13% of points on a tie, over five seeds. So the case also pins `bit`'s tie order (a strict `<`, toward the first list) in k-means and in list assignment, and it passes.
 
 | Case | Data | Blocks | Lists | What it exercises |
 |---|---|---|---|---|
@@ -252,12 +263,16 @@ The block and list counts are this run's `bytecmp/pgrust/cases.tsv`: the oracle'
 
 ## Known divergences left open
 **New in M4:**
-- **Core LOCATIONs `reloptions.c:0` and `guc.c:0` (a new core follow-up).** C reports `parse_one_reloption, reloptions.c:1637` and `parse_and_validate_value, guc.c:3186`/`:3282` for the `lists` reloption and the `ivfflat.*`/`hnsw.*` settings. pgrust core reports line 0. The regression files run at default verbosity, so they pass; the durable `ivfflat_errors` row leaves these statements out. The fix is in core and needs the user's go-ahead.
+- **Core LOCATIONs `reloptions.c:0` and `guc.c:0` (a new core follow-up).**
+  - C reports `parse_one_reloption, reloptions.c:1637` and `parse_and_validate_value, guc.c:3186`/`:3282` for the `lists` reloption and the `ivfflat.*`/`hnsw.*` settings. pgrust core reports line 0.
+  - `vector`'s `pg_init` makes two more such sites reachable through the reserved prefixes: `MarkGUCPrefixReserved`'s WARNING `invalid configuration parameter name "hnsw.typo", removing it` (C: `guc.c:5312`), and `assignable_custom_variable_name`'s reserved-prefix ERROR (C: `guc.c:1156`).
+  - pgrust reports `guc.c:0` for both. This was measured after the final review on fresh `ref` and `pgrust` servers with `\set VERBOSITY verbose`, running `SET hnsw.typo = 1; LOAD 'vector'; SET hnsw.typo2 = 1;`.
+  - The regression files run at default verbosity, so they pass; the durable `ivfflat_errors` row leaves these statements out. The fix is in core and needs the user's go-ahead.
 - **`_PG_init` load timing (a core follow-up).**
   - C loads `vector`, running `_PG_init` and reserving the `hnsw` and `ivfflat` prefixes, on a session's first open of an hnsw or ivfflat index: `InitIndexAmRoutine` → `GetIndexAmRoutine` → `OidFunctionCall0(amhandler)` (`relcache.c:1432`, `amapi.c:38`).
   - pgrust resolves the handler by name (`resolve_extension_handler`, `amapi/src/lib.rs`) and never loads the library there.
   - So the reservation can come later than in C. For example, `SET hnsw.typo = 1`, then a query on an hnsw-indexed table, then `SET hnsw.typo2 = 1` gives C's WARNING and reserved-prefix ERROR but nothing on pgrust, and `pg_get_loaded_modules()` can omit `vector`.
-  - This predates M4 (since M1); M4's `pg_init` makes it visible. The fix is in core `amapi` and needs the user's go-ahead.
+  - This predates M4 (since M1); M4's `pg_init` makes it visible. `pg_init` now carries a `DIVERGENCE` line saying so (final review). The fix is in core `amapi` and needs the user's go-ahead.
 - **`pg_index_has_property(<hnsw or ivfflat index>, 'bitmap_scan')` is `t` where C says `f` (a core follow-up).** `adt_amutils` answers `Prop::BitmapScan => Some(true)` for every access method, while C returns `amgetbitmap != NULL` (`amutils.c:368-369`), and neither pgvector AM has one. It predates M4 and is shared with HNSW. `AmFlags` has no `amgetbitmap` bit, and the fix is outside spec §4.5, so it needs the user's go-ahead.
 - **The static `ivfflat.*` and `hnsw.*` GUCs exist before the library loads.** C defines them at `_PG_init` (`DefineCustom*Variable`), so before `vector` loads, `SHOW ivfflat.probes` is an unrecognized parameter and `SET` makes an unvalidated placeholder. pgrust registers them in core `guc_tables` at boot. HNSW's have done so since M1.
 - **An unknown or non-C support proc 5 raises where C calls it.** pgrust knows only `ivfflat_halfvec_support` and `ivfflat_bit_support`, and raises 0A000 `ivfflat type support function "<symbol>" of index "<index>" is not supported` (`DIVERGENCE` in `utils.rs`). C calls any proc 5 and trusts the pointer it returns. HNSW's proc 3 behaves the same way, and since M4 a non-C proc 3 also raises.
@@ -265,7 +280,7 @@ The block and list counts are this run's `bytecmp/pgrust/cases.tsv`: the oracle'
 - **An insert into a list with no insert page raises where C asserts** (`ivfinsert.c:110`). Without the check, `InvalidBlockNumber` would reach `ReadBuffer` as `P_NEW` and extend the index from a corrupt list item. Only a corrupt index reaches it.
 - **No parallel build (M6).** `plan_create_index_workers` is unported, so both access methods build serially. C also builds serially when no workers launch.
 - **HNSW's build phase names are not reported** (pre-existing). `pg_indexam_progress_phasename` returns NULL for HNSW, where C names `initializing` and `loading tuples` (`hnswbuildphasename`, `hnsw.c:117-129`). M4 adds IVFFlat's four names only (`phasenames_match_c`).
-- **ANALYZE seeds its reservoir from a u64 where C uses a u32.** C passes `(uint64) pg_prng_uint32(&pg_global_prng_state)` (`sampling.c:139`); pgrust's ANALYZE passes `next_u64()` (`analyze/src/lib.rs:1816`). That is unobservable, because nothing seeds ANALYZE. IVFFlat's build passes `next_u32() as u64`, as C does, and its sampling is byte-checked by `ivf_big`.
+- **ANALYZE seeds its reservoir from a u64 where C uses a u32.** C passes `pg_prng_uint32(&pg_global_prng_state)` to `sampler_random_init_state` (`sampling.c:139`), which widens it with `(uint64) seed` (`sampling.c:236`); pgrust's ANALYZE passes `next_u64()` (`analyze/src/lib.rs:1816`). That is unobservable, because nothing seeds ANALYZE. IVFFlat's build passes `next_u32() as u64`, as C does, and its sampling is byte-checked by `ivf_big`.
 - **Type info is resolved on every call, not cached in `rd_amcache`** (Decision 3).
   - pgrust's `rd_amcache` is one typed field per access method in core `RelationData`, so caching would add core fields.
   - The cost is two `pg_proc` syscache probes and a memory context per insert into a `halfvec` or `bit` index (`support_proc_symbol`; `vector` has no proc 5), against an insert that already computes a distance to every list's center. C also calls the support proc on every insert, through `FunctionCall0Coll` on the cached `FmgrInfo` (`ivfutils.c:427`).
@@ -294,19 +309,53 @@ The block and list counts are this run's `bytecmp/pgrust/cases.tsv`: the oracle'
 - **The findings-file block.** `diffrunner.rs`'s raw-fs budget is 8 because the block is duplicated across five suites (copybin, copytext, copyopts, dbddl, pgvector); a shared helper would shrink it.
 - **M1's build divergences.** The build-memory spill point (opt-in `spill`, M6) and `vector` cosine pages (opt-in `cosine`) are unchanged.
 
-**Closed in M4:** `pg_get_loaded_modules()` reports `vector | 0.8.7`, as C does, through `dfmgr`'s library-version registry (Decision 7).
+**Closed in M4:** once the library is loaded, `pg_get_loaded_modules()` reports `vector | 0.8.7`, as C does, through `dfmgr`'s library-version registry (Decision 7). When the library loads still differs from C (`_PG_init` load timing, above).
+
+## Fixed after the final review
+The final whole-branch review's fix wave (`87a34c8584`, code only; this docs commit follows it):
+1. **The k-means buffers allocate fallibly** (final review, Important). `ElkanKmeans`' buffers are sized by user input and capped only by `maintenance_work_mem`, which any user can `SET`. Their largest are `lowerBound` (samples × lists × 4 B) and `halfcdist` (lists² × 4 B). They were plain `vec!`s, so a failed allocation aborted the process, killing every session. C's `palloc` raises a per-statement `out of memory` instead.
+   - Now every buffer `IvfflatKmeans` allocates lives in one `Ivfflat kmeans temporary context` (C's `kmeansCtx`, `ivfkmeans.c:556-569`), allocated through `mcx`: `palloc` semantics, or `palloc_extended(MCXT_ALLOC_HUGE)` for `lowerBound` and `halfcdist`. The buffers are the eight Elkan buffers, `InitCenters`' `weight`, `RandomCenters`' `x`, `CheckElements`' `scratch` and the new centers.
+   - Values, casts and iteration order are unchanged.
+   - New unit test `ivf_kmeans_buffers_raise_out_of_memory`. It asks for 2⁶² bytes through the huge path and gets `out of memory` (53200, with C's DETAIL naming the context). Past `MaxAllocSize` without HUGE it gets `invalid memory alloc request size 1073741824`.
+     - RED: with the old `vec!` semantics, the test binary died with `memory allocation of 4611686018427387904 bytes failed` (SIGABRT).
+     - GREEN after the change.
+2. `XlogPage::link_new_page` sets the old page's `nextblkno` before registering the new buffer. It no longer writes through a pointer that `register_buffer`'s mutable reborrow of the whole GenericXLog state had invalidated (the same class as Task 1's `item_mut`). The order is unobservable: both images belong to one record, and `GenericXLogFinish` computes the deltas.
+3. `pgvector`'s `pg_init` carries a `DIVERGENCE` line for `_PG_init`'s load timing (Known divergences).
+4. `index_getprocinfo`'s comment no longer calls the elog unreachable from SQL. `ivfflathandler` sets no `amadjustmembers` and `ivfflatvalidate` returns true (`ivfflat.c:173-176`, `297`), so a hand-written opclass reaches it during a build.
+5. `KmeansProcs` carries a `DIVERGENCE` note: proc 3 is fetched before `IvfflatCheckMemoryUsage`, where C fetches it after (`ivfkmeans.c:290`, then `:297`).
+6. The docs: the upgrade note above; the `ivf_bit_hamming` tie claims (here, spec §8.2 and `run-bytecmp.sh`); the init-file, `sampling.c` and `pg_get_loaded_modules()` wording; the new `guc.c` LOCATION sites; the spill coverage limit; this bookkeeping. Task 8's four deferred wording nits are fixed too:
+   - CLAUDE.md's vector-search lead-in no longer ends in a colon that introduces the crate list.
+   - `types_hnsw` is listed before `types_ivfflat`.
+   - Spec §5.4's support-proc bullet dates the `LANGUAGE c` check to M4 and introduces its symbol list itself, which also closes M3's split-parenthetical minor.
+   - Spec §8.3 no longer reads as removing three scripts.
+
+**Reruns after the fix**, on `target/fast-profile/postgres` rebuilt from `87a34c8584`:
+- regress: 14/14.
+- bytecmp: 29/29, all eight `ivf_*` byte-identical.
+- diff: 19/19.
+- TAP `003`, `005`, `008` and `036`:
+  - `005`, `008` and `036` pass;
+  - `003` fails only its three parallel-worker assertions (line 127).
+- `UT ivf_ block_sampler reservoir_ lookup_cover fmgr_stubs shipped_scripts`: 25 (`pgvector_ivfflat_build` now 6).
+- Plain `UT ivf_ block_sampler reservoir_`: 21.
+- `UT_KEEP`: 63.
+- `lint-determinism`: PASS (0 violations, 41 warnings). `lint-seam-installs`: PASS (0 violations, 22 allowlisted). Both are as before.
+- Both reference trees are clean.
 
 ## Deferred minors
-Review minors deferred to a later cleanup, one line each. This section carries every M2 and M3 item that M4 did not absorb, so the M3 report's list is superseded.
+Review minors deferred to a later cleanup, one line each. This section carries every M2 and M3 item that M4 did not absorb: the M3 report's list and the M3 ledger's items parked after it. So the M3 report's list is superseded.
 
 **Absorbed by M4:**
 - `fmgr_stubs` is in `UT_KEEP` (M3's final-wave test is part of the gate again).
 - `hnsw_get_type_info` gains GIN's `prolang` check through `pgvector::support_proc_symbol` (Task 1), and the `utils.rs:116` comment no longer compares it with amapi's handler resolution.
 - `pgvector/src/lib.rs` cites `hnsw.c:266-402` (Task 5).
-- CLAUDE.md's `run-bytecmp.sh` line shows `[case ...]` (this task).
-- Spec §5.4's split parenthetical and its "by function name" wording (this task).
+- CLAUDE.md's `run-bytecmp.sh` line shows `[case ...]` (Task 8) and `--list` (final review; `run-iterscan.sh`'s line too). This closes the M3 ledger's usage item.
+- Spec §5.4's split parenthetical and its "by function name" wording (Task 8; the bullet's trailing colon in the final review).
 - `strip_hnsw_memory`'s comment: the function is now `sqldiff.sh`'s `strip_seeded_info`, and its comment names `hnswvacuum.c:171` (Task 6).
 - `upstream-sql.sh`'s `--only-am` typo handling, moot now that the script is retired (this task).
+- The M3 report's Task 3 ruled-count item (its `:320`), already resolved in M3: that report gives the M2 → M3 count, 53 → 46.
+- The M3 final review's "cache type info per relation" item became Decision 3 (see Known divergences).
+- M4 Task 5's minor: CLAUDE.md's vector-search section and the `upstream-sql.sh` header described the pre-M4 state. Task 8 updated CLAUDE.md and deleted the script.
 - The M3 report's three wording items, worded correctly where this report carries the same points (the M3 report itself is not rewritten): "C returns its static pointer" holds for the support functions, while PG18's `hnswhandler` builds its routine with `makeNode`; "C crashes on the same input" (an unknown support proc 3) was never probed, since C trusts the returned pointer, which is undefined behavior; and the stale "Note for the final review" lead-in.
 
 **From M2: `pgvector` crate code and comments**
@@ -363,15 +412,16 @@ Review minors deferred to a later cleanup, one line each. This section carries e
 - `run-bytecmp.sh:23-26`: the header says the non-integer cases explain in their comments why C and pgrust round alike, but the opt-in `vector` `cosine` case is a known divergence, and `insert_sparsevec_cosine` leans on `sparsevec_cosine_grid`'s comment.
 - `lint-seam-installs` warns of 21 stale allowlist rows, `pgaio_io_start_readv` among them (pre-existing, not M3 or M4).
 - The M3 report's HNSW error-site claim should note that `HnswCheckDim`'s build and insert sites are unit-test-only (unreachable from SQL).
+- `hnsw-errors.sql` has no `bit` statement for `column does not have dimensions` (`InitBuildState, hnswbuild.c:709`). The `vector`, `halfvec` and `sparsevec` statements already pin the site. The M3 final review ruled that this waits: a 23rd statement would ripple through the report's counts.
 
 **From M4, Task 1 (`types_ivfflat`, ivfutils.c, `support_proc_symbol`)**
-- `utils.rs` `index_getprocinfo`'s comment "Not reachable from SQL: CREATE OPERATOR CLASS checks the procs" is false: `ivfflathandler` has no `amadjustmembers` and `ivfflatvalidate` returns true. Behavior still matches C.
 - `utils.rs` `ivfflat_norm_value` drops a `PgResult` (`let _ = mcx::vec_append_bytes(...)`; use `?`), and copies the normalized image twice.
 - `ivfflat_norm_vectors` creates a bump `MemoryContext` per vector, where C resets one `tmpCtx`: up to about 1.6M samples at `lists = 32768`.
 - `pub fn datum_image` and `buffer_page` return unbounded lifetimes from raw pointers behind safe signatures (the precedent is `pub(crate)`).
 - `unwrap_or_default()` gives `type support function ""` for a non-C or missing proc; naming the OID or `proname` would help (IVFFlat and HNSW `utils.rs`).
 - `support_proc_symbol` does two syscache lookups and creates a `MemoryContext` per call, so per inserted row; HNSW previously did one lookup. A performance item, tied to Decision 3.
-- No unit test covers the relcache init-file codec's tag 12 or `sort.rs`'s `HeapSort`. The regression, TAP and bytecmp tiers exercise both end to end.
+- No unit test covers `sort.rs`'s `HeapSort`. The regression, TAP and bytecmp tiers exercise it end to end.
+- The relcache init-file codec's tag 12 (`Ivfflat` options) is effectively unreachable and untested. The init file holds only catalog relations (`RelationIdIsInInitFile`, checked when writing at `initfile.rs:1338`), so no IVFFlat index's options are ever written there or read back. The same holds for HNSW's tag 10.
 - `ivf_support_proc_symbol_requires_language_c` guards its seam installs with `is_installed()` and then `set`, not a `Once` (no other installer is in that test binary today).
 - Task 1's report was imprecise on `UT_KEEP`'s per-crate counts and on the pre-existing lint warning counts (process only).
 
@@ -380,7 +430,6 @@ Review minors deferred to a later cleanup, one line each. This section carries e
 - `ivf_kmeans_fills_every_center_from_duplicates` only asserts that the 3 distinct values appear, so it would pass if empty clusters kept duplicates or were zeroed. It should pin the two random centers in [0,1)² (or exactly, under its seed 7).
 - `ivf_check_centers_rejects_short_arrays_and_nan` checks message text only, not SQLSTATE or location.
 - The raw-pointer and `inner_err` indirection in `sample_rows`/`assign_tuples` is unnecessary (a direct `&mut bs` borrow works); it is copied from `pgvector_hnsw_build`.
-- `ivfflat_kmeans` fetches `IVFFLAT_KMEANS_DISTANCE_PROC` before `IvfflatCheckMemoryUsage`, where C checks memory first (`ivfkmeans.c:290`, then `:297`). The error differs only for a custom opclass that lacks proc 3 and also overflows `maintenance_work_mem`, and it is not marked `DIVERGENCE`.
 - `add_sample` and `add_tuple_to_sort` create a bump `MemoryContext` per row, where C resets one `tmpCtx` (speed only; the same as the HNSW build).
 - The kmeans tests install their `CHECK_FOR_INTERRUPTS` stub as a side effect of `l2_procs()`; a direct call would be clearer.
 
@@ -398,10 +447,9 @@ Review minors deferred to a later cleanup, one line each. This section carries e
 - `dfmgr`'s `LIBRARY_VERSIONS` is a raw `std::sync::Mutex`, where CLAUDE.md names `pgsync` the only lock library. It matches `BUILTIN_LIBRARIES` beside it (plan-mandated, Decision 7).
 - `main_main/build.rs` couples two separately written arrays by index (`sources[k]`), so reordering one list would prune every staged file. A single (subdirectory, directory, set) list removes the risk.
 - `shipped_scripts_are_upstream_verbatim` maps a shipped `vector.sql` to `sql/vector.sql` through its `other` arm, so swapping one upgrade script for a `vector.sql` keeps 43 files and passes. Comparing names against upstream's listing would close it.
-- `_PG_init`'s load timing (see Known divergences); at minimum, `pg_init` could carry a `DIVERGENCE` line.
 
 **From M4, Task 6 (the seeded oracle, IVFFlat bytecmp, `ivfflat-errors.sql`)**
-- `run-bytecmp.sh` has stale comments: lines 6-7 say "HNSW pages are written through GenericXLog" (IVFFlat's are too), line 17 says the empty seed "omits the SET" (it now omits two), and line 60's "Seeds pgrust (Task 5)" heads two lines. `harness_test.sh`'s `test_bytecmp_detects_difference` comment still names only `#ifdef HNSW_MEMORY`.
+- `run-bytecmp.sh` has stale comments: lines 6-7 say "HNSW pages are written through GenericXLog" (IVFFlat's are too), line 17 says the empty seed "omits the SET" (it now omits two), and line 62's "Seeds pgrust (Task 5)" heads two lines. `harness_test.sh`'s `test_bytecmp_detects_difference` comment still names only `#ifdef HNSW_MEMORY`.
 - `test_bytecmp_ivf_knob_off` drops both SETs, so it cannot catch IVFFlat reseeding from `pgrust.hnsw_build_seed` (no live bug: the build reads the right name).
 - There is no negative control for the refusal on a missing IVFFlat oracle marker (`INFO:  k-means: `).
 - `ivfflat-errors.sql`'s NULL-query checks all use `lists = 1`, so "a NULL query scores every list 0" is not discriminated. A 2-list index over two equal groups with `probes = 1` would be (N rows on C, 2N if every list were scanned).
@@ -412,5 +460,13 @@ Review minors deferred to a later cleanup, one line each. This section carries e
 - **x86.** The harness ran only on macOS arm64. M3's per-target L2 test has amd64 values from the amd64 Docker image under emulation; the C reference's x86 F16C and AVX-512 dispatch paths are still unexercised (M5).
 - **IVFFlat cosine and inner product** are covered by the regression files, TAP and `m4-ivf.sql`'s sqldiff, not by byte identity (Known divergences, "For M5").
 - **Recall after a parallel build.** TAP `003`, `032` and `035` (and `012`, `020`, `024` and `028`) check recall after their "parallel" build, but pgrust built serially, so those assertions ran against serial builds. Recall margins are not visible either: the TAP output reports pass or fail only.
-- **Tie order.** The byte-identical IVFFlat cases are designed so every k-means comparison has a clear winner, so they do not pin IVFFlat's distance-tie order. Ties are covered by TAP `008` and `036` (duplicate values, where build, insert and scan must all break ties toward the first list) and the unit test `ivf_kmeans_fills_every_center_from_duplicates`. HNSW's tie order rests on M1's pairing heap, as before.
+- **Tie order.**
+  - The byte-identical `vector` and `halfvec` IVFFlat cases are designed so every k-means comparison has a clear winner, so they do not pin tie order.
+  - `ivf_bit_hamming` does. Its md5 data under integer Hamming distances tie often, so it pins `bit`'s tie order in k-means and list assignment.
+  - Ties are also covered by TAP `008` and `036` and by the unit test `ivf_kmeans_fills_every_center_from_duplicates`. TAP `008` and `036` use duplicate values, where build, insert and scan must all break ties toward the first list.
+  - HNSW's tie order rests on M1's pairing heap, as before.
+- **Sort spills.** No tier makes the IVFFlat build sort spill past `maintenance_work_mem`, or the scan sort spill past `work_mem`.
+  - The build-sort spill is the normal case for real-size builds, because every sorted tuple carries its vector.
+  - So within-list tuple order after a spilled build sort, and scan tie order after a spilled scan sort, are unverified.
+  - Final-review Ruling 10: recorded here, with no new case in M4. A spill-order difference would be in core tuplesort.
 - **M2's I/O limits stand.** No tier feeds C-produced binary into pgrust's recv; the recv functions and binary-only error sites are checked by unit tests only.

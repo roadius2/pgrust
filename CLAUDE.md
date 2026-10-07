@@ -104,13 +104,13 @@ Keep these conventions when porting or changing code.
 
 ## Vector search (fork work)
 
-There is an existing pgvector port (upstream 0.8.5 commit `159b79a`, brought to 0.8.7 behavior for `vector` and HNSW in M1, with `halfvec`, `sparsevec` and the `bit` functions added in M2 and their HNSW opclasses in M3, and IVFFlat (serial builds) in M4). The extension directory is upstream 0.8.7's, verbatim:
+There is an existing pgvector port (upstream 0.8.5 commit `159b79a`, brought to 0.8.7 behavior for `vector` and HNSW in M1, with `halfvec`, `sparsevec` and the `bit` functions added in M2 and their HNSW opclasses in M3, and IVFFlat (serial builds) in M4). Its extension directory is upstream 0.8.7's, verbatim. The crates:
 - `crates/contrib/pgvector`: the `vector`, `halfvec` and `sparsevec` types and the `bit` distance functions: I/O, functions, aggregates, casts and btree opclasses, one module per C file.
 - `crates/contrib/pgvector_f16_parity`: test-only. Its `build.rs` compiles pgvector's C f16 routines and checks every f16, every f32 and every pair of halves against the port; it is skipped on wasm32.
 - `crates/contrib/pgvector_hnsw` and `pgvector_hnsw_build`: the HNSW AM for all four types, using pgvector's page layout and GenericXLog. An opclass's support proc 3 resolves by its C symbol to hnswutils.c's static type info.
 - `crates/contrib/pgvector_ivfflat` and `pgvector_ivfflat_build`: the IVFFlat AM for `vector`, `halfvec` and `bit`, using pgvector's page layout and GenericXLog. Builds are serial: k-means over samples from ANALYZE's block sampler, which now lives in its own `sampling` crate. An opclass's support proc 5 resolves by its C symbol, as HNSW's proc 3 does.
-- `crates/_support/types/types_ivfflat`.
 - `crates/_support/types/types_hnsw`.
+- `crates/_support/types/types_ivfflat`.
 
 Parallel index builds (M6) are **not ported**: both AMs build serially.
 
@@ -127,8 +127,8 @@ scripts/pgvector/run-all.sh {pgrust|ref}                  # every tier + report;
 scripts/pgvector/tests/harness_test.sh                    # self-tests of the harness itself
 scripts/pgvector/server.sh {start|fresh|stop|psql} {pgrust|ref}  # manual servers on the harness ports
 scripts/pgvector/docker-ref.sh {up|down|psql}                  # pgvector/pgvector:0.8.7-pg18 reference (port 55493)
-scripts/pgvector/run-bytecmp.sh {pgrust|ref} [case ...]         # HNSW and IVFFlat pages vs the seeded C build (pgvec-seeded, -DHNSW_MEMORY -DIVFFLAT_BENCH)
-scripts/pgvector/run-iterscan.sh {pgrust|ref} [case ...]        # iterative-scan stop points vs the seeded C build
+scripts/pgvector/run-bytecmp.sh {pgrust|ref} [case ...]         # HNSW and IVFFlat pages vs the seeded C build (pgvec-seeded, -DHNSW_MEMORY -DIVFFLAT_BENCH); --list prints the cases
+scripts/pgvector/run-iterscan.sh {pgrust|ref} [case ...]        # iterative-scan stop points vs the seeded C build; --list prints the cases
 scripts/pgvector/run-diff.sh {pgrust|ref}                       # exact differential: diffrunner --pgvector + error LOCATIONs
 scripts/pgvector/sqldiff.sh {pgrust|ref} [--verbose] <file|->   # one SQL script on fresh ref and subject servers, diffed
 ```
