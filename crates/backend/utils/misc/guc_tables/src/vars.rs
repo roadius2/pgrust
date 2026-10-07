@@ -491,6 +491,11 @@ pub static hnsw_ef_search: GucIntVar = GucSlot::new("hnsw_ef_search");
 pub static hnsw_iterative_scan: GucEnumVar = GucSlot::new("hnsw_iterative_scan");
 pub static hnsw_max_scan_tuples: GucIntVar = GucSlot::new("hnsw_max_scan_tuples");
 pub static hnsw_scan_mem_multiplier: GucRealVar = GucSlot::new("hnsw_scan_mem_multiplier");
+// pgvector ivfflat.* (contrib GUCs, defined statically; C defines them at
+// module load, ivfflat.c:45-56).
+pub static ivfflat_probes: GucIntVar = GucSlot::new("ivfflat_probes");
+pub static ivfflat_iterative_scan: GucEnumVar = GucSlot::new("ivfflat_iterative_scan");
+pub static ivfflat_max_probes: GucIntVar = GucSlot::new("ivfflat_max_probes");
 pub static pg_krb_caseins_users: GucBoolVar = GucSlot::new("pg_krb_caseins_users");
 pub static pg_krb_server_keyfile: GucStringVar = GucSlot::new("pg_krb_server_keyfile");
 pub static pgstat_fetch_consistency: GucEnumVar = GucSlot::new("pgstat_fetch_consistency");

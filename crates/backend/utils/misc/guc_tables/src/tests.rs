@@ -21,6 +21,7 @@ fn table_counts_match_compiled_backend_shape() {
     // Int +1 pgrust.condition_cache_size.
     // pgvector hnsw.*: Int +2 / Real +1 / Enum +1 (contrib GUCs defined
     // statically here).
+    // pgvector ivfflat.*: Int +2 / Enum +1 (likewise).
     // M5-0 (pgrust-only, docs/design/m5-planner.md §2.2): Enum +1
     // pgrust.parallel_engine, Int +1 pgrust.runtime_dop.
     // auto_explain.* (statically defined custom GUCs, like pg_stat_statements):
@@ -125,11 +126,11 @@ fn table_counts_match_compiled_backend_shape() {
     //   pgrust.admission_bypass_applications (-> 90) = 500.
     let test_validator = usize::from(cfg!(feature = "oauth-test-validator"));
     assert_eq!(ConfigureNamesBool.len(), 147 + test_validator);
-    assert_eq!(ConfigureNamesInt.len(), 182);
+    assert_eq!(ConfigureNamesInt.len(), 184);
     assert_eq!(ConfigureNamesReal.len(), 31);
     assert_eq!(ConfigureNamesString.len(), 90 + test_validator);
-    assert_eq!(ConfigureNamesEnum.len(), 50);
-    assert_eq!(all_settings().count(), 500 + 2 * test_validator);
+    assert_eq!(ConfigureNamesEnum.len(), 51);
+    assert_eq!(all_settings().count(), 503 + 2 * test_validator);
     assert_eq!(GucContext_Names.len(), PGC_USERSET as usize + 1);
     assert_eq!(GucSource_Names.len(), PGC_S_SESSION as usize + 1);
     assert_eq!(config_group_names.len(), DEVELOPER_OPTIONS as usize + 1);

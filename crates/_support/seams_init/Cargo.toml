@@ -320,6 +320,7 @@ passwordcheck = { path = "../../contrib/passwordcheck" }
 test_oat_hooks = { path = "../../contrib/test_oat_hooks" }
 pgvector = { path = "../../contrib/pgvector" }
 pgvector_hnsw = { path = "../../contrib/pgvector_hnsw" }
+pgvector_ivfflat = { path = "../../contrib/pgvector_ivfflat" }
 bloom = { path = "../../contrib/bloom" }
 hstore = { path = "../../contrib/hstore" }
 adt_expandedrecord = { path = "../../backend/utils/adt/expandedrecord" }

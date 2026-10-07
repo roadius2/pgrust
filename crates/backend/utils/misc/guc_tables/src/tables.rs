@@ -250,6 +250,12 @@ pub static hnsw_iterative_scan_options: &[config_enum_entry] = &[
     config_enum_entry { name: "strict_order", val: 2, hidden: false },
 ];
 
+// ivfflat_iterative_scan_options (ivfflat.c:29-33).
+pub static ivfflat_iterative_scan_options: &[config_enum_entry] = &[
+    config_enum_entry { name: "off", val: 0, hidden: false },
+    config_enum_entry { name: "relaxed_order", val: 1, hidden: false },
+];
+
 pub static intervalstyle_options: &[config_enum_entry] = &[
     config_enum_entry { name: "postgres", val: INTSTYLE_POSTGRES, hidden: false },
     config_enum_entry { name: "postgres_verbose", val: INTSTYLE_POSTGRES_VERBOSE, hidden: false },
@@ -993,6 +999,8 @@ pub static ConfigureNamesInt: &[GucIntSetting] = &[
     GucIntSetting { name: "scram_iterations", context: PGC_USERSET, group: CONN_AUTH_AUTH, short_desc: Some("Sets the iteration count for SCRAM secret generation."), long_desc: None, flags: GUC_REPORT, variable: &vars::scram_sha_256_iterations, boot_val: GucDefaultValue::Int(SCRAM_SHA_256_DEFAULT_ITERATIONS), min: 1, max: i32::MAX, check_hook: None, assign_hook: None, show_hook: None },
     GucIntSetting { name: "hnsw.ef_search", context: PGC_USERSET, group: CUSTOM_OPTIONS, short_desc: Some("Sets the size of the dynamic candidate list for search"), long_desc: Some("Valid range is 1..1000."), flags: 0, variable: &vars::hnsw_ef_search, boot_val: GucDefaultValue::Int(40), min: 1, max: 1000, check_hook: None, assign_hook: None, show_hook: None },
     GucIntSetting { name: "hnsw.max_scan_tuples", context: PGC_USERSET, group: CUSTOM_OPTIONS, short_desc: Some("Sets the max number of tuples to visit for iterative scans"), long_desc: None, flags: 0, variable: &vars::hnsw_max_scan_tuples, boot_val: GucDefaultValue::Int(20000), min: 1, max: i32::MAX, check_hook: None, assign_hook: None, show_hook: None },
+    GucIntSetting { name: "ivfflat.probes", context: PGC_USERSET, group: CUSTOM_OPTIONS, short_desc: Some("Sets the number of probes"), long_desc: Some("Valid range is 1..lists."), flags: 0, variable: &vars::ivfflat_probes, boot_val: GucDefaultValue::Int(1), min: 1, max: 32768, check_hook: None, assign_hook: None, show_hook: None },
+    GucIntSetting { name: "ivfflat.max_probes", context: PGC_USERSET, group: CUSTOM_OPTIONS, short_desc: Some("Sets the max number of probes for iterative scans"), long_desc: None, flags: 0, variable: &vars::ivfflat_max_probes, boot_val: GucDefaultValue::Int(32768), min: 1, max: 32768, check_hook: None, assign_hook: None, show_hook: None },
     // pgrust.condition_cache_size: the condition cache's LRU byte budget
     // (default 100MB — ClickHouse's query_condition_cache_size default).
     GucIntSetting { name: "pgrust.condition_cache_size", context: PGC_USERSET, group: CUSTOM_OPTIONS, short_desc: Some("Sets the memory budget of the pgrcolumnar condition cache."), long_desc: None, flags: GUC_UNIT_KB, variable: &vars::pgrust_condition_cache_size, boot_val: GucDefaultValue::Int(102400), min: 0, max: MAX_KILOBYTES, check_hook: None, assign_hook: None, show_hook: None },
@@ -1325,6 +1333,7 @@ pub static ConfigureNamesEnum: &[GucEnumSetting] = &[
     // methods cleanly (owner: aio_core).
     GucEnumSetting { name: "io_method", context: PGC_POSTMASTER, group: RESOURCES_IO, short_desc: Some("Selects the method for executing asynchronous I/O."), long_desc: None, flags: 0, variable: &vars::io_method, boot_val: GucDefaultValue::Enum(IOMETHOD_SYNC), options: GucEnumOptions::External(&option_sets::io_method_options), check_hook: Some(&hooks::check_io_method), assign_hook: Some(&hooks::assign_io_method), show_hook: None },
     GucEnumSetting { name: "hnsw.iterative_scan", context: PGC_USERSET, group: CUSTOM_OPTIONS, short_desc: Some("Sets the mode for iterative scans"), long_desc: None, flags: 0, variable: &vars::hnsw_iterative_scan, boot_val: GucDefaultValue::Enum(0), options: GucEnumOptions::Inline(hnsw_iterative_scan_options), check_hook: None, assign_hook: None, show_hook: None },
+    GucEnumSetting { name: "ivfflat.iterative_scan", context: PGC_USERSET, group: CUSTOM_OPTIONS, short_desc: Some("Sets the mode for iterative scans"), long_desc: None, flags: 0, variable: &vars::ivfflat_iterative_scan, boot_val: GucDefaultValue::Enum(0), options: GucEnumOptions::Inline(ivfflat_iterative_scan_options), check_hook: None, assign_hook: None, show_hook: None },
 ];
 
 #[cfg(test)]

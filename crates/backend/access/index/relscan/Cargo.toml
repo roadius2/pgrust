@@ -28,4 +28,5 @@ pgstat = { path = "../../../utils/activity/pgstat" }
 types_hash = { path = "../../../../_support/types/hash" }
 types_bloom = { path = "../../../../_support/types/types_bloom" }
 types_hnsw = { path = "../../../../_support/types/types_hnsw" }
+types_ivfflat = { path = "../../../../_support/types/types_ivfflat" }
 gin_vocab = { path = "../../gin/gin_vocab" }

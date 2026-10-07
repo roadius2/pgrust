@@ -256,6 +256,7 @@ pub fn init_all_with_transport(transport: Transport) {
     test_oat_hooks::init_seams();
     pgvector::init_seams();
     pgvector_hnsw::init_seams();
+    pgvector_ivfflat::init_seams();
     bloom::init_seams();
     hstore::init_seams();
     adt_expandedrecord::init_seams();

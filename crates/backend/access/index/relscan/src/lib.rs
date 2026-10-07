@@ -36,6 +36,7 @@ pub enum IndexAmKind {
     Spgist,
     Brin,
     Hnsw,
+    Ivfflat,
     Bloom,
     #[cfg(feature = "mock")]
     Mock,
@@ -65,6 +66,7 @@ impl IndexAmKind {
             IndexAmKind::Spgist => false,
             IndexAmKind::Brin => false,
             IndexAmKind::Hnsw => false,
+            IndexAmKind::Ivfflat => false,
             IndexAmKind::Bloom => false,
             #[cfg(feature = "mock")]
             IndexAmKind::Mock => true,
@@ -80,6 +82,7 @@ impl IndexAmKind {
             IndexAmKind::Spgist => false,
             IndexAmKind::Brin => true,
             IndexAmKind::Hnsw => false,
+            IndexAmKind::Ivfflat => false,
             IndexAmKind::Bloom => false,
             #[cfg(feature = "mock")]
             IndexAmKind::Mock => false,
@@ -96,6 +99,7 @@ impl IndexAmKind {
             IndexAmKind::Spgist => false,
             IndexAmKind::Brin => false,
             IndexAmKind::Hnsw => false,
+            IndexAmKind::Ivfflat => false,
             IndexAmKind::Bloom => false,
             #[cfg(feature = "mock")]
             IndexAmKind::Mock => false,
@@ -113,6 +117,7 @@ impl IndexAmKind {
             IndexAmKind::Spgist => false,
             IndexAmKind::Brin => false,
             IndexAmKind::Hnsw => false,
+            IndexAmKind::Ivfflat => false,
             IndexAmKind::Bloom => false,
             #[cfg(feature = "mock")]
             IndexAmKind::Mock => false,
@@ -128,6 +133,7 @@ impl IndexAmKind {
             IndexAmKind::Spgist => false,
             IndexAmKind::Brin => false,
             IndexAmKind::Hnsw => false,
+            IndexAmKind::Ivfflat => false,
             IndexAmKind::Bloom => false,
             #[cfg(feature = "mock")]
             IndexAmKind::Mock => true,
@@ -143,6 +149,7 @@ impl IndexAmKind {
             IndexAmKind::Spgist => false,
             IndexAmKind::Brin => false,
             IndexAmKind::Hnsw => false,
+            IndexAmKind::Ivfflat => false,
             IndexAmKind::Bloom => false,
             #[cfg(feature = "mock")]
             IndexAmKind::Mock => false,
@@ -158,6 +165,7 @@ impl IndexAmKind {
             IndexAmKind::Spgist => 0,
             IndexAmKind::Brin => 0,
             IndexAmKind::Hnsw => 0,
+            IndexAmKind::Ivfflat => 0,
             IndexAmKind::Bloom => 1,
             #[cfg(feature = "mock")]
             IndexAmKind::Mock => 5,
@@ -173,6 +181,7 @@ impl IndexAmKind {
             IndexAmKind::Spgist => 7,
             IndexAmKind::Brin => 15,
             IndexAmKind::Hnsw => 3,
+            IndexAmKind::Ivfflat => 5,
             IndexAmKind::Bloom => 2,
             #[cfg(feature = "mock")]
             IndexAmKind::Mock => 6,
@@ -188,6 +197,7 @@ impl IndexAmKind {
             IndexAmKind::Spgist => 7,
             IndexAmKind::Brin => 5,
             IndexAmKind::Hnsw => 0,
+            IndexAmKind::Ivfflat => 0,
             IndexAmKind::Bloom => 2,
             #[cfg(feature = "mock")]
             IndexAmKind::Mock => 5,
@@ -203,6 +213,7 @@ impl IndexAmKind {
             IndexAmKind::Spgist => true,
             IndexAmKind::Brin => true,
             IndexAmKind::Hnsw => false,
+            IndexAmKind::Ivfflat => false,
             IndexAmKind::Bloom => false,
             #[cfg(feature = "mock")]
             IndexAmKind::Mock => false,
@@ -218,6 +229,7 @@ impl IndexAmKind {
             IndexAmKind::Spgist => false,
             IndexAmKind::Brin => false,
             IndexAmKind::Hnsw => false,
+            IndexAmKind::Ivfflat => false,
             IndexAmKind::Bloom => false,
             #[cfg(feature = "mock")]
             IndexAmKind::Mock => true,
@@ -233,6 +245,7 @@ impl IndexAmKind {
             IndexAmKind::Spgist => false,
             IndexAmKind::Brin => false,
             IndexAmKind::Hnsw => false,
+            IndexAmKind::Ivfflat => false,
             IndexAmKind::Bloom => false,
             #[cfg(feature = "mock")]
             IndexAmKind::Mock => false,
@@ -248,6 +261,7 @@ impl IndexAmKind {
             IndexAmKind::Spgist => true,
             IndexAmKind::Brin => false,
             IndexAmKind::Hnsw => true,
+            IndexAmKind::Ivfflat => true,
             IndexAmKind::Bloom => false,
             #[cfg(feature = "mock")]
             IndexAmKind::Mock => false,
@@ -263,6 +277,7 @@ impl IndexAmKind {
             IndexAmKind::Spgist => false,
             IndexAmKind::Brin => true,
             IndexAmKind::Hnsw => false,
+            IndexAmKind::Ivfflat => false,
             IndexAmKind::Bloom => false,
             #[cfg(feature = "mock")]
             IndexAmKind::Mock => false,
@@ -348,7 +363,7 @@ fn registered_index_am(relam: Oid) -> IndexAmKind {
 #[cold]
 #[inline(never)]
 fn unported_index_am(relam: Oid) -> ! {
-    panic!("unported: index AM {relam} (IndexAmKind covers btree+hash+gin+gist+spgist+brin+hnsw+bloom)")
+    panic!("unported: index AM {relam} (IndexAmKind covers btree+hash+gin+gist+spgist+brin+hnsw+ivfflat+bloom)")
 }
 
 pub enum IndexScanOpaque<'mcx> {
@@ -359,6 +374,7 @@ pub enum IndexScanOpaque<'mcx> {
     Spgist(PgBox<'mcx, ::types_spgist::state::SpGistScanOpaqueData<'mcx>>),
     Brin(PgBox<'mcx, ::types_brin::BrinOpaque<'mcx>>),
     Hnsw(PgBox<'mcx, ::types_hnsw::HnswScanOpaqueData<'mcx>>),
+    Ivfflat(PgBox<'mcx, ::types_ivfflat::IvfflatScanOpaqueData>),
     Bloom(PgBox<'mcx, ::types_bloom::BloomScanOpaqueData>),
     #[cfg(feature = "mock")]
     Mock(MockOpaque),
@@ -375,6 +391,7 @@ impl IndexScanOpaque<'_> {
             IndexScanOpaque::Spgist(_) => IndexAmKind::Spgist,
             IndexScanOpaque::Brin(_) => IndexAmKind::Brin,
             IndexScanOpaque::Hnsw(_) => IndexAmKind::Hnsw,
+            IndexScanOpaque::Ivfflat(_) => IndexAmKind::Ivfflat,
             IndexScanOpaque::Bloom(_) => IndexAmKind::Bloom,
             #[cfg(feature = "mock")]
             IndexScanOpaque::Mock(_) => IndexAmKind::Mock,
@@ -625,6 +642,19 @@ mod am_property_tests {
         assert!(!IndexAmKind::Spgist.amsearcharray());
         assert!(!IndexAmKind::Brin.amsearcharray());
         assert!(!IndexAmKind::Hnsw.amsearcharray());
+        assert!(!IndexAmKind::Ivfflat.amsearcharray());
         assert!(!IndexAmKind::Bloom.amsearcharray());
+    }
+
+    // ivfflathandler (ivfflat.c:184-319).
+    #[test]
+    fn ivf_am_properties_match_ivfflathandler() {
+        let k = IndexAmKind::Ivfflat;
+        assert_eq!(k.amstrategies(), 0);
+        assert_eq!(k.amsupport(), 5);
+        assert_eq!(k.amoptsprocnum(), 0);
+        assert!(k.amcanorderbyop() && !k.amcanorder() && !k.amcanhash());
+        assert!(!k.ampredlocks() && !k.amsummarizing() && !k.amsearcharray() && !k.amclusterable());
+        assert!(!k.has_ammarkpos() && !k.has_amrestrpos() && !k.amstorage() && !k.has_aminsertcleanup());
     }
 }

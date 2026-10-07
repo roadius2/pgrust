@@ -28,3 +28,12 @@ tupdesc = { path = "../../backend/access/common/tupdesc" }
 tuplesort = { path = "../../backend/utils/sort/tuplesort" }
 pgvector = { path = "../pgvector" }
 adt_varbit = { path = "../../backend/utils/adt/varbit" }
+types_relscan = { path = "../../backend/access/index/relscan" }
+types_scan = { path = "../../_support/types/types_scan" }
+types_snapshot = { path = "../../_support/types/snapshot" }
+types_nbtree = { path = "../../_support/types/types_nbtree" }
+lmgr = { path = "../../backend/storage/lmgr/lmgr" }
+vacuum_seams = { path = "../../backend/commands/vacuum_seams" }
+xact = { path = "../../backend/access/transam/xact" }
+nbtree = { path = "../../backend/access/nbtree/nbtree" }
+guc_tables = { path = "../../backend/utils/misc/guc_tables" }
