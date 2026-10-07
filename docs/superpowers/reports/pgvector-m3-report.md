@@ -21,6 +21,11 @@ Date: 2026-10-07 · pgrust commit: 1033c58acc (code: Task 6's, the last before t
   - `build-reference.sh --verify`: ok (11 checks).
   - Both reference trees print nothing from `git status --porcelain --ignored`.
 - **How the run was produced.** After `build-reference.sh --verify`, `build-pgrust.sh` built `target/fast-profile/postgres` from 1033c58acc plus the docs commit's header-comment edit. Then each command ran once: `run-all.sh ref`, then `run-all.sh pgrust` (the two lints ran alongside it), then `harness_test.sh`, `UT_M3`, `UT_KEEP`, the parity tests and the reference-tree check. The table below is `run-all.sh pgrust`'s report.
+- **After the final-review fix wave.** That wave made the fmgr stubs raise instead of panic, and gave `insert_sparsevec_cosine` one more inserted row. On a rebuilt binary:
+  - `run-bytecmp.sh ref insert_sparsevec_cosine` and `run-bytecmp.sh pgrust insert_sparsevec_cosine` were both 1/1 identical;
+  - `run-regress.sh pgrust hnsw_sparsevec hnsw_vector` passed 2/2;
+  - `UT lookup_cover fmgr_stubs` passed 3/3.
+  - The full table above predates the wave.
 
 ## pgrust results
 | Tier | Test | Result |
@@ -173,8 +178,8 @@ Every remaining failure is IVFFlat (M4) or a parallel build (M6). I checked each
 - `hnsw_get_type_info` (`pgvector_hnsw/src/utils.rs`) maps an opclass's support proc 3, by its C symbol (`pg_proc.prosrc`), to one of hnswutils.c's four static tables; with no proc 3 it is `vector`'s.
 - The dimension count, the value check, normalization and the maximum dimensions all dispatch through it.
 - The ten opclasses and the three `hnsw_*_support` functions come from upstream's script through `upstream-sql.sh --only-am hnsw`.
-- Any other symbol raises 0A000 (`type_info_resolves_only_pgvector_symbols`, Review Focus 4).
-- **Support proc 3 is unreachable from SQL (Task 5 probe, controller ruling).** C rejects `SELECT hnsw_halfvec_support(NULL::internal)` at parse time: 42846, `cannot cast type unknown to internal`. pgrust ports the same check, so the `lookup` stubs are unreachable and the plan's panicking stub stands.
+- Any other symbol raises 0A000 (Review Focus 4). The unit test `type_info_resolves_only_pgvector_symbols` checks only the symbol map; `hnsw_get_type_info`'s error branch has no test, and SQL cannot compare it with C, which crashes on the same input.
+- **Support proc 3 is unreachable from SQL (Task 5 probe, controller ruling).** C rejects `SELECT hnsw_halfvec_support(NULL::internal)` at parse time: 42846, `cannot cast type unknown to internal`. pgrust ports the same check, so the `lookup` stubs are unreachable through their `internal` signatures. A superuser can still bind the symbols to a callable signature, so the final fix wave made the stubs (and M1's `hnswhandler`) raise XX000 instead of panicking.
 
 **Byte-identical seeded builds for every opclass family (bytecmp 21/21).**
 - **New type cases:**
@@ -183,6 +188,7 @@ Every remaining failure is IVFFlat (M4) or a parallel build (M6). I checked each
   - `bit_hamming` and `bit_jaccard`, on `bit(64)` from md5;
   - each of these builds a 39–42-block, level-2 index.
 - **`wide_sparsevec`:** 1,000-non-zero values (8,016 bytes, TOASTed in the heap), 201 blocks, level 1. Each neighbor tuple goes on the next page, and inserts after the build append pages. They all match C's (Review Focus 1).
+- **`insert_sparsevec_cosine`:** its last inserted row, `{1:3e38,3:1e-30}/3`, loses an element when normalized (1e-30/3e38 underflows in f32). Both sides store `{1:1}/3`, at the same offset of block 41, so Review Focus 2's stored shrink is pinned in page bytes.
 - **`bq_expression`:** `binary_quantize(v)::bit(64)` with `bit_hamming_ops`, 40 blocks; the index attribute's typmod gives the dimensions (Review Focus 5).
 - **`big_golomb`:** a 10,000-row `vector` build, 390 blocks, height 3. C's in-memory graph (6 MB) spans several 1 MB Generation blocks. So M1's SelectNeighbors tie-break question (pgrust breaks ties by element id, C by address) is verified at that size.
 
@@ -225,7 +231,11 @@ Every remaining failure is IVFFlat (M4) or a parallel build (M6). I checked each
 
 **An unknown support proc 3 raises 0A000 where C calls it.** C trusts any proc 3's returned pointer. pgrust knows only pgvector's three support symbols and raises `hnsw type support function "<symbol>" of index "<index>" is not supported` (`DIVERGENCE` in `utils.rs`). Likewise, a hand-written opclass that gives `bit` a norm proc makes C call a NULL normalize function and crash; pgrust raises.
 
-**For M5.** M5's identical-approximate-results gate compares pgrust with the Docker image's gcc build. That build's tails differ from both clang's and pgrust's sequential order. So M5 may need to measure how often that changes a traversal, or decide to emulate gcc's tail.
+**The fmgr stubs raise where C returns.** `hnswhandler` and the three `hnsw_*_support` functions are resolved by access method and by symbol, never called through fmgr. Bound by a superuser to a callable signature (`CREATE FUNCTION f(int) RETURNS int AS '$libdir/vector', 'hnsw_bit_support' LANGUAGE C`), C returns its static pointer. pgrust raises XX000 `<symbol> is resolved by ..., never called through fmgr` (`DIVERGENCE` in `pgvector/src/lib.rs`; unit test `fmgr_stubs_raise_internal_error`).
+
+**For M5.**
+- M5's identical-approximate-results gate compares pgrust with the Docker image's gcc build. That build's tails differ from both clang's and pgrust's sequential order. So M5 may need to measure how often that changes a traversal, or decide to emulate gcc's tail.
+- C also vectorizes the normalize functions' double-precision norm sums: sparsevec `l2_normalize` (`sparsevec.rs:904`), and halfvec's and vector's `l2_normalize`. Their order feeds the stored values of cosine indexes. pgrust sums in source order, which the user's M2 no-reduction-emulation ruling covers.
 
 **Carried forward from M2, untouched by M3** (details in `pgvector-m2-report.md`):
 - **TAP 018's worker pin.** The harness runs pgrust with C's `max_parallel_workers_per_gather = 2`. pgrust's own default (4) is unchanged, so stock pgrust still differs from C on parallel plan shape.
@@ -289,27 +299,21 @@ Review minors deferred to a later cleanup, one line each. This section carries e
 - `utils.rs:116`'s comment says "as amapi resolves hnswhandler", but amapi matches `proname`, not `prosrc`.
 - `utils.rs:184-192`: `hnsw_norm_value` copies the fmgr result a second time in the same memory context.
 - Non-vector inserts create a `MemoryContext` and look up `pg_proc` per row (`insert.rs:914`), where C uses a cached `FunctionCall0Coll`.
-- Neither check pins the normalize-drop `tmpCtx` charges exactly:
-  - `charge_norm_value_matches_c` restates the function;
-  - `run-iterscan.sh:96-98` overstates `sparsevec_cosine_drop_64k`: its trace is KB-granular, and a kept `3:0` entry would give identical results.
-  - Also, `hnsw_get_type_info`'s error path has no unit test.
+- `charge_norm_value_matches_c` restates the function it checks, so the normalize-drop `tmpCtx` charge sequence rests on that test's reading of `sparsevec.c`; the iterscan trace is KB-granular. Also, `hnsw_get_type_info`'s error path has no unit test.
 - `sparsevec.rs:785-786`: the L1 tail's divergence has no `DIVERGENCE` marker at the site; `fmadd_step`'s comment covers only the L2 tail.
 - `pgvector/src/lib.rs:13-15`: the header's "neither emulates C's vectorized L2/L1 tails" reads oddly.
 - Note for the final review: sparsevec's single-array norm loops are unfused scalar sums with no `DIVERGENCE` note, while C vectorizes them. These are the cosine norms (`sparsevec.rs:854`, `:858`) and `l2_norm`/`l2_normalize` (`:891`, `:904`), and `sparsevec_cosine_ops`' support proc 2 uses them. M2's no-reduction-emulation rule plausibly covers them.
-- `pgvector/src/lib.rs:145-148`: `fc_hnsw_type_support`'s comment lacks the `hnswutils.c:1418-1458` citation.
 
 **From M3: harness**
-- `harness_test.sh:321`: `test_iterscan_memory_off` passes on any `relaxed_64k` FAIL. It should assert 0 subject memory lines and at least 1 oracle line.
+- `harness_test.sh:323`: `test_iterscan_memory_off` passes on any `relaxed_64k` FAIL. It should assert 0 subject memory lines and at least 1 oracle line.
 - No stop-point self-test checks that `big_strict_128k` (2669) and `big_ef100_128k` (4727) stay below 9990.
-- `harness_test.sh:319`: shellcheck SC1007 on `PGV_ITERSCAN_MEMORY= ` (use `''`), like the existing `PGV_BYTECMP_SEED=` line.
+- `harness_test.sh:325`: shellcheck SC1007 on `PGV_ITERSCAN_MEMORY= ` (use `''`), like the existing `PGV_BYTECMP_SEED=` line.
 - `run-iterscan.sh`'s `setup_sql` builds the 10,000-row `big` index on every run, even for single non-`big` cases.
 - `sqldiff.sh`'s `strip_hnsw_memory`:
   - its comment omits `hnswvacuum.c:171`, which it also strips (correctly);
   - it runs on both sides, so sqldiff alone would miss a default-on pgrust trace (regress and TAP would catch it).
 - `hnsw-errors.sql`'s NULL-query statements for `bit` (`:49`), `sparsevec` (`:66`) and `vector` return the same count from a seq scan, so sqldiff cannot detect a fallback; an `EXPLAIN (COSTS OFF)` per NULL query would pin the plan.
 - `upstream-sql.sh --only-am` with a typo (for example `hsnw`) exits 0 printing only headers, and `--only-am ''` silently means default mode.
-- `run-bytecmp.sh:143` says "0 to 3 non-zeros" where it means "1 to 3".
-- `run-bytecmp.sh:22-23`'s header ("integer-valued so float math is exact or rounds once") is stale since `sparsevec_l2_frac` and the cosine cases.
 - `wide_sparsevec` has only the generic 10-block self-test; a 150-block arm like `wide_golomb`'s would pin Review Focus 1.
 - Five of the six new iterscan type cases stop in their first batch (no resume); only `sparsevec_cosine_drop_64k` spans several.
 - `lint-seam-installs` warns of stale allowlist rows, `pgaio_io_start_readv` among them (pre-existing, not M3).

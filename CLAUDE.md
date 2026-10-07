@@ -126,7 +126,7 @@ scripts/pgvector/tests/harness_test.sh                    # self-tests of the ha
 scripts/pgvector/server.sh {start|fresh|stop|psql} {pgrust|ref}  # manual servers on the harness ports
 scripts/pgvector/docker-ref.sh {up|down|psql}                  # pgvector/pgvector:0.8.7-pg18 reference (port 55493)
 scripts/pgvector/run-bytecmp.sh {pgrust|ref}                    # HNSW pages vs the seeded C build (pgvec-seeded, -DHNSW_MEMORY)
-scripts/pgvector/run-iterscan.sh {pgrust|ref}                   # iterative-scan stop points vs the seeded C build
+scripts/pgvector/run-iterscan.sh {pgrust|ref} [case ...]        # iterative-scan stop points vs the seeded C build
 scripts/pgvector/run-diff.sh {pgrust|ref}                       # exact differential: diffrunner --pgvector + error LOCATIONs
 scripts/pgvector/sqldiff.sh {pgrust|ref} [--verbose] <file|->   # one SQL script on fresh ref and subject servers, diffed
 scripts/pgvector/upstream-sql.sh [--only-am hnsw] 'SECTION' ...  # upstream extension-script sections for the trimmed script
