@@ -84,6 +84,14 @@ else
   r=FAIL
 fi
 printf 'hnsw_errors\t%s\n' "$r" | tee -a "$out/summary.tsv"
+# IVFFlat's error sites, every type (M4 Review Focus 2: a wrong-dimension
+# query errors even on an empty index).
+if "$here/sqldiff.sh" "$mode" --verbose "$here/sql/ivfflat-errors.sql" >"$out/ivfflat-errors.log" 2>&1; then
+  r=ok
+else
+  r=FAIL
+fi
+printf 'ivfflat_errors\t%s\n' "$r" | tee -a "$out/summary.tsv"
 
 total=$(wc -l <"$out/summary.tsv" | tr -d ' ')
 passed=$(grep -c $'\tok$' "$out/summary.tsv" || true)

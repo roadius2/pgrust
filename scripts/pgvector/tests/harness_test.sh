@@ -199,8 +199,23 @@ test_bytecmp_ref() {
   if assert_reference_clean; then pass "bytecmp: reference trees untouched"; else fail "bytecmp: reference trees modified"; fi
 }
 
+# Blocks and lists of each IVFFlat case's relation on the seeded C build
+# (M4 plan facts): lists start on blocks 2 and 4 and inserts append two
+# pages (ivf_insert), one list item and one entry per page (ivf_wide).
+ivf_want() {
+  case "$1" in
+    ivf_l2_groups:idx | ivf_halfvec_groups:idx | ivf_bit_hamming:idx | ivf_unlogged:idx | ivf_unlogged:idx_init) echo "12 10" ;;
+    ivf_big:idx) echo "92 10" ;;
+    ivf_insert:idx) echo "8 2" ;;
+    ivf_vacuum:idx) echo "22 10" ;;
+    ivf_wide:idx) echo "56 5" ;;
+    *) echo "unknown case" ;;
+  esac
+}
+
 # The cases must exercise what they claim (reads the C-vs-C run above):
-# multi-level graphs, a deep m=4 graph, page-split wide tuples, an init fork.
+# multi-level graphs, a deep m=4 graph, page-split wide tuples, an init fork,
+# IVFFlat block and list counts.
 test_bytecmp_cases() {
   local f="$PGV_WORK/bytecmp/ref/cases.tsv" c label blocks level
   if [ ! -s "$f" ]; then
@@ -209,6 +224,8 @@ test_bytecmp_cases() {
   fi
   while IFS=$'\t' read -r c label blocks level; do
     case "$c:$label" in
+      ivf_*) [ "$blocks $level" = "$(ivf_want "$c:$label")" ] && pass "bytecmp $c $label: $blocks blocks, $level lists" ||
+        fail "bytecmp $c $label: $blocks blocks, $level lists, want $(ivf_want "$c:$label")" ;;
       *:idx_init) [ "$level" = -1 ] && pass "bytecmp $c: empty init fork" || fail "bytecmp $c: init fork entry level $level" ;;
       m4_golomb:idx) [ "$level" -ge 3 ] && pass "bytecmp $c: graph height $level" || fail "bytecmp $c: graph height $level, want >= 3" ;;
       wide_golomb:idx) [ "$blocks" -ge 150 ] && pass "bytecmp $c: $blocks blocks" || fail "bytecmp $c: $blocks blocks, want >= 150" ;;
@@ -241,6 +258,19 @@ test_bytecmp_knob_off() {
     pass "bytecmp: unseeded pgrust differs from the seeded oracle"
   else
     fail "bytecmp: unseeded pgrust: wrong failure (see $w.log)"
+  fi
+}
+
+# The IVFFlat seed is opt-in too: without SET pgrust.ivfflat_build_seed the
+# k-means++ picks, and so the list order, differ from the seeded oracle.
+test_bytecmp_ivf_knob_off() {
+  local w="$PGV_WORK/bytecmp-ivf-noseed"
+  if PGV_WORK="$w" PGV_BYTECMP_SEED= "$here/../run-bytecmp.sh" pgrust ivf_l2_groups >"$w.log" 2>&1; then
+    fail "bytecmp: unseeded pgrust ivfflat differs from the seeded oracle"
+  elif grep -q $'^ivf_l2_groups\tFAIL$' "$w/bytecmp/pgrust/summary.tsv" 2>/dev/null; then
+    pass "bytecmp: unseeded pgrust ivfflat differs from the seeded oracle"
+  else
+    fail "bytecmp: unseeded pgrust ivfflat: wrong failure (see $w.log)"
   fi
 }
 
@@ -363,7 +393,7 @@ test_diff_ref() {
     fail "diff ref: exit 0 (see $PGV_WORK/diff-ref.log)"
   fi
   n="$(grep -c $'\tok$' "$PGV_WORK/diff/ref/summary.tsv" 2>/dev/null || true)"
-  if [ "$n" = 18 ]; then pass "diff ref: 18 ok"; else fail "diff ref: '$n' ok, want 18"; fi
+  if [ "$n" = 19 ]; then pass "diff ref: 19 ok"; else fail "diff ref: '$n' ok, want 19"; fi
 }
 
 # Negative control: a B side without l2_normalize(halfvec) must be reported

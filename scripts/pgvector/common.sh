@@ -8,10 +8,11 @@
 #   $PG_VEC    Copy of $PG_TOOLS plus C pgvector 0.8.7: the reference server.
 #              Kept separate so pgrust never sees C pgvector's control file
 #              or upgrade scripts.
-#   $PG_VEC_SEEDED  Same as $PG_VEC, but pgvector is built with -DHNSW_MEMORY,
-#              the only configuration in which C seeds the HNSW level RNG
-#              (SeedRandom(42), hnswbuild.c:1134-1136). Oracle of the
-#              byte-identical and iterative-scan tiers; nothing else uses it.
+#   $PG_VEC_SEEDED  Same as $PG_VEC, but pgvector is built with -DHNSW_MEMORY
+#              -DIVFFLAT_BENCH, the only configuration in which C seeds HNSW
+#              and IVFFlat builds (SeedRandom(42), hnswbuild.c:1134-1136,
+#              ivfbuild.c:1075-1077). Oracle of the byte-identical and
+#              iterative-scan tiers; nothing else uses it.
 
 PGV_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PG_SRC="$PGV_REPO/crates/postgres-18.6-reference"

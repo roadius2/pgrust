@@ -5,7 +5,7 @@ set -euo pipefail
 . "$(dirname "$0")/common.sh"
 
 verify_reference() {
-  local fails=0 tools_share vec_share seeded_share
+  local fails=0 tools_share vec_share seeded_share seeded_lib ref_lib
   expect() { # expect DESCRIPTION ACTUAL WANTED
     if [ "$2" = "$3" ]; then
       echo "ok   - $1"
@@ -26,12 +26,14 @@ verify_reference() {
   expect "tools share has no pgvector" \
     "$([ -e "$tools_share/extension/vector.control" ] && echo present || echo absent)" "absent"
   expect "IPC::Run loadable" "$(PERL5LIB="$PGV_PERL5LIB" perl -MIPC::Run -e 'print "yes"' 2>/dev/null)" "yes"
-  # HNSW_MEMORY compiles in FlushPages' INFO "memory: %zu MB" (hnswbuild.c:306-308).
-  hnsw_memory_marker() {
+  # Count a format string compiled into a pgvector library: HNSW_MEMORY's
+  # FlushPages INFO "memory: %zu MB" (hnswbuild.c:306-308) and IVFFLAT_BENCH's
+  # IvfflatBench INFO "%s: %.3f ms" (ivfflat.h:71-84).
+  lib_marker() {
     local lib
-    for lib in "$1/vector.dylib" "$1/vector.so"; do
+    for lib in "$2/vector.dylib" "$2/vector.so"; do
       if [ -f "$lib" ]; then
-        strings "$lib" | grep -c 'memory: %zu MB' || true
+        strings "$lib" | grep -cF -- "$1" || true
         return
       fi
     done
@@ -41,10 +43,12 @@ verify_reference() {
   expect "seeded postgres -V" "$("$PG_VEC_SEEDED/bin/postgres" -V 2>/dev/null)" "postgres (PostgreSQL) 18.6"
   expect "seeded reference has pgvector" \
     "$(sed -n "s/^default_version = '\(.*\)'$/\1/p" "$seeded_share/extension/vector.control" 2>/dev/null)" "0.8.7"
-  expect "seeded pgvector built with HNSW_MEMORY" \
-    "$(hnsw_memory_marker "$("$PG_VEC_SEEDED/bin/pg_config" --pkglibdir 2>/dev/null)")" "1"
-  expect "reference pgvector built without HNSW_MEMORY" \
-    "$(hnsw_memory_marker "$("$PG_VEC/bin/pg_config" --pkglibdir 2>/dev/null)")" "0"
+  seeded_lib="$("$PG_VEC_SEEDED/bin/pg_config" --pkglibdir 2>/dev/null || true)"
+  ref_lib="$("$PG_VEC/bin/pg_config" --pkglibdir 2>/dev/null || true)"
+  expect "seeded pgvector built with HNSW_MEMORY" "$(lib_marker 'memory: %zu MB' "$seeded_lib")" "1"
+  expect "reference pgvector built without HNSW_MEMORY" "$(lib_marker 'memory: %zu MB' "$ref_lib")" "0"
+  expect "seeded pgvector built with IVFFLAT_BENCH" "$(lib_marker '%s: %.3f ms' "$seeded_lib")" "1"
+  expect "reference pgvector built without IVFFLAT_BENCH" "$(lib_marker '%s: %.3f ms' "$ref_lib")" "0"
   [ "$fails" -eq 0 ] || die "$fails reference check(s) failed"
 }
 
@@ -97,9 +101,10 @@ if [ ! -f "$vec_share/extension/vector.control" ]; then
 fi
 
 # 4. Seeded reference install (oracle of run-bytecmp.sh and run-iterscan.sh):
-#    the same pgvector built with -DHNSW_MEMORY, the only C configuration that
-#    seeds HNSW builds (SeedRandom(42), hnswbuild.c:1134-1136). PG_CFLAGS must
-#    come from the environment: on the make command line it would replace the
+#    the same pgvector built with -DHNSW_MEMORY -DIVFFLAT_BENCH, the only C
+#    configuration that seeds HNSW and IVFFlat builds (SeedRandom(42),
+#    hnswbuild.c:1134-1136, ivfbuild.c:1075-1077). PG_CFLAGS must come from
+#    the environment: on the make command line it would replace the
 #    Makefile's `PG_CFLAGS += ... -ffp-contract=fast` instead of extending it.
 if [ ! -d "$PG_VEC_SEEDED" ]; then
   cp -R "$PG_TOOLS" "$PG_VEC_SEEDED"
@@ -110,10 +115,10 @@ if [ ! -f "$seeded_share/extension/vector.control" ]; then
   rm -rf "$build"
   mkdir -p "$build"
   cp -R "$PGV_SRC/." "$build/"
-  echo "building seeded pgvector 0.8.7 (-DHNSW_MEMORY) in $build"
+  echo "building seeded pgvector 0.8.7 (-DHNSW_MEMORY -DIVFFLAT_BENCH) in $build"
   (
     cd "$build" &&
-      PG_CFLAGS="-DHNSW_MEMORY" make OPTFLAGS="" PG_CONFIG="$PG_VEC_SEEDED/bin/pg_config" >make.log 2>&1 &&
+      PG_CFLAGS="-DHNSW_MEMORY -DIVFFLAT_BENCH" make OPTFLAGS="" PG_CONFIG="$PG_VEC_SEEDED/bin/pg_config" >make.log 2>&1 &&
       make install PG_CONFIG="$PG_VEC_SEEDED/bin/pg_config" >install.log 2>&1
   ) || die "seeded pgvector build failed; logs in $build"
 fi

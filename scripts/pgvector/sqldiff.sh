@@ -15,12 +15,13 @@ set -euo pipefail
 
 usage() { die "usage: sqldiff.sh {pgrust|ref} [--verbose] <file.sql | ->"; }
 
-# The seeded build (-DHNSW_MEMORY) also prints "memory:" INFO lines for HNSW
-# builds and scans (hnswbuild.c:307, hnswscan.c:128), which stock C and
-# pgrust (without SET pgrust.hnsw_memory) do not. Drop them, and the
-# LOCATION line --verbose adds, before comparing.
-strip_hnsw_memory() {
-  awk '/INFO:  (00000: )?memory: / { skip = 1; next }
+# The seeded build (-DHNSW_MEMORY -DIVFFLAT_BENCH) also prints INFO lines that
+# stock C and pgrust do not: "memory:" for HNSW builds, scans and vacuums
+# (hnswbuild.c:307, hnswscan.c:128, hnswvacuum.c:171), and IvfflatBench's
+# "<step>: N ms" for IVFFlat builds and scans (ivfflat.h:71-84). Drop them,
+# and the LOCATION line --verbose adds, before comparing.
+strip_seeded_info() {
+  awk '/INFO:  (00000: )?(memory: |(sample rows|k-means|assign tuples|sort tuples|load tuples|GetScanLists|GetScanItems): [0-9.]+ ms)/ { skip = 1; next }
     skip && /^LOCATION:  / { skip = 0; next }
     { skip = 0; print }' "$1" >"$1.tmp"
   mv "$1.tmp" "$1"
@@ -55,7 +56,7 @@ for side in ref "$subject"; do
   assert_identity "$side" "$port"
   pgv_psql "$port" -c 'CREATE EXTENSION vector' >/dev/null
   (cd "$out" && pgv_psql "$port" -a -v ON_ERROR_STOP=0 -f input.sql) >"$out/$side.out" 2>&1 || true
-  strip_hnsw_memory "$out/$side.out"
+  strip_seeded_info "$out/$side.out"
   server_stop "$side"
   [ "${PGV_KEEP_DATA:-}" = 1 ] || rm -rf "$out/data/$side"
 done

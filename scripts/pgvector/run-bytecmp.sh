@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Byte-identical HNSW tier (spec §8.2). Build the same HNSW indexes on the
+# Byte-identical HNSW and IVFFlat tier (spec §8.2). Build the same indexes on the
 # seeded C reference (the oracle) and on the subject server, stop both cleanly,
 # then compare every index relation file page by page after masking both sides
 # with crates/bin/pagemask's `generic` rmgr: pd_lsn, pd_checksum and the
@@ -9,7 +9,8 @@
 # usage: run-bytecmp.sh {pgrust|ref} [case ...]   (default: the cases in CASES)
 #        run-bytecmp.sh --list
 #   pgrust: the subject is pgrust ($PGRUST_BIN), seeded with
-#           SET pgrust.hnsw_build_seed = $PGV_BYTECMP_SEED (default 42).
+#           SET pgrust.hnsw_build_seed = $PGV_BYTECMP_SEED (default 42)
+#           and SET pgrust.ivfflat_build_seed.
 #   ref:    the subject is a second, fresh seeded C cluster: C-vs-C proof that
 #           the oracle and every case are deterministic (must always pass).
 #   PGV_BYTECMP_SUBJECT={pgrust|ref|seeded} overrides the subject (self-tests);
@@ -17,21 +18,25 @@
 #   PGV_KEEP_DATA=1 keeps each side's cluster under $PGV_WORK/bytecmp/<mode>/data
 #           (default: deleted after a successful side, to save disk).
 #
-# The oracle is $PG_VEC_SEEDED (see common.sh): stock C pgvector does not seed
-# its level RNG at all (SeedRandom(42) sits under #ifdef HNSW_MEMORY), so only
-# that build is deterministic. Data are mostly integer-valued so float math is
-# exact or rounds once (identical under FMA and reassociation); the non-integer
-# cases (sparsevec_l2_frac and the cosine cases) say in their comments why C
-# and pgrust round alike. Every case runs in its own session; insert_* cases
-# build and then insert in ONE session, because on-disk inserts draw levels
-# from the stream the build left behind.
+# The oracle is $PG_VEC_SEEDED (see common.sh): stock C pgvector seeds neither
+# access method (SeedRandom(42) sits under #ifdef HNSW_MEMORY and #ifdef
+# IVFFLAT_BENCH), so only that build is deterministic. HNSW data are mostly
+# integer-valued so float math is exact or rounds once (identical under FMA
+# and reassociation); the non-integer cases (sparsevec_l2_frac and the cosine
+# cases) say in their comments why C and pgrust round alike. IVFFlat data
+# (ivf_*) are well-separated groups of four integer points: every k-means and
+# assignment comparison has a clear winner, and the stored centers are
+# element-wise sums divided once, which C and pgrust round alike. Every case
+# runs in its own session; insert_* cases build and then insert in ONE
+# session, because on-disk inserts draw levels from the stream the build
+# left behind.
 set -euo pipefail
 . "$(dirname "$0")/common.sh"
 
 # Default cases. *_golomb data are tie-free: x = 2*p*k + (k*k % p) is an
 # Erdos-Turan Golomb ruler, so all pairwise distances differ. *_grid and dups
 # have many equal distances, which exercises C's pairingheap tie order.
-CASES="l2_golomb l1_golomb m4_golomb wide_golomb unlogged_golomb insert_golomb l2_grid ip_grid dups insert_grid big_golomb halfvec_l2_grid halfvec_cosine_grid sparsevec_l2_grid sparsevec_l2_frac sparsevec_cosine_grid insert_sparsevec_cosine wide_sparsevec bit_hamming bit_jaccard bq_expression"
+CASES="l2_golomb l1_golomb m4_golomb wide_golomb unlogged_golomb insert_golomb l2_grid ip_grid dups insert_grid big_golomb halfvec_l2_grid halfvec_cosine_grid sparsevec_l2_grid sparsevec_l2_frac sparsevec_cosine_grid insert_sparsevec_cosine wide_sparsevec bit_hamming bit_jaccard bq_expression ivf_l2_groups ivf_big ivf_halfvec_groups ivf_bit_hamming ivf_insert ivf_unlogged ivf_vacuum ivf_wide"
 # Opt-in only (known divergences, run by name): spill cosine
 
 GOLOMB1009='ARRAY[2*1009*k + (k*k) % 1009, 0, 0]::vector'
@@ -41,6 +46,10 @@ GRID='ARRAY[i % 17, (i * 7) % 23, (i * 13) % 31]::vector'
 GRID3='ARRAY[i % 17, (i * 7) % 23, (i * 13) % 31]'
 GRID3_POS='ARRAY[1 + i % 17, 1 + (i * 7) % 23, 1 + (i * 13) % 31]'
 MD5BITS="('x' || substr(md5(i::text), 1, 16))::bit(64)"
+# IVFFlat groups: ten groups of four points, 256 apart; a group's mean is
+# its corner + (0.5, 0.5).
+IVF_GROUPS='ARRAY[256 * ((i % 10) % 5) + (i / 10) % 2, 256 * ((i % 10) / 5) + ((i / 10) / 2) % 2, 0]'
+IVF_GROUPS2='ARRAY[256 * (i % 2) + (i / 2) % 2, ((i / 2) / 2) % 2, 0]'
 SEED="${PGV_BYTECMP_SEED-42}"
 
 # Print one case's SQL. Each case ends by selecting "rel|<label>|<relfile>"
@@ -50,6 +59,7 @@ case_sql() {
   echo "SET maintenance_work_mem = '64MB';"
   # Seeds pgrust (Task 5); C keeps it as an unused placeholder.
   [ -z "$SEED" ] || echo "SET pgrust.hnsw_build_seed = $SEED;"
+  [ -z "$SEED" ] || echo "SET pgrust.ivfflat_build_seed = $SEED;"
   case "$1" in
     l2_golomb | l1_golomb)
       local ops=vector_l2_ops
@@ -204,6 +214,79 @@ INSERT INTO $1 SELECT i, (SELECT array_agg(CASE WHEN substr(md5(i::text || ':' |
 CREATE INDEX $1_idx ON $1 USING hnsw ((binary_quantize(v)::bit(64)) bit_hamming_ops);
 SQL
       ;;
+    ivf_l2_groups)
+      cat <<SQL
+CREATE TABLE $1 (id int, v vector(3));
+INSERT INTO $1 SELECT i, $IVF_GROUPS::vector FROM generate_series(0, 999) i;
+CREATE INDEX $1_idx ON $1 USING ivfflat (v vector_l2_ops) WITH (lists = 10);
+SQL
+      ;;
+    ivf_big)
+      # 20,000 rows and 10,000 samples: the reservoir replaces samples
+      # (reservoir_get_next_S, sampler_random_fract), so the group means are
+      # inexact, but every comparison still has a clear winner.
+      cat <<SQL
+CREATE TABLE $1 (id int, v vector(3));
+INSERT INTO $1 SELECT i, $IVF_GROUPS::vector FROM generate_series(0, 19999) i;
+CREATE INDEX $1_idx ON $1 USING ivfflat (v vector_l2_ops) WITH (lists = 10);
+SQL
+      ;;
+    ivf_halfvec_groups)
+      # 1024.5 is not a half: the centers 1024.5 round to 1024 on both sides.
+      cat <<SQL
+CREATE TABLE $1 (id int, v halfvec(3));
+INSERT INTO $1 SELECT i, $IVF_GROUPS::halfvec FROM generate_series(0, 999) i;
+CREATE INDEX $1_idx ON $1 USING ivfflat (v halfvec_l2_ops) WITH (lists = 10);
+SQL
+      ;;
+    ivf_bit_hamming)
+      # Hamming distances are integers; bit centers threshold their means.
+      cat <<SQL
+CREATE TABLE $1 (id int, v bit(64));
+INSERT INTO $1 SELECT i, $MD5BITS FROM generate_series(1, 1000) i;
+CREATE INDEX $1_idx ON $1 USING ivfflat (v bit_hamming_ops) WITH (lists = 10);
+SQL
+      ;;
+    ivf_insert)
+      # Two lists of two pages each; the inserts fill them, append a page to
+      # each (under the extension lock) and move the insert pages there.
+      cat <<SQL
+CREATE TABLE $1 (id int, v vector(3));
+INSERT INTO $1 SELECT i, $IVF_GROUPS2::vector FROM generate_series(0, 599) i;
+CREATE INDEX $1_idx ON $1 USING ivfflat (v vector_l2_ops) WITH (lists = 2);
+INSERT INTO $1 SELECT i, $IVF_GROUPS2::vector FROM generate_series(600, 999) i;
+SQL
+      ;;
+    ivf_unlogged)
+      # Also compares the init fork ivfflatbuildempty writes: no heap, so
+      # random centers from the stream the main-fork build left behind.
+      cat <<SQL
+CREATE UNLOGGED TABLE $1 (id int, v vector(3));
+INSERT INTO $1 SELECT i, $IVF_GROUPS::vector FROM generate_series(0, 999) i;
+CREATE INDEX $1_idx ON $1 USING ivfflat (v vector_l2_ops) WITH (lists = 10);
+SELECT 'rel|idx_init|' || pg_relation_filepath('$1_idx') || '_init';
+SQL
+      ;;
+    ivf_vacuum)
+      # ivfflatbulkdelete compacts every entry page and moves each list's
+      # insert page back to its first page with deletions.
+      cat <<SQL
+CREATE TABLE $1 (id int, v vector(3)) WITH (autovacuum_enabled = false);
+INSERT INTO $1 SELECT i, $IVF_GROUPS::vector FROM generate_series(0, 2999) i;
+CREATE INDEX $1_idx ON $1 USING ivfflat (v vector_l2_ops) WITH (lists = 10);
+DELETE FROM $1 WHERE id % 3 = 0;
+VACUUM $1;
+SQL
+      ;;
+    ivf_wide)
+      # 2,000 dimensions: one list item per page (IvfflatAppendPage in
+      # CreateListPages) and one entry per page.
+      cat <<SQL
+CREATE TABLE $1 (id int, v vector(2000));
+INSERT INTO $1 SELECT i, (ARRAY[256 * (i % 5) + (i / 5) % 2, ((i / 5) / 2) % 2] || array_fill(0, ARRAY[1998]))::vector FROM generate_series(0, 49) i;
+CREATE INDEX $1_idx ON $1 USING ivfflat (v vector_l2_ops) WITH (lists = 5);
+SQL
+      ;;
     spill)
       # Known divergence: C flushes when its Generation context has allocated
       # maintenance_work_mem (1436 tuples here); pgrust estimates (1840).
@@ -232,7 +315,7 @@ SQL
 # cleanly (the shutdown checkpoint writes every buffer, unlogged ones too),
 # then copy and mask the files into $out/LABEL.
 run_side() {
-  local label="$1" kind="$2" port dir c line rel path
+  local label="$1" kind="$2" port dir c line rel path marker
   port="$(port_for "$kind")"
   dir="$out/$label"
   mkdir -p "$dir"
@@ -244,10 +327,13 @@ run_side() {
     case_sql "$c" >"$dir/$c.sql"
     pgv_psql "$port" -At -f "$dir/$c.sql" >"$dir/$c.out" 2>"$dir/$c.err" ||
       die "$label ($kind): case $c failed; see $dir/$c.err"
-    # The seeded build reports its graph memory (HNSW_MEMORY's FlushPages
-    # elog), which proves the seeded library built the index.
-    if [ "$kind" = seeded ] && ! grep -q 'INFO:  memory: ' "$dir/$c.err"; then
-      die "$label: case $c was not built by the seeded C pgvector (no 'INFO:  memory:' line)"
+    # The seeded build reports its HNSW graph memory (HNSW_MEMORY's
+    # FlushPages elog) or its IVFFlat k-means time (IVFFLAT_BENCH's
+    # IvfflatBench), which proves the seeded library built the index.
+    marker='INFO:  memory: '
+    case "$c" in ivf_*) marker='INFO:  k-means: ' ;; esac
+    if [ "$kind" = seeded ] && ! grep -q "$marker" "$dir/$c.err"; then
+      die "$label: case $c was not built by the seeded C pgvector (no '${marker% }' line)"
     fi
   done
   server_stop "$kind"
@@ -273,6 +359,11 @@ run_side() {
 # HnswMetaPageData.entryLevel (int16 at page offset 24 + 22): the graph height.
 entry_level() {
   od -An -td2 -j46 -N2 "$1" | tr -d ' '
+}
+
+# IvfflatMetaPageData.lists (uint16 at page offset 24 + 10).
+meta_lists() {
+  od -An -tu2 -j34 -N2 "$1" | tr -d ' '
 }
 
 # Per-block summary of the masked bytes that differ.
@@ -325,8 +416,9 @@ for c in "${cases[@]}"; do
     [ -e "$f" ] || die "case $c produced no relation files"
     name="$(basename "$f" .masked)"
     g="$out/subject/$name.masked"
-    printf '%s\t%s\t%s\t%s\n' "$c" "${name#"$c".}" "$(($(wc -c <"$f") / 8192))" \
-      "$(entry_level "$f")" >>"$out/cases.tsv"
+    # Column 4: the HNSW graph height, or an IVFFlat index's lists.
+    case "$c" in ivf_*) col4="$(meta_lists "$f")" ;; *) col4="$(entry_level "$f")" ;; esac
+    printf '%s\t%s\t%s\t%s\n' "$c" "${name#"$c".}" "$(($(wc -c <"$f") / 8192))" "$col4" >>"$out/cases.tsv"
     if [ ! -e "$g" ] || ! cmp -s "$f" "$g"; then
       result=FAIL
       if [ -e "$g" ]; then describe_diff "$f" "$g"; else echo "subject has no $name"; fi >"$out/diff/$name.txt"
