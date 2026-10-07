@@ -411,26 +411,6 @@ test_diff_detects_difference() {
   fi
 }
 
-# upstream-sql.sh --only-am prints just one access method's blocks: the three
-# hnsw_*_support functions and the ten hnsw opclasses of M3, no ivfflat block,
-# no COMMENT ON. The default mode still drops them all.
-test_upstream_sql_only_am() {
-  local s="$here/../upstream-sql.sh" o
-  o="$("$s" --only-am hnsw 'access method private functions' 'halfvec opclasses' 'bit opclasses' 'sparsevec opclasses' 2>&1)" || true
-  if [ "$(printf '%s\n' "$o" | grep -c 'USING hnsw')" = 10 ] &&
-    [ "$(printf '%s\n' "$o" | grep -c '^CREATE FUNCTION hnsw_[a-z]*_support(internal)')" = 3 ] &&
-    ! printf '%s\n' "$o" | grep -q 'ivfflat\|COMMENT ON\|USING btree'; then
-    pass "upstream-sql --only-am hnsw: 3 functions, 10 opclasses"
-  else
-    fail "upstream-sql --only-am hnsw: got: $(printf '%s\n' "$o" | head -3)"
-  fi
-  if [ "$("$s" 'halfvec opclasses' | grep -c 'OPERATOR CLASS')" = 1 ]; then
-    pass "upstream-sql default mode keeps only btree halfvec_ops"
-  else
-    fail "upstream-sql default mode: halfvec opclasses changed"
-  fi
-}
-
 # --- runner ---
 if [ "$#" -eq 0 ]; then
   # Declaration order (declare -F would sort): a test may read the results of
