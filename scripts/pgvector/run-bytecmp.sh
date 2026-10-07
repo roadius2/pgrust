@@ -19,10 +19,12 @@
 #
 # The oracle is $PG_VEC_SEEDED (see common.sh): stock C pgvector does not seed
 # its level RNG at all (SeedRandom(42) sits under #ifdef HNSW_MEMORY), so only
-# that build is deterministic. Data are integer-valued so float math is exact
-# or rounds once (identical under FMA and reassociation). Every case runs in its
-# own session; insert_* cases build and then insert in ONE session, because
-# on-disk inserts draw levels from the stream the build left behind.
+# that build is deterministic. Data are mostly integer-valued so float math is
+# exact or rounds once (identical under FMA and reassociation); the non-integer
+# cases (sparsevec_l2_frac and the cosine cases) say in their comments why C
+# and pgrust round alike. Every case runs in its own session; insert_* cases
+# build and then insert in ONE session, because on-disk inserts draw levels
+# from the stream the build left behind.
 set -euo pipefail
 . "$(dirname "$0")/common.sh"
 
@@ -140,7 +142,7 @@ CREATE INDEX $1_idx ON $1 USING hnsw (v $ops);
 SQL
       ;;
     sparsevec_l2_grid | sparsevec_cosine_grid)
-      # 0 to 3 non-zeros per row. Cosine: the normalized values' inner
+      # 1 to 3 non-zeros per row. Cosine: the normalized values' inner
       # products fuse on arm64 in C and in pgrust alike.
       local ops=sparsevec_l2_ops grid="$GRID3"
       if [ "$1" = sparsevec_cosine_grid ]; then ops=sparsevec_cosine_ops; grid="$GRID3_POS"; fi
@@ -161,12 +163,15 @@ CREATE INDEX $1_idx ON $1 USING hnsw (v sparsevec_l2_ops);
 SQL
       ;;
     insert_sparsevec_cosine)
-      # Inserts after the build normalize on the on-disk path.
+      # Inserts after the build normalize on the on-disk path. The last row
+      # loses an element when normalized (Review Focus 2): 1e-30/3e38
+      # underflows in f32, so both sides store {1:1}/3.
       cat <<SQL
 CREATE TABLE $1 (id int, v sparsevec(3));
 INSERT INTO $1 SELECT i, $GRID3_POS::vector::sparsevec FROM generate_series(1, 800) i;
 CREATE INDEX $1_idx ON $1 USING hnsw (v sparsevec_cosine_ops);
 INSERT INTO $1 SELECT i, $GRID3_POS::vector::sparsevec FROM generate_series(801, 1000) i;
+INSERT INTO $1 VALUES (1001, '{1:3e38,3:1e-30}/3');
 SQL
       ;;
     wide_sparsevec)

@@ -128,29 +128,58 @@ fn lookup(function: &str) -> Option<PGFunction> {
         "hamming_distance" => bitvec::fc_hamming_distance,
         "jaccard_distance" => bitvec::fc_jaccard_distance,
         "hnswhandler" => fc_hnswhandler,
-        "hnsw_halfvec_support" | "hnsw_bit_support" | "hnsw_sparsevec_support" => fc_hnsw_type_support,
+        "hnsw_halfvec_support" => fc_hnsw_halfvec_support,
+        "hnsw_bit_support" => fc_hnsw_bit_support,
+        "hnsw_sparsevec_support" => fc_hnsw_sparsevec_support,
         _ => return None,
     })
 }
 
-// CREATE FUNCTION validation target only; the closed AM set dispatches via
-// IndexAmKind, never through fmgr.
+// The error a symbol pgrust never calls through fmgr raises if a superuser
+// binds it to a callable signature (CREATE FUNCTION f(int) RETURNS int AS
+// '$libdir/vector', 'hnsw_bit_support' LANGUAGE C).
+fn not_called_through_fmgr(symbol: &str, resolved_by: &str) -> types_error::PgResult<datum::Datum> {
+    Err(types_error::PgError::error(format!("{symbol} is resolved by {resolved_by}, never called through fmgr"))
+        .with_sqlstate(types_error::ERRCODE_INTERNAL_ERROR)
+        .into())
+}
+
+// hnswhandler (hnsw.c:266-401): a CREATE FUNCTION validation target only;
+// the closed AM set dispatches via IndexAmKind, never through fmgr.
+// DIVERGENCE: C returns its IndexAmRoutine when called; pgrust raises.
 fn fc_hnswhandler(
     _f: Option<&mut types_fmgr::FmgrInfo>,
     _fcinfo: &mut types_fmgr::FunctionCallInfoBaseData,
 ) -> types_error::PgResult<datum::Datum> {
-    panic!("hnswhandler: the closed AM set dispatches via IndexAmKind, never through fmgr")
+    not_called_through_fmgr("hnswhandler", "its access method")
 }
 
-// CREATE FUNCTION validation targets only: pgvector_hnsw resolves an
-// opclass's support proc 3 by its C symbol to a static HnswTypeInfo
-// (hnsw_get_type_info, spec §5.4), never through fmgr. SQL cannot call
-// them, because their only argument is `internal`.
-fn fc_hnsw_type_support(
+// hnsw_halfvec_support, hnsw_bit_support and hnsw_sparsevec_support
+// (hnswutils.c:1418-1458): CREATE FUNCTION validation targets only.
+// pgvector_hnsw resolves an opclass's support proc 3 by its C symbol to a
+// static HnswTypeInfo (hnsw_get_type_info, spec §5.4), never through fmgr,
+// and SQL cannot call them through their `internal` signature.
+// DIVERGENCE: C returns a pointer to its static HnswTypeInfo when called;
+// pgrust raises.
+fn fc_hnsw_halfvec_support(
     _f: Option<&mut types_fmgr::FmgrInfo>,
     _fcinfo: &mut types_fmgr::FunctionCallInfoBaseData,
 ) -> types_error::PgResult<datum::Datum> {
-    panic!("hnsw_*_support: pgvector_hnsw resolves support proc 3 by symbol, never through fmgr")
+    not_called_through_fmgr("hnsw_halfvec_support", "symbol")
+}
+
+fn fc_hnsw_bit_support(
+    _f: Option<&mut types_fmgr::FmgrInfo>,
+    _fcinfo: &mut types_fmgr::FunctionCallInfoBaseData,
+) -> types_error::PgResult<datum::Datum> {
+    not_called_through_fmgr("hnsw_bit_support", "symbol")
+}
+
+fn fc_hnsw_sparsevec_support(
+    _f: Option<&mut types_fmgr::FmgrInfo>,
+    _fcinfo: &mut types_fmgr::FunctionCallInfoBaseData,
+) -> types_error::PgResult<datum::Datum> {
+    not_called_through_fmgr("hnsw_sparsevec_support", "symbol")
 }
 
 pub fn init_seams() {
@@ -193,6 +222,18 @@ mod tests {
                    CREATE FUNCTION vector_in(cstring) RETURNS vector\n\tAS 'MODULE_PATHNAME' LANGUAGE C;\n\n\
                    CREATE AGGREGATE avg(vector) (SFUNC = vector_accum, STYPE = double precision[]);";
         assert_eq!(module_pathname_symbols(sql), vec!["halfvec_l2_distance", "vector_in"]);
+    }
+
+    // The symbols resolved outside fmgr raise when called, never panic.
+    #[test]
+    fn fmgr_stubs_raise_internal_error() {
+        for symbol in ["hnswhandler", "hnsw_halfvec_support", "hnsw_bit_support", "hnsw_sparsevec_support"] {
+            let f = super::lookup(symbol).unwrap();
+            let mut fc = types_fmgr::LocalFcinfo::<0>::new(0);
+            let e = f(None, &mut fc).unwrap_err();
+            assert_eq!(e.sqlstate(), types_error::ERRCODE_INTERNAL_ERROR, "{symbol}");
+            assert!(e.message().starts_with(&format!("{symbol} is resolved by ")), "{symbol}: {}", e.message());
+        }
     }
 
     // Spec §4.6: CREATE EXTENSION stops at the first CREATE FUNCTION whose

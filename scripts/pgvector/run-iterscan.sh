@@ -93,8 +93,10 @@ query_sql() {
     halfvec_l2) echo "SELECT i FROM hv WHERE i % 100 = 0 ORDER BY v <-> '[1000,1000,1000]' LIMIT 11" ;;
     halfvec_cosine) echo "SELECT i FROM hv WHERE i % 100 = 0 ORDER BY v <=> '[1,2,3]' LIMIT 11" ;;
     sparsevec_l2) echo "SELECT i FROM sv WHERE i % 100 = 0 ORDER BY v <-> '{1:1000,2:1000,3:1000}/3' LIMIT 11" ;;
-    # 1e-30 normalizes to zero: sparsevec_l2_normalize's zero-dropping
-    # path, charged to tmpCtx as two vectors and a pfree (Review Focus 2).
+    # 1e-30 normalizes to zero, so the query exercises
+    # sparsevec_l2_normalize's zero-dropping path (Review Focus 2). The trace
+    # is KB-granular, and a kept zero entry would give the same results;
+    # charge_norm_value_matches_c pins the exact charge sequence.
     sparsevec_cosine_drop) echo "SELECT i FROM sv WHERE i % 100 = 0 ORDER BY v <=> '{1:3e38,3:1e-30}/3' LIMIT 11" ;;
     bit_hamming) echo "SELECT i FROM bv WHERE i % 100 = 0 ORDER BY v <~> ('x' || substr(md5('q'), 1, 16))::bit(64) LIMIT 11" ;;
     bit_jaccard) echo "SELECT i FROM bv WHERE i % 100 = 0 ORDER BY v <%> ('x' || substr(md5('q'), 1, 16))::bit(64) LIMIT 11" ;;
