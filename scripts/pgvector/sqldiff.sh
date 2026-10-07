@@ -14,6 +14,17 @@ set -euo pipefail
 . "$(dirname "$0")/common.sh"
 
 usage() { die "usage: sqldiff.sh {pgrust|ref} [--verbose] <file.sql | ->"; }
+
+# The seeded build (-DHNSW_MEMORY) also prints "memory:" INFO lines for HNSW
+# builds and scans (hnswbuild.c:307, hnswscan.c:128), which stock C and
+# pgrust (without SET pgrust.hnsw_memory) do not. Drop them, and the
+# LOCATION line --verbose adds, before comparing.
+strip_hnsw_memory() {
+  awk '/INFO:  (00000: )?memory: / { skip = 1; next }
+    skip && /^LOCATION:  / { skip = 0; next }
+    { skip = 0; print }' "$1" >"$1.tmp"
+  mv "$1.tmp" "$1"
+}
 [ "$#" -ge 2 ] || usage
 mode="$1"
 shift
@@ -44,6 +55,7 @@ for side in ref "$subject"; do
   assert_identity "$side" "$port"
   pgv_psql "$port" -c 'CREATE EXTENSION vector' >/dev/null
   (cd "$out" && pgv_psql "$port" -a -v ON_ERROR_STOP=0 -f input.sql) >"$out/$side.out" 2>&1 || true
+  strip_hnsw_memory "$out/$side.out"
   server_stop "$side"
   [ "${PGV_KEEP_DATA:-}" = 1 ] || rm -rf "$out/data/$side"
 done

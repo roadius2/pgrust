@@ -850,6 +850,7 @@ fn init_build_state<'a, 'g, 'mcx>(
     if dimensions < 0 {
         return Err(PgError::error("column does not have dimensions")
             .with_sqlstate(ERRCODE_INVALID_PARAMETER_VALUE)
+            .with_location("hnswbuild.c", 709, "InitBuildState")
             .into());
     }
     if dimensions > max_dims {
@@ -857,12 +858,14 @@ fn init_build_state<'a, 'g, 'mcx>(
             "column cannot have more than {max_dims} dimensions for hnsw index"
         ))
         .with_sqlstate(ERRCODE_PROGRAM_LIMIT_EXCEEDED)
+        .with_location("hnswbuild.c", 714, "InitBuildState")
         .into());
     }
     if ef_construction < 2 * m {
         return Err(
             PgError::error("ef_construction must be greater than or equal to 2 * m")
                 .with_sqlstate(ERRCODE_INVALID_PARAMETER_VALUE)
+                .with_location("hnswbuild.c", 719, "InitBuildState")
                 .into(),
         );
     }

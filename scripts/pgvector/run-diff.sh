@@ -76,6 +76,14 @@ else
   r=FAIL
 fi
 printf 'error_locations\t%s\n' "$r" | tee -a "$out/summary.tsv"
+# HNSW's error sites, every type (M1 Review Focus 2: a wrong-dimension query
+# errors even on an empty index).
+if "$here/sqldiff.sh" "$mode" --verbose "$here/sql/hnsw-errors.sql" >"$out/hnsw-errors.log" 2>&1; then
+  r=ok
+else
+  r=FAIL
+fi
+printf 'hnsw_errors\t%s\n' "$r" | tee -a "$out/summary.tsv"
 
 total=$(wc -l <"$out/summary.tsv" | tr -d ' ')
 passed=$(grep -c $'\tok$' "$out/summary.tsv" || true)
