@@ -6,7 +6,7 @@ use bufmgr::{
 use datum::Datum;
 use mcx::{Mcx, PgVec};
 use pairingheap::PairingHeap;
-use types_core::{BlockNumber, Buffer, ForkNumber, Oid};
+use types_core::{BlockNumber, Buffer, ForkNumber, InvalidOid, Oid};
 use types_error::{PgError, PgResult};
 use types_hnsw::*;
 use types_rel::Relation;
@@ -63,30 +63,98 @@ pub fn init_support(index: &Relation<'_>) -> PgResult<HnswSupport> {
     })
 }
 
-// HnswGetTypeInfo: proc 3 (halfvec/bit/sparsevec) is unported — vector only.
-// Unreachable through the trimmed vector--0.8.5.sql (no such opclasses), but
-// error rather than panic if a foreign catalog ever presents one.
-pub fn check_type_supported(index: &Relation<'_>) -> PgResult<i32> {
-    if index_getprocid(index, HNSW_TYPE_INFO_PROC) != 0 {
-        return Err(PgError::error(
-            "hnsw type-info opclasses (halfvec/bit/sparsevec) are not supported",
-        )
-        .with_sqlstate(types_error::ERRCODE_FEATURE_NOT_SUPPORTED)
+// HnswGetTypeInfo's default, no proc 3 (hnswutils.c:1403-1412): the
+// vector opclasses.
+pub static VECTOR_TYPE_INFO: HnswTypeInfo = HnswTypeInfo {
+    max_dimensions: HNSW_MAX_DIM as i32,
+    dimensions: pgvector::funcs::fc_vector_dims,
+    normalize: Some(pgvector::funcs::fc_l2_normalize),
+    check_value: None,
+};
+
+// hnsw_halfvec_support (hnswutils.c:1418-1430).
+pub static HALFVEC_TYPE_INFO: HnswTypeInfo = HnswTypeInfo {
+    max_dimensions: HNSW_MAX_DIM as i32 * 2,
+    dimensions: pgvector::halfvec::fc_halfvec_vector_dims,
+    normalize: Some(pgvector::halfvec::fc_halfvec_l2_normalize),
+    check_value: None,
+};
+
+// hnsw_bit_support (hnswutils.c:1432-1444): dimensions is varbit.c's
+// bitlength.
+pub static BIT_TYPE_INFO: HnswTypeInfo = HnswTypeInfo {
+    max_dimensions: HNSW_MAX_DIM as i32 * 32,
+    dimensions: adt_varbit::fc_bitlength,
+    normalize: None,
+    check_value: None,
+};
+
+// hnsw_sparsevec_support (hnswutils.c:1446-1458).
+pub static SPARSEVEC_TYPE_INFO: HnswTypeInfo = HnswTypeInfo {
+    max_dimensions: pgvector::sparsevec::SPARSEVEC_MAX_DIM,
+    dimensions: pgvector::sparsevec::fc_sparsevec_vector_dims,
+    normalize: Some(pgvector::sparsevec::fc_sparsevec_l2_normalize),
+    check_value: Some(sparsevec_check_value),
+};
+
+// SparsevecCheckValue (hnswutils.c:1384-1393).
+fn sparsevec_check_value(img: &[u8]) -> PgResult<()> {
+    let v = pgvector::sparsevec::SparseView::from_payload(&img[4..])?;
+    if v.nnz() > HNSW_MAX_NNZ as usize {
+        return Err(PgError::error(format!(
+            "sparsevec cannot have more than {HNSW_MAX_NNZ} non-zero elements for hnsw index"
+        ))
+        .with_sqlstate(types_error::ERRCODE_PROGRAM_LIMIT_EXCEEDED)
+        .with_location("hnswutils.c", 1392, "SparsevecCheckValue")
         .into());
     }
-    Ok(HNSW_MAX_DIM as i32)
+    Ok(())
 }
 
-// HnswCheckDim (hnswutils.c:1366-1374, pgvector 0.8.7). typeInfo->dimensions
-// is vector_dims for the vector opclasses (hnswutils.c:1407); the halfvec/
-// bit/sparsevec type info arrives in M3.
-pub fn hnsw_check_dim(expected: i32, collation: Oid, value: Datum) -> PgResult<()> {
-    let dim = types_fmgr::fcinfo::direct_function_call1_coll(
-        pgvector::funcs::fc_vector_dims,
-        collation,
-        value,
-    )?
-    .as_i32();
+// The type info a support proc 3 names, by its C symbol. C calls the proc
+// and gets a pointer to its static HnswTypeInfo; pgrust maps the symbol to
+// the same static table, as amapi resolves hnswhandler (spec §5.4), so the
+// hnsw_*_support functions are never called through fmgr.
+pub fn hnsw_type_info_for_symbol(symbol: &str) -> Option<&'static HnswTypeInfo> {
+    Some(match symbol {
+        "hnsw_halfvec_support" => &HALFVEC_TYPE_INFO,
+        "hnsw_bit_support" => &BIT_TYPE_INFO,
+        "hnsw_sparsevec_support" => &SPARSEVEC_TYPE_INFO,
+        _ => return None,
+    })
+}
+
+// HnswGetTypeInfo (hnswutils.c:1398-1416). The symbol is pg_proc.prosrc,
+// what C's fmgr looks up in the library.
+// DIVERGENCE: C calls any proc 3 and trusts the pointer it returns; pgrust
+// knows only pgvector's three support functions and raises otherwise.
+pub fn hnsw_get_type_info(index: &Relation<'_>) -> PgResult<&'static HnswTypeInfo> {
+    let procid = index_getprocid(index, HNSW_TYPE_INFO_PROC);
+    if procid == InvalidOid {
+        return Ok(&VECTOR_TYPE_INFO);
+    }
+    let cx = mcx::MemoryContext::new("hnsw type info");
+    let prosrc = syscache_seams::lookup_pg_proc_prosrc::call(cx.mcx(), procid)?;
+    let symbol = prosrc.as_ref().map(|s| s.as_str()).unwrap_or("");
+    hnsw_type_info_for_symbol(symbol).ok_or_else(|| {
+        PgError::error(format!(
+            "hnsw type support function \"{symbol}\" of index \"{}\" is not supported",
+            index.name()
+        ))
+        .with_sqlstate(types_error::ERRCODE_FEATURE_NOT_SUPPORTED)
+        .into()
+    })
+}
+
+// HnswCheckDim (hnswutils.c:1365-1374, pgvector 0.8.7).
+pub fn hnsw_check_dim(
+    expected: i32,
+    type_info: &HnswTypeInfo,
+    collation: Oid,
+    value: Datum,
+) -> PgResult<()> {
+    let dim = types_fmgr::fcinfo::direct_function_call1_coll(type_info.dimensions, collation, value)?
+        .as_i32();
     if dim != expected {
         return Err(PgError::error(format!("expected {expected} dimensions, not {dim}"))
             .with_sqlstate(types_error::ERRCODE_DATA_EXCEPTION)
@@ -94,6 +162,34 @@ pub fn hnsw_check_dim(expected: i32, collation: Oid, value: Datum) -> PgResult<(
             .into());
     }
     Ok(())
+}
+
+// HnswNormValue (hnswutils.c:164-168): the type's normalize function on a
+// detoasted image; the result is a fresh image in `mcx`.
+// DIVERGENCE: C calls a NULL normalize (bit given a norm proc by a
+// hand-written opclass) and crashes; pgrust raises instead.
+pub fn hnsw_norm_value<'m>(
+    type_info: &HnswTypeInfo,
+    collation: Oid,
+    mcx: Mcx<'m>,
+    img: &[u8],
+) -> PgResult<PgVec<'m, u8>> {
+    let Some(normalize) = type_info.normalize else {
+        return Err(PgError::error("hnsw type info has no normalize function").into());
+    };
+    let d = types_fmgr::fcinfo::direct_function_call1_coll_in(
+        normalize,
+        collation,
+        mcx,
+        Datum::from_usize(img.as_ptr() as usize),
+    )?;
+    let p = d.as_usize() as *const u8;
+    // SAFETY: the normalize functions return a 4-byte-header varlena image
+    // allocated in `mcx`.
+    let out = unsafe { core::slice::from_raw_parts(p, types_tuple::varatt::varsize_any(p)) };
+    let mut v: PgVec<'m, u8> = mcx::vec_with_capacity_in_infallible(mcx, out.len());
+    let _ = mcx::vec_append_bytes(&mut v, out);
+    Ok(v)
 }
 
 #[inline]
@@ -1118,20 +1214,132 @@ pub fn heaptid_valid(t: &ItemPointerData) -> bool {
 mod tests {
     use super::*;
 
-    // HnswCheckDim (hnswutils.c:1366-1374): ERRCODE_DATA_EXCEPTION, C's text.
+    use pgvector::halfutils::{float4_to_half_unchecked, half_to_float4};
+    use pgvector::halfvec::{HalfBuilder, HalfView};
+    use pgvector::sparsevec::{SparseBuilder, SparseView};
+    use pgvector::vec::{VecBuilder, VecView};
+    use types_core::InvalidOid;
+
+    // A bit(len) varlena image: 4-byte header, i32 bit length, the bytes.
+    fn bit_image(bits: &[u8], len: i32) -> Vec<u8> {
+        let mut img = vec![0u8; 8 + bits.len()];
+        let hdr = ((img.len() as u32) << 2).to_ne_bytes();
+        img[0..4].copy_from_slice(&hdr);
+        img[4..8].copy_from_slice(&len.to_ne_bytes());
+        img[8..].copy_from_slice(bits);
+        img
+    }
+
+    fn sparse<'m>(m: Mcx<'m>, dim: i32, idx: &[i32], vals: &[f32]) -> PgVec<'m, u8> {
+        let mut b = SparseBuilder::new(m, dim, idx.len()).unwrap();
+        for (i, (x, v)) in idx.iter().zip(vals).enumerate() {
+            b.set_index(i, *x);
+            b.set_value(i, *v);
+        }
+        b.image()
+    }
+
+    // HnswGetTypeInfo's tables (hnswutils.c:1398-1458): max dimensions, and
+    // which types normalize and check values. Only pgvector's three support
+    // symbols resolve (Review Focus 4).
+    #[test]
+    fn type_info_resolves_only_pgvector_symbols() {
+        assert_eq!(VECTOR_TYPE_INFO.max_dimensions, 2000);
+        assert!(VECTOR_TYPE_INFO.normalize.is_some() && VECTOR_TYPE_INFO.check_value.is_none());
+        let h = hnsw_type_info_for_symbol("hnsw_halfvec_support").unwrap();
+        assert!(core::ptr::eq(h, &HALFVEC_TYPE_INFO));
+        assert_eq!(h.max_dimensions, 4000);
+        assert!(h.normalize.is_some() && h.check_value.is_none());
+        let b = hnsw_type_info_for_symbol("hnsw_bit_support").unwrap();
+        assert!(core::ptr::eq(b, &BIT_TYPE_INFO));
+        assert_eq!(b.max_dimensions, 64000);
+        assert!(b.normalize.is_none() && b.check_value.is_none());
+        let s = hnsw_type_info_for_symbol("hnsw_sparsevec_support").unwrap();
+        assert!(core::ptr::eq(s, &SPARSEVEC_TYPE_INFO));
+        assert_eq!(s.max_dimensions, 1_000_000_000);
+        assert!(s.normalize.is_some() && s.check_value.is_some());
+        for other in ["hnswhandler", "ivfflat_halfvec_support", "textin", ""] {
+            assert!(hnsw_type_info_for_symbol(other).is_none(), "{other}");
+        }
+    }
+
+    // HnswCheckDim (hnswutils.c:1365-1374) through each type's dimensions
+    // function: ERRCODE_DATA_EXCEPTION and C's text. Its build and insert
+    // calls are unreachable from SQL, so these pin them.
     #[test]
     fn hnsw_check_dim_matches_c() {
         let ctx = mcx::MemoryContext::new("hnsw-test");
         let m = ctx.mcx();
-        let mut b = pgvector::vec::VecBuilder::new(m, 2).unwrap();
-        b.set(0, 1.0);
-        b.set(1, 2.0);
-        let img = b.image();
-        let d = Datum::from_usize(img.as_ptr() as usize);
-        assert!(hnsw_check_dim(2, types_core::InvalidOid, d).is_ok());
-        let e = hnsw_check_dim(3, types_core::InvalidOid, d).unwrap_err();
-        assert_eq!(e.message(), "expected 3 dimensions, not 2");
-        assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_EXCEPTION);
+        let vimg = VecBuilder::new(m, 2).unwrap().image();
+        let himg = HalfBuilder::new(m, 2).unwrap().image();
+        let simg = sparse(m, 2, &[1], &[1.0]);
+        let bimg = bit_image(&[0b1100_0000], 2);
+        let typed: [(&HnswTypeInfo, &[u8]); 4] = [
+            (&VECTOR_TYPE_INFO, &vimg[..]),
+            (&HALFVEC_TYPE_INFO, &himg[..]),
+            (&SPARSEVEC_TYPE_INFO, &simg[..]),
+            (&BIT_TYPE_INFO, &bimg[..]),
+        ];
+        for (info, img) in typed {
+            let d = Datum::from_usize(img.as_ptr() as usize);
+            assert!(hnsw_check_dim(2, info, InvalidOid, d).is_ok());
+            let e = hnsw_check_dim(3, info, InvalidOid, d).unwrap_err();
+            assert_eq!(e.message(), "expected 3 dimensions, not 2");
+            assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_EXCEPTION);
+        }
+    }
+
+    // SparsevecCheckValue (hnswutils.c:1384-1393): at most HNSW_MAX_NNZ
+    // non-zero elements (Review Focus 3).
+    #[test]
+    fn sparsevec_check_value_caps_at_1000() {
+        let ctx = mcx::MemoryContext::new("hnsw-test");
+        let m = ctx.mcx();
+        let of = |nnz: usize| {
+            let idx: Vec<i32> = (0..nnz as i32).collect();
+            sparse(m, 2000, &idx, &vec![1.0; nnz])
+        };
+        let check = SPARSEVEC_TYPE_INFO.check_value.unwrap();
+        assert!(check(&of(1000)).is_ok());
+        let e = check(&of(1001)).unwrap_err();
+        assert_eq!(e.message(), "sparsevec cannot have more than 1000 non-zero elements for hnsw index");
+        assert_eq!(e.sqlstate(), types_error::ERRCODE_PROGRAM_LIMIT_EXCEEDED);
+    }
+
+    // HnswNormValue (hnswutils.c:164-168) dispatches to each type's
+    // l2_normalize. sparsevec drops elements that normalize to zero
+    // (sparsevec.c:1130-1154, Review Focus 2); bit has no normalize.
+    #[test]
+    fn hnsw_norm_value_dispatches_by_type() {
+        let ctx = mcx::MemoryContext::new("hnsw-test");
+        let m = ctx.mcx();
+        let mut v = VecBuilder::new(m, 2).unwrap();
+        v.set(0, 3.0);
+        v.set(1, 4.0);
+        let out = hnsw_norm_value(&VECTOR_TYPE_INFO, InvalidOid, m, &v.image()).unwrap();
+        let view = VecView::from_payload(&out[4..]).unwrap();
+        assert_eq!((view.x(0), view.x(1)), (0.6, 0.8));
+
+        let mut h = HalfBuilder::new(m, 2).unwrap();
+        h.set(0, float4_to_half_unchecked(3.0));
+        h.set(1, float4_to_half_unchecked(4.0));
+        let out = hnsw_norm_value(&HALFVEC_TYPE_INFO, InvalidOid, m, &h.image()).unwrap();
+        let view = HalfView::from_payload(&out[4..]).unwrap();
+        assert_eq!((view.x(0), view.x(1)), (float4_to_half_unchecked(0.6), float4_to_half_unchecked(0.8)));
+        assert_eq!(half_to_float4(view.x(0)), 0.600_097_66);
+
+        let out = hnsw_norm_value(&SPARSEVEC_TYPE_INFO, InvalidOid, m, &sparse(m, 2, &[0, 1], &[3.0, 4.0])).unwrap();
+        let view = SparseView::from_payload(&out[4..]).unwrap();
+        assert_eq!((view.nnz(), view.value(0), view.value(1)), (2, 0.6, 0.8));
+        // 1e-30 / 3e38 underflows to zero, so normalization drops it.
+        let input = sparse(m, 3, &[0, 2], &[3e38, 1e-30]);
+        let out = hnsw_norm_value(&SPARSEVEC_TYPE_INFO, InvalidOid, m, &input).unwrap();
+        let view = SparseView::from_payload(&out[4..]).unwrap();
+        assert_eq!((view.nnz(), view.index(0), view.value(0)), (1, 0, 1.0));
+        assert_eq!(out.len(), input.len() - 8);
+
+        let e = hnsw_norm_value(&BIT_TYPE_INFO, InvalidOid, m, &bit_image(&[0x80], 1)).unwrap_err();
+        assert_eq!(e.message(), "hnsw type info has no normalize function");
     }
 
     // pairingheap_first is the comparator's maximum: C pops the nearest

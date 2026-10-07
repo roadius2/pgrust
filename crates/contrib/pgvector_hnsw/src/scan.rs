@@ -63,7 +63,8 @@ pub fn hnswbeginscan<'mcx>(
     nkeys: i32,
     norderbys: i32,
 ) -> PgResult<IndexScanDescData<'mcx>> {
-    check_type_supported(index)?;
+    // hnswscan.c:145.
+    let type_info = hnsw_get_type_info(index)?;
     let support = init_support(index)?;
     let max_memory = (init_small::globals::work_mem() as f64
         * guc_tables::vars::hnsw_scan_mem_multiplier.read()
@@ -82,8 +83,7 @@ pub fn hnswbeginscan<'mcx>(
         tmp_ctx: AllocSetModel::new(0, 8 * 1024, 256 * 1024),
         value: None,
         support,
-        max_dimensions: HNSW_MAX_DIM as i32,
-        norm_is_l2: false,
+        type_info,
         w: Vec::new(),
         w_list: ListShape::NIL,
         visited: None,
@@ -147,12 +147,15 @@ pub fn hnswendscan(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
     Ok(())
 }
 
-// GetScanValue: detoast, then normalize for cosine-family opclasses.
-// Scratch goes in a local bump (C allocates in tmpCtx); the returned image
-// is owned so it frees at the next rescan.
+// GetScanValue (hnswscan.c:97-119): detoast, then HnswNormValue for
+// opclasses with a norm proc. Scratch goes in a local bump; the returned
+// image is owned so it frees at the next rescan. C normalizes in tmpCtx,
+// so the normalize function's allocations are charged to the model.
 fn get_scan_value(
-    support: &mut HnswSupport,
+    type_info: &HnswTypeInfo,
+    support: &HnswSupport,
     orderby: &ScanKeyData,
+    tmp_ctx: &mut AllocSetModel,
 ) -> PgResult<Option<Vec<u8>>> {
     if orderby.sk_flags & SK_ISNULL != 0 {
         return Ok(None);
@@ -161,41 +164,31 @@ fn get_scan_value(
     let tmcx = tmp.mcx();
     let d = orderby.sk_argument;
     let p = d.as_usize() as *const u8;
-    // SAFETY: non-null vector varlena datum.
+    // SAFETY: non-null varlena datum.
     let raw = unsafe {
         core::slice::from_raw_parts(p, types_tuple::varatt::varsize_any(p))
     };
     let flat = detoast::detoast_attr(tmcx, raw)?;
 
     if support.normprocinfo.is_some() {
-        let normed = norm_value(tmcx, &flat)?;
+        let normed = hnsw_norm_value(type_info, support.collation, tmcx, &flat)?;
+        charge_norm_value(tmp_ctx, flat.len(), normed.len());
         return Ok(Some(normed.to_vec()));
     }
     Ok(Some(flat.to_vec()))
 }
 
-// HnswNormValue for the vector opclasses: l2_normalize applied in place.
-pub fn norm_value<'m>(mcx: Mcx<'m>, img: &[u8]) -> PgResult<PgVec<'m, u8>> {
-    let v = pgvector::vec::VecView::from_payload(&img[4..])?;
-    let mut b = pgvector::vec::VecBuilder::new(mcx, v.dim())?;
-    let mut norm = 0.0f64;
-    for x in v.iter() {
-        norm += x as f64 * x as f64;
+// HnswNormValue's allocations in tmpCtx (hnswscan.c:115): the normalize
+// function pallocs a result the size of its input (InitVector,
+// InitHalfVector, InitSparseVector); sparsevec_l2_normalize, when elements
+// normalize to zero, pallocs a smaller vector and pfrees the first
+// (sparsevec.c:1133, 1151).
+fn charge_norm_value(tmp_ctx: &mut AllocSetModel, in_len: usize, out_len: usize) {
+    tmp_ctx.palloc(in_len);
+    if out_len != in_len {
+        tmp_ctx.palloc(out_len);
+        tmp_ctx.pfree(in_len);
     }
-    norm = norm.sqrt();
-    if norm > 0.0 {
-        for i in 0..v.dim() {
-            b.set(i, (v.x(i) as f64 / norm) as f32);
-        }
-        for i in 0..v.dim() {
-            if b.get(i).is_infinite() {
-                return Err(PgError::error("value out of range: overflow")
-                    .with_sqlstate(types_error::ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE)
-                    .into());
-            }
-        }
-    }
-    Ok(b.image())
 }
 
 // Reloption invariants the rest of the HNSW code assumes, matching pgvector's
@@ -252,6 +245,7 @@ fn get_scan_items(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
     if let Some(v) = so.value.as_ref() {
         hnsw_check_dim(
             meta.dimensions as i32,
+            so.type_info,
             so.support.collation,
             Datum::from_usize(v.as_ptr() as usize),
         )?;
@@ -424,15 +418,7 @@ pub fn hnswgettuple(
                 IndexScanOpaque::Hnsw(so) => &mut **so,
                 _ => unreachable!(),
             };
-            let mut support = so.support.clone();
-            so.value = get_scan_value(&mut support, &orderby)?;
-            so.support = support;
-            // HnswNormValue's palloc0(VECTOR_SIZE(dim)) in tmpCtx (hnswscan.c:115).
-            if so.support.normprocinfo.is_some() {
-                if let Some(v) = so.value.as_ref() {
-                    so.tmp_ctx.palloc(v.len());
-                }
-            }
+            so.value = get_scan_value(so.type_info, &so.support, &orderby, &mut so.tmp_ctx)?;
         }
 
         lmgr::LockPage(&index, HNSW_SCAN_LOCK, types_storage::lock::ShareLock)?;
@@ -546,5 +532,22 @@ mod tests {
             assert!(!parse_show_memory(Some(v.to_string())), "{v}");
         }
         assert!(!parse_show_memory(None));
+    }
+
+    // GetScanValue's normalization charges: InitVector, InitHalfVector or
+    // InitSparseVector of the input's size; on sparsevec_l2_normalize's
+    // zero-dropping path, a second InitSparseVector and a pfree of the first
+    // (sparsevec.c:1133, 1151).
+    #[test]
+    fn charge_norm_value_matches_c() {
+        let mut got = AllocSetModel::new(0, 8 * 1024, 256 * 1024);
+        let mut want = got.clone();
+        charge_norm_value(&mut got, 20, 20);
+        want.palloc(20);
+        charge_norm_value(&mut got, 32, 24);
+        want.palloc(32);
+        want.palloc(24);
+        want.pfree(32);
+        assert_eq!(format!("{got:?}"), format!("{want:?}"));
     }
 }

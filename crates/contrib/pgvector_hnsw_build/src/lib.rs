@@ -10,7 +10,7 @@ use pgvector_hnsw::insert::{form_index_value, insert_tuple_on_disk, random_level
 use pgvector_hnsw::layout::*;
 use pgvector_hnsw::utils::*;
 use types_core::{BlockNumber, Buffer, ForkNumber};
-use types_error::{PgError, PgResult, ERRCODE_INVALID_PARAMETER_VALUE, ERRCODE_PROGRAM_LIMIT_EXCEEDED, NOTICE};
+use types_error::{PgError, PgResult, ERRCODE_FEATURE_NOT_SUPPORTED, ERRCODE_INVALID_PARAMETER_VALUE, ERRCODE_PROGRAM_LIMIT_EXCEEDED, NOTICE};
 use types_hnsw::*;
 use types_rel::Relation;
 use types_storage::bufpage::PageMut;
@@ -69,6 +69,7 @@ struct BuildState<'a, 'g, 'mcx> {
     m: i32,
     ef_construction: i32,
     dimensions: i32,
+    type_info: &'static HnswTypeInfo,
     ml: f64,
     max_level: i32,
     support: HnswSupport,
@@ -760,18 +761,23 @@ fn insert_tuple(
     let tmp = mcx::MemoryContext::new_bump("Hnsw build temporary context");
     let tmcx = tmp.mcx();
     let mut support = bs.support.clone();
-    let Some(img) = form_index_value(tmcx, values[0], &mut support)? else {
+    let Some(img) = form_index_value(tmcx, values[0], bs.type_info, &mut support)? else {
         bs.support = support;
         return Ok(false);
     };
     bs.support = support;
 
     // Check dimensions match index (hnswbuild.c:503-504): the column typmod.
-    hnsw_check_dim(bs.dimensions, bs.support.collation, Datum::from_usize(img.as_ptr() as usize))?;
+    hnsw_check_dim(
+        bs.dimensions,
+        bs.type_info,
+        bs.support.collation,
+        Datum::from_usize(img.as_ptr() as usize),
+    )?;
 
     if bs.graph.flushed {
         let mut support = bs.support.clone();
-        let r = insert_tuple_on_disk(bs.index, &mut support, &img, heaptid, true);
+        let r = insert_tuple_on_disk(bs.index, bs.type_info, &mut support, &img, heaptid, true);
         bs.support = support;
         return r.map(|_| true);
     }
@@ -792,7 +798,7 @@ fn insert_tuple(
             flush_pages(bs)?;
         }
         let mut support = bs.support.clone();
-        let r = insert_tuple_on_disk(bs.index, &mut support, &img, heaptid, true);
+        let r = insert_tuple_on_disk(bs.index, bs.type_info, &mut support, &img, heaptid, true);
         bs.support = support;
         return r.map(|_| true);
     }
@@ -842,20 +848,30 @@ fn init_build_state<'a, 'g, 'mcx>(
     fork_num: ForkNumber,
     gmcx: Mcx<'g>,
 ) -> PgResult<BuildState<'a, 'g, 'mcx>> {
-    let max_dims = check_type_supported(index)?;
+    // InitBuildState (hnswbuild.c:686-745).
+    let type_info = hnsw_get_type_info(index)?;
     let m = hnsw_get_m(index);
     let ef_construction = hnsw_get_ef_construction(index);
     let dimensions = index.rd_att.attr(0).atttypmod;
 
+    // Disallow varbit since require fixed dimensions
+    if index.rd_att.attr(0).atttypid == types_core::VARBITOID {
+        return Err(PgError::error("type not supported for hnsw index")
+            .with_sqlstate(ERRCODE_FEATURE_NOT_SUPPORTED)
+            .with_location("hnswbuild.c", 703, "InitBuildState")
+            .into());
+    }
+    // Require column to have dimensions to be indexed
     if dimensions < 0 {
         return Err(PgError::error("column does not have dimensions")
             .with_sqlstate(ERRCODE_INVALID_PARAMETER_VALUE)
             .with_location("hnswbuild.c", 709, "InitBuildState")
             .into());
     }
-    if dimensions > max_dims {
+    if dimensions > type_info.max_dimensions {
         return Err(PgError::error(format!(
-            "column cannot have more than {max_dims} dimensions for hnsw index"
+            "column cannot have more than {} dimensions for hnsw index",
+            type_info.max_dimensions
         ))
         .with_sqlstate(ERRCODE_PROGRAM_LIMIT_EXCEEDED)
         .with_location("hnswbuild.c", 714, "InitBuildState")
@@ -878,6 +894,7 @@ fn init_build_state<'a, 'g, 'mcx>(
         m,
         ef_construction,
         dimensions,
+        type_info,
         ml: hnsw_get_ml(m),
         max_level: hnsw_get_max_level(m),
         support,

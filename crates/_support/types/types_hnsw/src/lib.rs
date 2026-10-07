@@ -5,10 +5,12 @@ pub mod tmpctx;
 pub use tmpctx::*;
 
 use types_core::{BlockNumber, Oid};
-use types_fmgr::FmgrInfo;
+use types_error::PgResult;
+use types_fmgr::{FmgrInfo, PGFunction};
 use types_tuple::itemptr::ItemPointerData;
 
 pub const HNSW_MAX_DIM: usize = 2000;
+pub const HNSW_MAX_NNZ: i32 = 1000;
 
 pub const HNSW_DISTANCE_PROC: u16 = 1;
 pub const HNSW_NORM_PROC: u16 = 2;
@@ -61,6 +63,17 @@ pub struct HnswSupport {
     pub procinfo: FmgrInfo,
     pub normprocinfo: Option<FmgrInfo>,
     pub collation: Oid,
+}
+
+// HnswTypeInfo (hnsw.h:291-297): what an opclass's support proc 3 returns.
+// `normalize` is None for bit (C's NULL); `check_value` is
+// SparsevecCheckValue for sparsevec and takes the detoasted varlena image
+// (4-byte header).
+pub struct HnswTypeInfo {
+    pub max_dimensions: i32,
+    pub dimensions: PGFunction,
+    pub normalize: Option<PGFunction>,
+    pub check_value: Option<fn(&[u8]) -> PgResult<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -116,8 +129,8 @@ pub struct HnswScanOpaqueData<'mcx> {
     // in hnswrescan/hnswendscan frees them (bounded memory across rescans).
     pub value: Option<Vec<u8>>,
     pub support: HnswSupport,
-    pub max_dimensions: i32,
-    pub norm_is_l2: bool,
+    // so->typeInfo (hnswscan.c:145).
+    pub type_info: &'static HnswTypeInfo,
     pub w: Vec<HnswScanElement>,
     // The allocation shape of the C List so->w in tmpCtx.
     pub w_list: ListShape,

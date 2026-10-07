@@ -791,6 +791,7 @@ pub fn seed_random(seed: u64) {
 // HnswInsertTupleOnDisk. `value` is a detoasted (possibly normalized) image.
 pub fn insert_tuple_on_disk(
     index: &Relation<'_>,
+    type_info: &HnswTypeInfo,
     support: &mut HnswSupport,
     value: &[u8],
     heaptid: &ItemPointerData,
@@ -806,6 +807,7 @@ pub fn insert_tuple_on_disk(
     // Check dimensions match index (hnswinsert.c:716-717).
     crate::utils::hnsw_check_dim(
         meta.dimensions as i32,
+        type_info,
         support.collation,
         Datum::from_usize(value.as_ptr() as usize),
     )?;
@@ -861,18 +863,25 @@ pub fn insert_tuple_on_disk(
     Ok(true)
 }
 
-// HnswFormIndexValue for the vector opclasses: detoast + norm-gate + normalize.
+// HnswFormIndexValue (hnswutils.c:411-433): detoast once, check the value
+// (SparsevecCheckValue for sparsevec), then, for opclasses with a norm proc,
+// skip zero-norm values (HnswCheckNorm) and normalize (HnswNormValue).
 pub fn form_index_value<'m>(
     mcx: Mcx<'m>,
     value: Datum,
+    type_info: &HnswTypeInfo,
     support: &mut HnswSupport,
 ) -> PgResult<Option<PgVec<'m, u8>>> {
     let p = value.as_usize() as *const u8;
-    // SAFETY: non-null vector varlena datum (isnull gated by caller).
+    // SAFETY: non-null varlena datum (isnull gated by caller).
     let raw = unsafe { core::slice::from_raw_parts(p, types_tuple::varatt::varsize_any(p)) };
     let flat = detoast::detoast_attr(mcx, raw)?;
     let mut img: PgVec<'m, u8> = mcx::vec_with_capacity_in_infallible(mcx, flat.len());
     let _ = mcx::vec_append_bytes(&mut img, &flat);
+
+    if let Some(check_value) = type_info.check_value {
+        check_value(&img)?;
+    }
 
     if support.normprocinfo.is_some() {
         // HnswCheckNorm.
@@ -884,7 +893,7 @@ pub fn form_index_value<'m>(
         if !(norm > 0.0) {
             return Ok(None);
         }
-        img = crate::scan::norm_value(mcx, &img)?;
+        img = hnsw_norm_value(type_info, support.collation, mcx, &img)?;
     }
     Ok(Some(img))
 }
@@ -901,15 +910,16 @@ pub fn hnswinsert<'mcx>(
     if isnull.first().copied().unwrap_or(true) {
         return Ok(false);
     }
-    check_type_supported(index)?;
+    // HnswInsertTuple (hnswinsert.c:752-766).
+    let type_info = hnsw_get_type_info(index)?;
     let insert_ctx = mcx::MemoryContext::new_bump("Hnsw insert temporary context");
     let imcx = insert_ctx.mcx();
 
     let mut support = init_support(index)?;
-    let Some(img) = form_index_value(imcx, values[0], &mut support)? else {
+    let Some(img) = form_index_value(imcx, values[0], type_info, &mut support)? else {
         return Ok(false);
     };
-    insert_tuple_on_disk(index, &mut support, &img, heap_tid, false)?;
+    insert_tuple_on_disk(index, type_info, &mut support, &img, heap_tid, false)?;
     Ok(false)
 }
 

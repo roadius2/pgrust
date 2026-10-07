@@ -40,4 +40,6 @@ vacuum_seams = { path = "../../backend/commands/vacuum_seams" }
 xact = { path = "../../backend/access/transam/xact" }
 transam_xlog_seams = { path = "../../backend/access/transam/transam_xlog_seams" }
 pgvector = { path = "../pgvector" }
+adt_varbit = { path = "../../backend/utils/adt/varbit" }
+syscache_seams = { path = "../../backend/utils/cache/syscache_seams" }
 nbtree = { path = "../../backend/access/nbtree/nbtree" }
