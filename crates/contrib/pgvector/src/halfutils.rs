@@ -138,17 +138,18 @@ pub fn float4_to_half(num: f32) -> PgResult<Half> {
     Ok(result)
 }
 
-// Element i of a halfvec's native-endian half array, as a float.
+// The `dim` halves of a halfvec's native-endian array, as floats. Slicing
+// the array once bounds-checks it once per kernel, not once per element.
 #[inline]
-fn hx(x: &[u8], i: usize) -> f32 {
-    half_to_float4(Half::from_ne_bytes([x[2 * i], x[2 * i + 1]]))
+fn half_floats(x: &[u8], dim: usize) -> impl Iterator<Item = f32> + '_ {
+    x[..2 * dim].chunks_exact(2).map(|h| half_to_float4(Half::from_ne_bytes([h[0], h[1]])))
 }
 
 // HalfvecL2SquaredDistanceDefault (halfutils.c:29-43).
 pub fn halfvec_l2_squared_distance(dim: usize, ax: &[u8], bx: &[u8]) -> f32 {
     let mut distance = 0.0f32;
-    for i in 0..dim {
-        let diff = hx(ax, i) - hx(bx, i);
+    for (a, b) in half_floats(ax, dim).zip(half_floats(bx, dim)) {
+        let diff = a - b;
         distance += diff * diff;
     }
     distance
@@ -157,8 +158,8 @@ pub fn halfvec_l2_squared_distance(dim: usize, ax: &[u8], bx: &[u8]) -> f32 {
 // HalfvecInnerProductDefault (halfutils.c:81-91).
 pub fn halfvec_inner_product(dim: usize, ax: &[u8], bx: &[u8]) -> f32 {
     let mut distance = 0.0f32;
-    for i in 0..dim {
-        distance += hx(ax, i) * hx(bx, i);
+    for (a, b) in half_floats(ax, dim).zip(half_floats(bx, dim)) {
+        distance += a * b;
     }
     distance
 }
@@ -168,8 +169,7 @@ pub fn halfvec_cosine_similarity(dim: usize, ax: &[u8], bx: &[u8]) -> f64 {
     let mut similarity = 0.0f32;
     let mut norma = 0.0f32;
     let mut normb = 0.0f32;
-    for i in 0..dim {
-        let (axi, bxi) = (hx(ax, i), hx(bx, i));
+    for (axi, bxi) in half_floats(ax, dim).zip(half_floats(bx, dim)) {
         similarity += axi * bxi;
         norma += axi * axi;
         normb += bxi * bxi;
@@ -181,8 +181,8 @@ pub fn halfvec_cosine_similarity(dim: usize, ax: &[u8], bx: &[u8]) -> f64 {
 // HalfvecL1DistanceDefault (halfutils.c:197-207).
 pub fn halfvec_l1_distance(dim: usize, ax: &[u8], bx: &[u8]) -> f32 {
     let mut distance = 0.0f32;
-    for i in 0..dim {
-        distance += (hx(ax, i) - hx(bx, i)).abs();
+    for (a, b) in half_floats(ax, dim).zip(half_floats(bx, dim)) {
+        distance += (a - b).abs();
     }
     distance
 }
@@ -190,6 +190,54 @@ pub fn halfvec_l1_distance(dim: usize, ax: &[u8], bx: &[u8]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct XorShift(u64);
+
+    impl XorShift {
+        // A random finite half (the kernels never see NaN or infinity:
+        // CheckElement rejects them on input).
+        fn half(&mut self) -> Half {
+            loop {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                let h = self.0 as u16;
+                if !half_is_nan(h) && !half_is_inf(h) {
+                    return h;
+                }
+            }
+        }
+    }
+
+    // The slice-once kernels against the per-element form they replace, bit
+    // for bit, over random finite halves of every magnitude.
+    #[test]
+    fn kernels_match_per_element_reference() {
+        let hx = |x: &[u8], i: usize| half_to_float4(Half::from_ne_bytes([x[2 * i], x[2 * i + 1]]));
+        let mut r = XorShift(0x9E37_79B9_7F4A_7C15);
+        for n in 0..2000usize {
+            let dim = 1 + n % 40;
+            let a: Vec<u8> = (0..dim).flat_map(|_| r.half().to_ne_bytes()).collect();
+            let b: Vec<u8> = (0..dim).flat_map(|_| r.half().to_ne_bytes()).collect();
+            let (mut l2, mut ip, mut l1) = (0.0f32, 0.0f32, 0.0f32);
+            let (mut sim, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+            for i in 0..dim {
+                let (x, y) = (hx(&a, i), hx(&b, i));
+                let diff = x - y;
+                l2 += diff * diff;
+                ip += x * y;
+                l1 += (x - y).abs();
+                sim += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+            let cos = sim as f64 / ((na as f64) * (nb as f64)).sqrt();
+            assert_eq!(halfvec_l2_squared_distance(dim, &a, &b).to_bits(), l2.to_bits());
+            assert_eq!(halfvec_inner_product(dim, &a, &b).to_bits(), ip.to_bits());
+            assert_eq!(halfvec_l1_distance(dim, &a, &b).to_bits(), l1.to_bits());
+            assert_eq!(halfvec_cosine_similarity(dim, &a, &b).to_bits(), cos.to_bits());
+        }
+    }
 
     fn halves(v: &[f32]) -> Vec<u8> {
         v.iter().flat_map(|x| float4_to_half_unchecked(*x).to_ne_bytes()).collect()

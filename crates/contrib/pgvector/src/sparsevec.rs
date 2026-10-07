@@ -690,8 +690,38 @@ pub fn fc_array_to_sparsevec(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> 
     Ok(image_datum(r.image()))
 }
 
+// `distance += x * y` in SparsevecInnerProduct and SparsevecL2SquaredDistance,
+// as C's code generation does it.
+// DIVERGENCE: C defines these sums by its code generation, not its source:
+// upstream builds with -ffp-contract=fast -fassociative-math (Makefile:38).
+// - The merge loops: on aarch64, where FMA is baseline, both the macOS clang
+//   reference and the Docker image's gcc build emit a scalar fmadd for every
+//   step (the L2 difference is rounded first: fsub, then fmadd), so pgrust
+//   fuses there too. Elsewhere pgrust keeps the unfused source form. That
+//   matches an x86-64 C build without FMA (OPTFLAGS="", as the amd64
+//   pgvector Docker image is built); one built with -march=native differs in
+//   the last bit, and in the sign of an all-underflow zero.
+// - The L2 tail (b-only entries after a's last index): both compilers
+//   vectorize it once it has 4 or more entries, differently. clang sums 16-
+//   and 4-element blocks in lanes, the first lane seeded with the running
+//   distance; gcc sums 4-element blocks in one lane vector and adds it to the
+//   running distance at the end. pgrust keeps scalar source order (fused on
+//   aarch64), so it equals both C builds whenever at most 3 b-only entries
+//   trail, and can differ from either in the last bit otherwise.
+#[inline]
+fn fmadd_step(distance: f32, x: f32, y: f32) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        x.mul_add(y, distance)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        distance + x * y
+    }
+}
+
 // SparsevecL2SquaredDistance (sparsevec.c:823-866): one merge over the two
-// sorted index lists.
+// sorted index lists. Each `distance += x * x` is fmadd_step(distance, x, x).
 pub fn sparsevec_l2_squared_distance(a: &SparseView<'_>, b: &SparseView<'_>) -> f32 {
     let mut distance = 0.0f32;
     let mut bpos = 0usize;
@@ -702,9 +732,9 @@ pub fn sparsevec_l2_squared_distance(a: &SparseView<'_>, b: &SparseView<'_>) -> 
             bi = b.index(j);
             if ai == bi {
                 let diff = a.value(i) - b.value(j);
-                distance += diff * diff;
+                distance = fmadd_step(distance, diff, diff);
             } else if ai > bi {
-                distance += b.value(j) * b.value(j);
+                distance = fmadd_step(distance, b.value(j), b.value(j));
             }
             // Update start for next iteration
             if ai >= bi {
@@ -716,34 +746,13 @@ pub fn sparsevec_l2_squared_distance(a: &SparseView<'_>, b: &SparseView<'_>) -> 
             }
         }
         if ai != bi {
-            distance += a.value(i) * a.value(i);
+            distance = fmadd_step(distance, a.value(i), a.value(i));
         }
     }
     for j in bpos..b.nnz() {
-        distance += b.value(j) * b.value(j);
+        distance = fmadd_step(distance, b.value(j), b.value(j));
     }
     distance
-}
-
-// `distance += x * y` of SparsevecInnerProduct, as C's code generation does it.
-// DIVERGENCE: C defines this sum by its code generation, not its source:
-// upstream builds with -ffp-contract=fast -fno-signed-zeros (Makefile:38).
-// On aarch64, where FMA is baseline, clang emits a scalar fmadd chain for the
-// merge loop (otool on the arm64 reference), so pgrust fuses there too.
-// Elsewhere pgrust keeps the unfused source form. That matches an x86-64 C
-// build without FMA (OPTFLAGS="", as the amd64 pgvector Docker image is built).
-// An x86-64 C build with -march=native (FMA) differs from pgrust in the last
-// bit, and in the sign of an all-underflow zero.
-#[inline]
-fn inner_product_step(distance: f32, x: f32, y: f32) -> f32 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        x.mul_add(y, distance)
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        distance + x * y
-    }
 }
 
 // SparsevecInnerProduct (sparsevec.c:902-933).
@@ -756,7 +765,7 @@ pub fn sparsevec_inner_product(a: &SparseView<'_>, b: &SparseView<'_>) -> f32 {
             let bi = b.index(j);
             // Only update when the same index
             if ai == bi {
-                distance = inner_product_step(distance, a.value(i), b.value(j));
+                distance = fmadd_step(distance, a.value(i), b.value(j));
             }
             // Update start for next iteration
             if ai >= bi {
@@ -772,7 +781,9 @@ pub fn sparsevec_inner_product(a: &SparseView<'_>, b: &SparseView<'_>) -> f32 {
 }
 
 // sparsevec_l1_distance's merge (sparsevec.c:1021-1054), factored out like
-// the L2 and inner-product kernels.
+// the L2 and inner-product kernels. It has no multiply to fuse: both C builds
+// emit fabd/fabs and fadd in source order, as here. A tail of 4 or more
+// b-only entries is vectorized, as the L2 tail is (see fmadd_step).
 pub fn sparsevec_l1_distance(a: &SparseView<'_>, b: &SparseView<'_>) -> f32 {
     let mut distance = 0.0f32;
     let mut bpos = 0usize;
@@ -1285,6 +1296,62 @@ mod tests {
             let b = SparseView::from_payload(&ib[4..]).unwrap();
             let got = sparsevec_inner_product(&a, &b) as f64;
             assert_eq!(got.to_bits(), bits(want), "{sa} . {sb}: got {got}, C {want}");
+        }
+    }
+
+    // sparsevec_l2_squared_distance against C, bit for bit. Each case gives
+    // the arm64 C result and the amd64 C result:
+    // - arm64: the macOS clang reference and the Docker image's gcc arm64
+    //   build both round each difference, then fuse every step (fsub, fmadd);
+    // - amd64: the pgvector/pgvector:0.8.7-pg18 amd64 image, unfused.
+    // Every case separates the two, and none has more than 3 b-only entries
+    // after a's last index; longer tails are vectorized (see fmadd_step).
+    // Measured while writing the M3 plan.
+    #[test]
+    fn l2_squared_distance_matches_c_per_arch() {
+        let ctx = mcx::MemoryContext::new("sparsevec-test");
+        let m = ctx.mcx();
+        let cases = [
+            (
+                "{3:0.68405217,5:0.5466399,6:-0.8204614}/6",
+                "{1:-0.004012036,2:0.61685055,5:-0.66298896,6:0.11534604}/6",
+                "3.1873855590820312",
+                "3.187385320663452",
+            ),
+            (
+                "{1:0.20962888,3:-0.25877634,6:-0.1003009}/6",
+                "{1:0.58375126,4:-0.6339017,5:0.04112337}/6",
+                "0.6205154657363892",
+                "0.6205155253410339",
+            ),
+            (
+                "{3:-0.87061185,4:-0.5315948}/6",
+                "{2:0.12337011,3:0.3771314,4:-0.29287863,5:-0.34002006,6:0.6459378}/6",
+                "2.1619181632995605",
+                "2.1619179248809814",
+            ),
+            (
+                "{1:-0.9719157,3:-0.669007,4:-0.066198595,6:0.93480444}/6",
+                "{1:0.47442326,2:-0.7231695,5:0.85055166,6:0.551655}/6",
+                "3.9370648860931396",
+                "3.9370646476745605",
+            ),
+            (
+                "{2:0.72718155,3:-0.25877634,4:0.015045135}/6",
+                "{1:0.2447342,2:-0.8365095,4:0.8104313,6:-0.6178536}/6",
+                "3.586372137069702",
+                "3.586371898651123",
+            ),
+        ];
+        let bits = |t: &str| t.parse::<f64>().unwrap().to_bits();
+        for (sa, sb, arm64, amd64) in cases {
+            assert_ne!(bits(arm64), bits(amd64), "{sa} - {sb}: case does not separate fused from unfused");
+            let want = if cfg!(target_arch = "aarch64") { arm64 } else { amd64 };
+            let (ia, ib) = (sparsevec_in_body(m, sa.as_bytes(), -1).unwrap(), sparsevec_in_body(m, sb.as_bytes(), -1).unwrap());
+            let a = SparseView::from_payload(&ia[4..]).unwrap();
+            let b = SparseView::from_payload(&ib[4..]).unwrap();
+            let got = sparsevec_l2_squared_distance(&a, &b) as f64;
+            assert_eq!(got.to_bits(), bits(want), "{sa} - {sb}: got {got}, C {want}");
         }
     }
 
