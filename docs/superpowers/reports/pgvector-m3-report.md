@@ -196,7 +196,7 @@ Every remaining failure is IVFFlat (M4) or a parallel build (M6). I checked each
 
 **Every SQL-reachable HNSW error site identical, LOCATION included (M1 prerequisite 2).**
 - `scripts/pgvector/sql/hnsw-errors.sql`, the diff tier's `hnsw_errors` row: 22 errors on each side, with identical transcripts. The sites:
-  - `HnswCheckDim, hnswutils.c:1373` (11), for every type and opclass, even on an empty index;
+  - `HnswCheckDim, hnswutils.c:1373` (11), for all four types (7 of the 14 opclasses: `vector` and `halfvec` L2 and cosine, `bit` Hamming and Jaccard, `sparsevec` L2), even on an empty index;
   - `InitBuildState, hnswbuild.c:703` (1), `:709` (3), `:714` (3) and `:719` (1);
   - `SparsevecCheckValue, hnswutils.c:1392` (3), at build and at insert, before normalization.
 - Before M3, pgrust reported `pgvector_hnsw_build.c:0` for 709, 714 and 719, and had neither the varbit check nor the non-zero check.
@@ -265,7 +265,7 @@ Review minors deferred to a later cleanup, one line each. This section carries e
 **From M2: unit tests**
 - bit: `check_dims` asserts only the message (no SQLSTATE or location), `init_bit_vector`'s test skips the varlena header word, and the kernels are not tested from non-zero starting counts.
 - f16 parity: the tests report a mismatch count, not the first failing input. The `_Float16` skip is an `eprintln!` hidden by test capture. The 2³² tests are not `#[ignore]`d under the debug profile, so plain `cargo test` runs them unoptimized.
-- `float4_to_half` and the sparsevec tests assert messages, not SQLSTATEs or locations.
+- `float4_to_half`, the halfvec parse-error tests (`parse_errors_match_halfvec_out`) and the sparsevec tests assert messages, not SQLSTATEs or locations.
 - halfvec `recv_validates_like_c` lacks the dim > 16000 / `i16::MAX` case and the C check-order case. sparsevec recv lacks i32 extremes, and there is no case for an index position written as an i64 literal.
 - No unit test covers halfvec `subvector` bounds at `i32::MIN`, `binary_quantize` bit order, or `mul` underflow (regress covers some).
 - The sparsevec `cmp` test is narrow: its negative-value and index-mismatch branches are covered only by TAP 033.
