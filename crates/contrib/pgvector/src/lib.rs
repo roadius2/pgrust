@@ -213,6 +213,50 @@ pub fn init_seams() {
 
 #[cfg(test)]
 mod tests {
+    // support_proc_symbol: only a LANGUAGE c proc names a library symbol
+    // (Review Focus 5). Stubs the two pg_proc lookups once per test binary.
+    #[test]
+    fn ivf_support_proc_symbol_requires_language_c() {
+        const C_PROC: types_core::Oid = 70_001;
+        const SQL_PROC: types_core::Oid = 70_002;
+        const GONE_PROC: types_core::Oid = 70_003;
+        if !syscache_seams::lookup_pg_proc_fmgr::is_installed() {
+            syscache_seams::lookup_pg_proc_fmgr::set(|funcid| {
+                let prolang = match funcid {
+                    C_PROC => 13,
+                    SQL_PROC => 14,
+                    _ => return Ok(None),
+                };
+                Ok(Some(syscache_seams::PgProcFmgrShape {
+                    prolang,
+                    prorettype: 2281,
+                    pronargs: 0,
+                    proisstrict: true,
+                    proretset: false,
+                    prosecdef: false,
+                    proconfig_isnull: true,
+                    xmin: 0,
+                    tid: Default::default(),
+                }))
+            });
+        }
+        if !syscache_seams::lookup_pg_proc_prosrc::is_installed() {
+            syscache_seams::lookup_pg_proc_prosrc::set(|cx, funcid| {
+                Ok(if funcid == C_PROC || funcid == SQL_PROC {
+                    Some(mcx::PgString::from_str_in("ivfflat_halfvec_support", cx)?)
+                } else {
+                    None
+                })
+            });
+        }
+        assert_eq!(
+            super::support_proc_symbol(C_PROC).unwrap().as_deref(),
+            Some("ivfflat_halfvec_support")
+        );
+        assert_eq!(super::support_proc_symbol(SQL_PROC).unwrap(), None);
+        assert_eq!(super::support_proc_symbol(GONE_PROC).unwrap(), None);
+    }
+
     // Every extension script pgrust ships.
     const SHIPPED_SCRIPTS: &[(&str, &str)] =
         &[("vector--0.8.5.sql", include_str!("../extension/vector--0.8.5.sql"))];

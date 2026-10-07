@@ -328,7 +328,10 @@ impl<'s> XlogPage<'s> {
 
     // PageGetItem on the registered image, writable.
     pub fn item_mut(&mut self, offno: u16) -> &mut [u8] {
-        let pr = page_ref(self.page());
+        // SAFETY: `self.page` is the registered image, a whole page; building
+        // the PageRef from the raw pointer (not a shared slice) keeps write
+        // provenance for the item pointer below.
+        let pr = unsafe { PageRef::from_raw(NonNull::new_unchecked(self.page)) };
         let (p, len) = pr.item_raw(pr.item_id(offno));
         // SAFETY: item_raw bounds the item within the registered image.
         unsafe { core::slice::from_raw_parts_mut(p as *mut u8, len as usize) }
