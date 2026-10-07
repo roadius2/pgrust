@@ -44,6 +44,24 @@ pub struct BuiltinLibraryEntry {
 
 static BUILTIN_LIBRARIES: Mutex<Vec<BuiltinLibraryEntry>> = Mutex::new(Vec::new());
 
+// PG_MODULE_MAGIC_EXT's .version (fmgr.h), the version pg_get_loaded_modules
+// reports for a library. A builtin library that registers none reports
+// PG_VERSION, as C's contrib modules (PG_MODULE_MAGIC_EXT(.version =
+// PG_VERSION)) do.
+static LIBRARY_VERSIONS: Mutex<Vec<(&'static str, &'static str)>> = Mutex::new(Vec::new());
+
+pub fn register_library_version(name: &'static str, version: &'static str) {
+    let mut versions = LIBRARY_VERSIONS.lock().unwrap();
+    match versions.iter_mut().find(|(n, _)| *n == name) {
+        Some(entry) => entry.1 = version,
+        None => versions.push((name, version)),
+    }
+}
+
+pub fn library_version(name: &str) -> Option<&'static str> {
+    LIBRARY_VERSIONS.lock().unwrap().iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
+}
+
 #[derive(Clone)]
 struct LoadedFile {
     filename: String,
@@ -780,5 +798,15 @@ mod tests {
         .join()
         .unwrap();
         assert_eq!(loaded_module_names(), vec!["tpre", "tses", "tlib"]);
+    }
+
+    // PG_MODULE_MAGIC_EXT's .version: what pg_get_loaded_modules reports.
+    #[test]
+    fn library_version_registers_and_defaults_to_none() {
+        assert_eq!(library_version("tver"), None);
+        register_library_version("tver", "1.2.3");
+        assert_eq!(library_version("tver"), Some("1.2.3"));
+        register_library_version("tver", "1.2.4");
+        assert_eq!(library_version("tver"), Some("1.2.4"));
     }
 }

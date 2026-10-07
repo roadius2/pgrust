@@ -1,12 +1,12 @@
 //! pgvector (github.com/pgvector/pgvector), ported from 0.8.5 @ 159b79a and
 //! brought to 0.8.7 behavior: the vector, halfvec and sparsevec types and
 //! the bit distance functions (I/O, functions, aggregates, casts, btree
-//! opclasses), one module per C file. The HNSW opclasses for all four types
-//! are shipped (M3); ivfflat (M4) is unported, and the shipped
-//! extension script is the trimmed vector--0.8.5.sql grown with upstream
-//! sections (scripts/pgvector/upstream-sql.sh) until M4 (spec §4.6).
-//! DIVERGENCE: pg_get_loaded_modules() reports 18.6 for this library; C
-//! reports PG_MODULE_MAGIC_EXT's "0.8.7" (vector.c:49). Revisit in M4.
+//! opclasses), one module per C file. The access methods are the
+//! pgvector_hnsw and pgvector_ivfflat crates. extension/ holds upstream
+//! 0.8.7's files verbatim: vector--0.8.7.sql (its sql/vector.sql), the 41
+//! upgrade scripts and vector.control (spec §4.6). The library reports
+//! PG_MODULE_MAGIC_EXT's "0.8.7" (vector.c:49) and reserves the hnsw and
+//! ivfflat GUC prefixes on load, as _PG_init does.
 //! DIVERGENCE: errors raised by the pre-M2 vector code (vec.rs, funcs.rs)
 //! carry crate-derived locations, not vector.c's; halfvec_to_vector and
 //! sparsevec_to_vector inherit that through vector's CheckDim helpers.
@@ -152,6 +152,9 @@ fn lookup(function: &str) -> Option<PGFunction> {
         "hnsw_halfvec_support" => fc_hnsw_halfvec_support,
         "hnsw_bit_support" => fc_hnsw_bit_support,
         "hnsw_sparsevec_support" => fc_hnsw_sparsevec_support,
+        "ivfflathandler" => fc_ivfflathandler,
+        "ivfflat_halfvec_support" => fc_ivfflat_halfvec_support,
+        "ivfflat_bit_support" => fc_ivfflat_bit_support,
         _ => return None,
     })
 }
@@ -165,7 +168,7 @@ fn not_called_through_fmgr(symbol: &str, resolved_by: &str) -> types_error::PgRe
         .into())
 }
 
-// hnswhandler (hnsw.c:266-401): a CREATE FUNCTION validation target only;
+// hnswhandler (hnsw.c:266-402): a CREATE FUNCTION validation target only;
 // the closed AM set dispatches via IndexAmKind, never through fmgr.
 // DIVERGENCE: C returns its IndexAmRoutine when called; pgrust raises.
 fn fc_hnswhandler(
@@ -203,12 +206,54 @@ fn fc_hnsw_sparsevec_support(
     not_called_through_fmgr("hnsw_sparsevec_support", "symbol")
 }
 
+// ivfflathandler (ivfflat.c:183-319): a CREATE FUNCTION validation target
+// only; the closed AM set dispatches via IndexAmKind, never through fmgr.
+// DIVERGENCE: C returns its IndexAmRoutine when called; pgrust raises.
+fn fc_ivfflathandler(
+    _f: Option<&mut types_fmgr::FmgrInfo>,
+    _fcinfo: &mut types_fmgr::FunctionCallInfoBaseData,
+) -> types_error::PgResult<datum::Datum> {
+    not_called_through_fmgr("ivfflathandler", "its access method")
+}
+
+// ivfflat_halfvec_support and ivfflat_bit_support (ivfutils.c:430-460):
+// CREATE FUNCTION validation targets only. pgvector_ivfflat resolves an
+// opclass's support proc 5 by its C symbol to a static IvfflatTypeInfo
+// (ivfflat_get_type_info, spec §6), never through fmgr.
+// DIVERGENCE: C returns a pointer to its static IvfflatTypeInfo when called;
+// pgrust raises.
+fn fc_ivfflat_halfvec_support(
+    _f: Option<&mut types_fmgr::FmgrInfo>,
+    _fcinfo: &mut types_fmgr::FunctionCallInfoBaseData,
+) -> types_error::PgResult<datum::Datum> {
+    not_called_through_fmgr("ivfflat_halfvec_support", "symbol")
+}
+
+fn fc_ivfflat_bit_support(
+    _f: Option<&mut types_fmgr::FmgrInfo>,
+    _fcinfo: &mut types_fmgr::FunctionCallInfoBaseData,
+) -> types_error::PgResult<datum::Datum> {
+    not_called_through_fmgr("ivfflat_bit_support", "symbol")
+}
+
+// _PG_init (vector.c:59-65). HnswInit and IvfflatInit end by reserving
+// their GUC prefixes (hnsw.c:111, ivfflat.c:58); the GUCs and reloptions
+// they define are static here, and BitvecInit and HalfvecInit only pick CPU
+// dispatch, which this port does not need.
+fn pg_init() -> types_error::PgResult<()> {
+    guc::MarkGUCPrefixReserved("hnsw");
+    guc::MarkGUCPrefixReserved("ivfflat");
+    Ok(())
+}
+
 pub fn init_seams() {
     dfmgr::register_builtin_library(dfmgr::BuiltinLibraryEntry {
         name: LIBRARY,
         lookup,
-        pg_init: None,
+        pg_init: Some(pg_init),
     });
+    // PG_MODULE_MAGIC_EXT(.name = "vector", .version = "0.8.7") (vector.c:49).
+    dfmgr::register_library_version(LIBRARY, "0.8.7");
 }
 
 #[cfg(test)]
@@ -257,9 +302,42 @@ mod tests {
         assert_eq!(super::support_proc_symbol(GONE_PROC).unwrap(), None);
     }
 
-    // Every extension script pgrust ships.
-    const SHIPPED_SCRIPTS: &[(&str, &str)] =
-        &[("vector--0.8.5.sql", include_str!("../extension/vector--0.8.5.sql"))];
+    // Every file in extension/: upstream 0.8.7's vector.control,
+    // vector--0.8.7.sql and its 41 upgrade scripts (spec §4.6).
+    fn shipped_files() -> Vec<(String, String)> {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/extension");
+        let mut out: Vec<(String, String)> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .map(|p| {
+                let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                (name, std::fs::read_to_string(&p).unwrap())
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    // The upstream file each shipped file copies.
+    fn upstream_path(file: &str) -> String {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pgvector-0.8.7-reference");
+        match file {
+            "vector.control" => format!("{root}/vector.control"),
+            "vector--0.8.7.sql" => format!("{root}/sql/vector.sql"),
+            other => format!("{root}/sql/{other}"),
+        }
+    }
+
+    // Spec §4.6: the extension directory is upstream's, byte for byte.
+    #[test]
+    fn shipped_scripts_are_upstream_verbatim() {
+        let files = shipped_files();
+        assert_eq!(files.len(), 43, "vector.control, the install script and 41 upgrade scripts");
+        for (file, text) in &files {
+            let upstream = std::fs::read_to_string(upstream_path(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+            assert!(*text == upstream, "{file} differs from upstream");
+        }
+    }
 
     /// The C symbol of every `CREATE FUNCTION ... AS 'MODULE_PATHNAME'` in a
     /// script: the link symbol after the comma, else the SQL name (which
@@ -292,7 +370,15 @@ mod tests {
     // The symbols resolved outside fmgr raise when called, never panic.
     #[test]
     fn fmgr_stubs_raise_internal_error() {
-        for symbol in ["hnswhandler", "hnsw_halfvec_support", "hnsw_bit_support", "hnsw_sparsevec_support"] {
+        for symbol in [
+            "hnswhandler",
+            "hnsw_halfvec_support",
+            "hnsw_bit_support",
+            "hnsw_sparsevec_support",
+            "ivfflathandler",
+            "ivfflat_halfvec_support",
+            "ivfflat_bit_support",
+        ] {
             let f = super::lookup(symbol).unwrap();
             let mut fc = types_fmgr::LocalFcinfo::<0>::new(0);
             let e = f(None, &mut fc).unwrap_err();
@@ -301,14 +387,16 @@ mod tests {
         }
     }
 
-    // Spec §4.6: CREATE EXTENSION stops at the first CREATE FUNCTION whose
-    // symbol `lookup` cannot resolve.
+    // Spec §4.6: CREATE EXTENSION and ALTER EXTENSION UPDATE stop at the
+    // first CREATE FUNCTION whose symbol `lookup` cannot resolve.
     #[test]
     fn lookup_covers_every_module_pathname_symbol() {
-        for (file, script) in SHIPPED_SCRIPTS {
-            let symbols = module_pathname_symbols(script);
-            assert!(symbols.len() >= 35, "{file}: parsed only {} symbols", symbols.len());
-            let missing: Vec<&String> = symbols.iter().filter(|s| super::lookup(s).is_none()).collect();
+        let files = shipped_files();
+        let install = &files.iter().find(|(f, _)| f == "vector--0.8.7.sql").expect("install script").1;
+        assert_eq!(module_pathname_symbols(install).len(), 114);
+        for (file, script) in files.iter().filter(|(f, _)| f.ends_with(".sql")) {
+            let missing: Vec<String> =
+                module_pathname_symbols(script).into_iter().filter(|s| super::lookup(s).is_none()).collect();
             assert!(missing.is_empty(), "{file}: no lookup entry for {missing:?}");
         }
     }

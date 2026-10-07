@@ -216,9 +216,11 @@ pub fn fc_pg_extension_config_dump(
 }
 
 // pg_get_loaded_modules (extension.c:2974-3018). No-dlopen carve: modules are
-// builtin registry entries; every shipped module's PG_MODULE_MAGIC_EXT carries
-// its own name and PG_VERSION, so those columns are derived. file_name is the
-// basename of the filename the library was opened under (:3007-3011).
+// builtin registry entries. module_name is the entry's name; version is the
+// one the library registered for PG_MODULE_MAGIC_EXT's .version (pgvector's
+// 0.8.7, vector.c:49), else PG_VERSION, which every other shipped module's
+// PG_MODULE_MAGIC_EXT carries. file_name is the basename of the filename the
+// library was opened under (:3007-3011).
 pub fn fc_pg_get_loaded_modules(
     flinfo: Option<&mut FmgrInfo>,
     fcinfo: &mut Fcinfo,
@@ -235,7 +237,10 @@ pub fn fc_pg_get_loaded_modules(
             &library_path[pg_path::last_dir_separator(library_path).map_or(0, |i| i + 1)..];
         let values = [
             text_datum(mcx, module.module_name)?,
-            text_datum(mcx, guc_tables::consts::PG_COMPAT_VERSION)?,
+            text_datum(
+                mcx,
+                dfmgr::library_version(module.module_name).unwrap_or(guc_tables::consts::PG_COMPAT_VERSION),
+            )?,
             text_datum(mcx, file_name)?,
         ];
         srf.putvalues(&values, &[false; 3])?;

@@ -4,6 +4,8 @@
 // commands/extension control.rs staged_extension_dir). Dist binaries fetched
 // from S3 travel without the staged dir; PGRUST_PGSHAREDIR-resolved system
 // files cover that path.
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 fn main() {
@@ -26,9 +28,12 @@ fn main() {
     let staged_tsdata = profile_dir.join("share/tsearch_data");
     std::fs::create_dir_all(&staged_tsdata).unwrap();
 
+    // The file names each staged directory should hold.
+    let mut sources: [HashSet<OsString>; 2] = [HashSet::new(), HashSet::new()];
+
     for crate_entry in std::fs::read_dir(&contrib_dir).unwrap() {
         let crate_path = crate_entry.unwrap().path();
-        for (sub, staged) in [("extension", &staged), ("tsearch_data", &staged_tsdata)] {
+        for (k, (sub, staged)) in [("extension", &staged), ("tsearch_data", &staged_tsdata)].into_iter().enumerate() {
             let src_dir = crate_path.join(sub);
             if !src_dir.is_dir() {
                 continue;
@@ -38,7 +43,22 @@ fn main() {
                 if !src.is_file() {
                     continue;
                 }
-                copy_if_changed(&src, &staged.join(src.file_name().unwrap()));
+                let name = src.file_name().unwrap().to_owned();
+                copy_if_changed(&src, &staged.join(&name));
+                sources[k].insert(name);
+            }
+        }
+    }
+
+    // Remove staged files whose source is gone (a renamed or deleted
+    // script, like pgvector's vector--0.8.5.sql at M4), so CREATE EXTENSION
+    // cannot find a version the tree no longer ships. Only this script
+    // writes these directories.
+    for (k, staged) in [&staged, &staged_tsdata].into_iter().enumerate() {
+        for f in std::fs::read_dir(staged).unwrap() {
+            let p = f.unwrap().path();
+            if p.is_file() && !sources[k].contains(p.file_name().unwrap()) {
+                std::fs::remove_file(&p).unwrap();
             }
         }
     }
