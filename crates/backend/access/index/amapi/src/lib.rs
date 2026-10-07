@@ -68,6 +68,7 @@ fn resolve_extension_handler(amhandler: Oid) -> PgResult<IndexAmKind> {
     };
     match name.name_str() {
         b"hnswhandler" => return Ok(IndexAmKind::Hnsw),
+        b"ivfflathandler" => return Ok(IndexAmKind::Ivfflat),
         b"blhandler" => return Ok(IndexAmKind::Bloom),
         _ => {}
     }
@@ -143,6 +144,7 @@ pub fn IndexAmTranslateStrategy(
         // amtranslatestrategy == NULL.
         IndexAmKind::Brin => COMPARE_INVALID,
         IndexAmKind::Hnsw => COMPARE_INVALID,
+        IndexAmKind::Ivfflat => COMPARE_INVALID,
         // amtranslatestrategy == NULL (contrib/bloom blhandler).
         IndexAmKind::Bloom => COMPARE_INVALID,
         // dead arm kept for enum growth
@@ -188,6 +190,7 @@ pub fn IndexAmTranslateCompareType(
         // amtranslatecmptype == NULL.
         IndexAmKind::Brin => InvalidStrategy,
         IndexAmKind::Hnsw => InvalidStrategy,
+        IndexAmKind::Ivfflat => InvalidStrategy,
         // amtranslatecmptype == NULL (contrib/bloom blhandler).
         IndexAmKind::Bloom => InvalidStrategy,
         // dead arm kept for enum growth
@@ -240,6 +243,7 @@ pub fn amvalidate(opclassoid: Oid) -> PgResult<bool> {
         IndexAmKind::Gist => gist_validate::gistvalidate(opclassoid),
         IndexAmKind::Gin => gin_validate::ginvalidate(opclassoid),
         IndexAmKind::Hnsw => pgvector_hnsw::hnswvalidate(opclassoid),
+        IndexAmKind::Ivfflat => pgvector_ivfflat::ivfflatvalidate(opclassoid),
         IndexAmKind::Bloom => bloom::blvalidate(opclassoid),
         #[allow(unreachable_patterns)]
         _ => unreachable!("IndexAmKind match is exhaustive over the supported AMs (relscan/src/lib.rs:31); the remaining arm is the cfg(mock) test variant"),
@@ -269,6 +273,7 @@ pub fn am_adjust_members(
         // C brinhandler sets amadjustmembers = NULL.
         IndexAmKind::Brin => Ok(()),
         IndexAmKind::Hnsw => Ok(()),
+        IndexAmKind::Ivfflat => Ok(()),
         // C blhandler sets amadjustmembers = NULL.
         IndexAmKind::Bloom => Ok(()),
         #[allow(unreachable_patterns)]
@@ -392,7 +397,7 @@ pub fn amparallelvacuumoptions(kind: IndexAmKind) -> u8 {
         IndexAmKind::Btree | IndexAmKind::Gist | IndexAmKind::Spgist => {
             VACUUM_OPTION_PARALLEL_BULKDEL | VACUUM_OPTION_PARALLEL_COND_CLEANUP
         }
-        IndexAmKind::Hash | IndexAmKind::Hnsw => VACUUM_OPTION_PARALLEL_BULKDEL,
+        IndexAmKind::Hash | IndexAmKind::Hnsw | IndexAmKind::Ivfflat => VACUUM_OPTION_PARALLEL_BULKDEL,
         // gin and bloom: BULKDEL | CLEANUP (blutils.c blhandler).
         IndexAmKind::Gin | IndexAmKind::Bloom => {
             VACUUM_OPTION_PARALLEL_BULKDEL | VACUUM_OPTION_PARALLEL_CLEANUP

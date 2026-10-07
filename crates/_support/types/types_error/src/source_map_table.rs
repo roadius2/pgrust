@@ -195,6 +195,8 @@ pub(crate) const OVERRIDES: &[(&str, &str)] = &[
     ("pglz", "pg_lzcompress.c"),
     ("pgstatfuncs+pseudorandomfuncs", "pgstatfuncs.c"),
     ("pgvector_hnsw", "{hnsw.c"),
+    ("pgvector_ivfflat", "ivfflat.c"),
+    ("pgvector_ivfflat_build", "ivfbuild.c"),
     ("planner(clausesel.rs", "clausesel.c"),
     ("planner(inherit.rs", "inherit.c"),
     ("plpgsql", "pl_scanner.c"),

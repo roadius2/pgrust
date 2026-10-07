@@ -156,6 +156,9 @@ pub(crate) fn relation_init_index_access_info(
         types_relscan::IndexAmKind::Brin => BRINNProcs,
         // pgvector hnsw: distance, norm, type-info.
         types_relscan::IndexAmKind::Hnsw => 3,
+        // pgvector ivfflat: distance, norm, k-means distance, k-means norm,
+        // type-info.
+        types_relscan::IndexAmKind::Ivfflat => 5,
         // contrib/bloom: hash proc + options proc (BLOOM_NPROC).
         types_relscan::IndexAmKind::Bloom => 2,
         #[allow(unreachable_patterns)]
@@ -182,6 +185,7 @@ pub(crate) fn relation_init_index_access_info(
             || form.relam == SPGIST_AM_OID
             || form.relam == BRIN_AM_OID
             || am_kind == types_relscan::IndexAmKind::Hnsw
+            || am_kind == types_relscan::IndexAmKind::Ivfflat
             || am_kind == types_relscan::IndexAmKind::Bloom
         {
             0

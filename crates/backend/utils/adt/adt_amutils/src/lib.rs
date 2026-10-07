@@ -220,6 +220,21 @@ fn am_flags(amoid: Oid) -> Option<&'static AmFlags> {
         has_amproperty: false,
         has_ambuildphasename: true,
     };
+    const IVFFLAT: AmFlags = AmFlags {
+        amcanorder: false,
+        amcanorderbyop: true,
+        amcanbackward: false,
+        amcanunique: false,
+        amcanmulticol: false,
+        amsearcharray: false,
+        amsearchnulls: false,
+        amclusterable: false,
+        amcaninclude: false,
+        has_amgettuple: true,
+        has_amcanreturn: false,
+        has_amproperty: false,
+        has_ambuildphasename: true,
+    };
     match canonical_index_am(amoid) {
         BTREE_AM_OID => Some(&BT),
         HASH_AM_OID => Some(&HASH),
@@ -229,6 +244,7 @@ fn am_flags(amoid: Oid) -> Option<&'static AmFlags> {
         BRIN_AM_OID => Some(&BRIN),
         other => match extension_am_handler(other).as_deref() {
             Some(b"hnswhandler") => Some(&HNSW),
+            Some(b"ivfflathandler") => Some(&IVFFLAT),
             Some(b"blhandler") => Some(&BLOOM),
             _ => None,
         },
@@ -585,19 +601,22 @@ pub fn fc_pg_indexam_progress_phasename(
     let name = match canonical_index_am(amoid) {
         BTREE_AM_OID => bt_phasename(phasenum),
         GIN_AM_OID => gin_phasename(phasenum),
-        _ => match am_flags(amoid) {
-            Some(_) => None,
-            None if is_index_am(amoid)? => {
-                // unported: out-of-core index AM build-phase-name lane.
-                return Err(Box::new(
-                    PgError::error(format!(
-                        "build phase names for non-core access method {amoid} \
-                         are not yet implemented"
-                    ))
-                    .with_sqlstate(ERRCODE_FEATURE_NOT_SUPPORTED),
-                ));
-            }
-            None => None,
+        other => match extension_am_handler(other).as_deref() {
+            Some(b"ivfflathandler") => ivfflat_phasename(phasenum),
+            _ => match am_flags(amoid) {
+                Some(_) => None,
+                None if is_index_am(amoid)? => {
+                    // unported: out-of-core index AM build-phase-name lane.
+                    return Err(Box::new(
+                        PgError::error(format!(
+                            "build phase names for non-core access method {amoid} \
+                             are not yet implemented"
+                        ))
+                        .with_sqlstate(ERRCODE_FEATURE_NOT_SUPPORTED),
+                    ));
+                }
+                None => None,
+            },
         },
     };
     match name {
@@ -630,6 +649,17 @@ fn gin_phasename(phasenum: i64) -> Option<&'static str> {
         4 => Some("merging tuples (workers)"),
         5 => Some("sorting tuples"),
         6 => Some("merging tuples"),
+        _ => None,
+    }
+}
+
+// ivfflatbuildphasename (pgvector ivfflat.c:61-80).
+fn ivfflat_phasename(phasenum: i64) -> Option<&'static str> {
+    match phasenum {
+        1 => Some("initializing"),
+        2 => Some("performing k-means"),
+        3 => Some("assigning tuples"),
+        4 => Some("loading tuples"),
         _ => None,
     }
 }

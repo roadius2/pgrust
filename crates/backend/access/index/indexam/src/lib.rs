@@ -245,6 +245,7 @@ pub fn index_bulk_delete<'mcx>(
         IndexAmKind::Gist => gist::gistbulkdelete(info, istat, dead_items),
         IndexAmKind::Spgist => spgist::spgbulkdelete(info, istat, dead_items),
         IndexAmKind::Hnsw => pgvector_hnsw::hnswbulkdelete(info, istat, dead_items),
+        IndexAmKind::Ivfflat => pgvector_ivfflat::ivfflatbulkdelete(info, istat, dead_items),
         IndexAmKind::Bloom => bloom::blbulkdelete(info, istat, dead_items),
         // brinbulkdelete: BRIN has no per-heap-tuple entries; stats
         // allocation is the whole body.
@@ -270,6 +271,7 @@ pub fn index_bulk_delete_collect<'mcx>(
         IndexAmKind::Gist => gist::gistbulkdelete_collect(info, callback),
         IndexAmKind::Spgist => spgist::spgbulkdelete_collect(info, callback),
         IndexAmKind::Hnsw => pgvector_hnsw::hnswbulkdelete_collect(info, callback),
+        IndexAmKind::Ivfflat => pgvector_ivfflat::ivfflatbulkdelete_collect(info, callback),
         IndexAmKind::Bloom => bloom::blbulkdelete_collect(info, callback),
         // brinbulkdelete never invokes the callback: BRIN has no
         // per-heap-tuple entries to report.
@@ -303,6 +305,7 @@ pub fn index_vacuum_cleanup<'mcx>(
         IndexAmKind::Gist => gist::gistvacuumcleanup(info, istat),
         IndexAmKind::Spgist => spgist::spgvacuumcleanup(info, istat),
         IndexAmKind::Hnsw => pgvector_hnsw::hnswvacuumcleanup(info, istat),
+        IndexAmKind::Ivfflat => pgvector_ivfflat::ivfflatvacuumcleanup(info, istat),
         IndexAmKind::Bloom => bloom::blvacuumcleanup(info, istat),
         IndexAmKind::Brin => {
             if info.analyze_only {
@@ -463,6 +466,7 @@ fn am_getbitmap(
         IndexScanOpaque::Spgist(_) => spgist::spggetbitmap(scan, bitmap),
         IndexScanOpaque::Brin(_) => brin::bringetbitmap(scan, bitmap),
         IndexScanOpaque::Hnsw(_) => Err(missing_procedure("amgetbitmap", scan.index_rel())),
+        IndexScanOpaque::Ivfflat(_) => Err(missing_procedure("amgetbitmap", scan.index_rel())),
         IndexScanOpaque::Bloom(_) => bloom::blgetbitmap(scan, bitmap),
         #[cfg(any(test, feature = "mock"))]
         IndexScanOpaque::Mock(_) => unreachable!("Mock lacks amgetbitmap"),
@@ -867,6 +871,7 @@ fn am_beginscan<'mcx>(
         IndexAmKind::Gist => gist::gistbeginscan(mcx, indexRelation, nkeys, norderbys),
         IndexAmKind::Spgist => spgist::spgbeginscan(mcx, indexRelation, nkeys, norderbys),
         IndexAmKind::Hnsw => pgvector_hnsw::hnswbeginscan(mcx, indexRelation, nkeys, norderbys),
+        IndexAmKind::Ivfflat => pgvector_ivfflat::ivfflatbeginscan(mcx, indexRelation, nkeys, norderbys),
         IndexAmKind::Bloom => bloom::blbeginscan(mcx, indexRelation, nkeys, norderbys),
         IndexAmKind::Brin => brin::brinbeginscan(mcx, indexRelation, nkeys, norderbys),
         #[cfg(any(test, feature = "mock"))]
@@ -889,6 +894,7 @@ fn am_rescan(
         IndexScanOpaque::Gist(_) => gist::gistrescan(scan, keys, orderbys),
         IndexScanOpaque::Spgist(_) => spgist::spgrescan(scan, keys, orderbys),
         IndexScanOpaque::Hnsw(_) => pgvector_hnsw::hnswrescan(scan, keys, orderbys),
+        IndexScanOpaque::Ivfflat(_) => pgvector_ivfflat::ivfflatrescan(scan, keys, orderbys),
         IndexScanOpaque::Bloom(_) => bloom::blrescan(scan, keys),
         IndexScanOpaque::Brin(_) => brin::brinrescan(scan, keys),
         #[cfg(any(test, feature = "mock"))]
@@ -906,6 +912,7 @@ fn am_endscan(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
         IndexScanOpaque::Gist(_) => gist::gistendscan(scan),
         IndexScanOpaque::Spgist(_) => spgist::spgendscan(scan),
         IndexScanOpaque::Hnsw(_) => pgvector_hnsw::hnswendscan(scan),
+        IndexScanOpaque::Ivfflat(_) => pgvector_ivfflat::ivfflatendscan(scan),
         IndexScanOpaque::Bloom(_) => bloom::blendscan(scan),
         IndexScanOpaque::Brin(_) => brin::brinendscan(scan),
         #[cfg(any(test, feature = "mock"))]
@@ -923,6 +930,7 @@ fn am_markpos(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
         IndexScanOpaque::Gist(_) => Err(missing_procedure("ammarkpos", scan.index_rel())),
         IndexScanOpaque::Spgist(_) => unreachable!("has_ammarkpos gate"),
         IndexScanOpaque::Hnsw(_) => unreachable!("has_ammarkpos gate"),
+        IndexScanOpaque::Ivfflat(_) => unreachable!("has_ammarkpos gate"),
         IndexScanOpaque::Bloom(_) => unreachable!("has_ammarkpos gate"),
         IndexScanOpaque::Brin(_) => unreachable!("has_ammarkpos gate"),
         #[cfg(any(test, feature = "mock"))]
@@ -940,6 +948,7 @@ fn am_restrpos(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
         IndexScanOpaque::Gist(_) => Err(missing_procedure("amrestrpos", scan.index_rel())),
         IndexScanOpaque::Spgist(_) => unreachable!("has_amrestrpos gate"),
         IndexScanOpaque::Hnsw(_) => unreachable!("has_amrestrpos gate"),
+        IndexScanOpaque::Ivfflat(_) => unreachable!("has_amrestrpos gate"),
         IndexScanOpaque::Bloom(_) => unreachable!("has_amrestrpos gate"),
         IndexScanOpaque::Brin(_) => unreachable!("has_amrestrpos gate"),
         #[cfg(any(test, feature = "mock"))]
@@ -959,6 +968,7 @@ fn am_gettuple(scan: &mut IndexScanDescData<'_>, direction: ScanDirection) -> Pg
         IndexScanOpaque::Gist(_) => gist::gistgettuple(scan, direction),
         IndexScanOpaque::Spgist(_) => spgist::spggettuple(scan, direction),
         IndexScanOpaque::Hnsw(_) => pgvector_hnsw::hnswgettuple(scan, direction),
+        IndexScanOpaque::Ivfflat(_) => pgvector_ivfflat::ivfflatgettuple(scan, direction),
         // CHECK_SCAN_PROCEDURE(amgettuple): bloom is bitmap-only.
         IndexScanOpaque::Bloom(_) => Err(missing_procedure("amgettuple", scan.index_rel())),
         // CHECK_SCAN_PROCEDURE(amgettuple): BRIN is bitmap-only.
@@ -1070,6 +1080,10 @@ fn am_insert<'mcx>(
             debug_assert!(checkUnique == IndexUniqueCheck::UNIQUE_CHECK_NO);
             pgvector_hnsw::hnswinsert(mcx, indexRelation, values, isnull, heap_t_ctid, heapRelation)
         }
+        IndexAmKind::Ivfflat => {
+            debug_assert!(checkUnique == IndexUniqueCheck::UNIQUE_CHECK_NO);
+            pgvector_ivfflat::ivfflatinsert(mcx, indexRelation, values, isnull, heap_t_ctid, heapRelation)
+        }
         IndexAmKind::Bloom => {
             debug_assert!(checkUnique == IndexUniqueCheck::UNIQUE_CHECK_NO);
             bloom::blinsert(mcx, indexRelation, values, isnull, heap_t_ctid, heapRelation)
@@ -1098,6 +1112,7 @@ fn am_insert_cleanup(
         IndexAmKind::Gist => Ok(()),
         IndexAmKind::Spgist => unreachable!("spgist lacks aminsertcleanup (guarded)"),
         IndexAmKind::Hnsw => unreachable!("hnsw lacks aminsertcleanup (guarded)"),
+        IndexAmKind::Ivfflat => unreachable!("ivfflat lacks aminsertcleanup (guarded)"),
         IndexAmKind::Bloom => unreachable!("bloom lacks aminsertcleanup (guarded)"),
         IndexAmKind::Brin => {
             let Some(boxed) = am_cache else { return Ok(()) };

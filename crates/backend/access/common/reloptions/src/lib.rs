@@ -28,7 +28,7 @@ use ::types_nodes::parsenodes::DefElem;
 use ::types_nodes::NodeList;
 use ::types_rel::{
     AutoVacOpts, BTOptions, BrinOptions, GinOptions, GistOptBufferingMode, GistOptions,
-    HashOptions, HnswOptions, RdOptions, SpGistOptions, StdRdOptIndexCleanup, StdRdOptions,
+    HashOptions, HnswOptions, IvfflatOptions, RdOptions, SpGistOptions, StdRdOptIndexCleanup, StdRdOptions,
     ViewOptCheckOption,
     ViewOptions, LOCKMODE, RELKIND_INDEX, RELKIND_MATVIEW, RELKIND_PARTITIONED_INDEX,
     RELKIND_PARTITIONED_TABLE, RELKIND_RELATION, RELKIND_TOASTVALUE, RELKIND_VIEW,
@@ -54,6 +54,8 @@ pub const RELOPT_KIND_PARTITIONED: relopt_kind = 1 << 11;
 pub const RELOPT_KIND_HNSW: relopt_kind = 1 << 12;
 // contrib/bloom: C add_reloption_kind() in _PG_init; static here.
 pub const RELOPT_KIND_BLOOM: relopt_kind = 1 << 13;
+// pgvector ivfflat: C add_reloption_kind() at module load; static here.
+pub const RELOPT_KIND_IVFFLAT: relopt_kind = 1 << 14;
 
 pub const HEAP_RELOPT_NAMESPACES: &[&str] = &["toast"];
 
@@ -175,6 +177,7 @@ static RELOPTS: &[OptDef] = &[
     ),
     i("m", RELOPT_KIND_HNSW, AEL, 16, 2, 100),
     i("ef_construction", RELOPT_KIND_HNSW, AEL, 64, 4, 1000),
+    i("lists", RELOPT_KIND_IVFFLAT, AEL, 100, 1, 32768),
     // contrib/bloom _PG_init: "length" in bits, then col1..col32 bits-per-key.
     i("length", RELOPT_KIND_BLOOM, AEL, 80, 1, 4096),
     i("col1", RELOPT_KIND_BLOOM, AEL, 2, 1, 4095),
@@ -1048,6 +1051,7 @@ pub fn index_reloptions<'mcx>(
         BRIN_AM_OID => brinoptions(mcx, options, validate),
         other => match extension_am_handler_symbol(other).as_deref() {
             Some("hnswhandler") => hnswoptions(mcx, options, validate),
+            Some("ivfflathandler") => ivfflatoptions(mcx, options, validate),
             Some("blhandler") => bloomoptions(mcx, options, validate),
             _ => panic!("index_reloptions: no amoptions for access method {other}"),
         },
@@ -1274,6 +1278,30 @@ fn hnswoptions<'mcx>(
         }
     }
     Ok(Some(RdOptions::Hnsw(out)))
+}
+
+// ivfflatoptions (pgvector ivfflat.c:153-167).
+fn ivfflatoptions<'mcx>(
+    mcx: Mcx<'mcx>,
+    options: Option<&[u8]>,
+    validate: bool,
+) -> PgResult<Option<RdOptions>> {
+    let values = parseRelOptions(mcx, options, validate, RELOPT_KIND_IVFFLAT)?;
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let mut out = IvfflatOptions { lists: 100 };
+    for v in values.iter() {
+        match v.def.name {
+            "lists" => out.lists = v.int_val(),
+            other => {
+                if validate {
+                    panic!("reloption \"{other}\" not found in parse table");
+                }
+            }
+        }
+    }
+    Ok(Some(RdOptions::Ivfflat(out)))
 }
 
 // bloptions (contrib/bloom blutils.c): parse, then convert the signature

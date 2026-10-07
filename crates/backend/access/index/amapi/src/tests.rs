@@ -117,6 +117,7 @@ fn handler_dispatch_is_the_closed_set() {
             5001 => Some(named("int4pl")),
             5002 => Some(named("fpb4_bt_handler")),
             5003 => Some(named("fpb4_int4pl")),
+            5004 => Some(named("ivfflathandler")),
             _ => None,
         })
     });
@@ -148,6 +149,7 @@ fn handler_dispatch_is_the_closed_set() {
     assert_eq!(GetIndexAmRoutine(F_BTHANDLER).unwrap(), IndexAmKind::Btree);
     assert_eq!(GetIndexAmRoutine(F_BRINHANDLER).unwrap(), IndexAmKind::Brin);
     assert_eq!(GetIndexAmRoutine(5000).unwrap(), IndexAmKind::Bloom);
+    assert_eq!(GetIndexAmRoutine(5004).unwrap(), IndexAmKind::Ivfflat);
     // An internal alias of bthandler IS the btree handler (what C's
     // OidFunctionCall0 on it returns); an internal alias of int4pl is not.
     assert_eq!(GetIndexAmRoutine(5002).unwrap(), IndexAmKind::Btree);

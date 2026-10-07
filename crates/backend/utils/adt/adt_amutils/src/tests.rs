@@ -29,6 +29,7 @@ fn install_amhandler_stub() {
                 BRIN_AM_OID => Some(335),
                 20000 => Some(9999),
                 20001 => Some(9998),
+                20002 => Some(9997),
                 _ => None,
             })
         });
@@ -36,6 +37,7 @@ fn install_amhandler_stub() {
             Ok(match funcid {
                 9999 => Some(mcx::PgString::from_str_in("blhandler", mcx)?),
                 9998 => Some(mcx::PgString::from_str_in("hnswhandler", mcx)?),
+                9997 => Some(mcx::PgString::from_str_in("ivfflathandler", mcx)?),
                 _ => None,
             })
         });
@@ -52,6 +54,8 @@ fn extension_am_identified_by_handler_prosrc() {
     assert!(bloom.amcanmulticol && !bloom.has_ambuildphasename && !bloom.amcanorderbyop);
     let hnsw = am_flags(20001).unwrap();
     assert!(hnsw.amcanorderbyop && hnsw.has_ambuildphasename && !hnsw.amcanmulticol);
+    let ivfflat = am_flags(20002).unwrap();
+    assert!(ivfflat.amcanorderbyop && ivfflat.has_ambuildphasename && !ivfflat.amcanmulticol);
 }
 
 #[test]
@@ -76,6 +80,11 @@ fn phasenames_match_c() {
     assert_eq!(gin_phasename(3), Some("sorting tuples (workers)"));
     assert_eq!(gin_phasename(6), Some("merging tuples"));
     assert_eq!(gin_phasename(7), None);
+    assert_eq!(ivfflat_phasename(1), Some("initializing"));
+    assert_eq!(ivfflat_phasename(2), Some("performing k-means"));
+    assert_eq!(ivfflat_phasename(3), Some("assigning tuples"));
+    assert_eq!(ivfflat_phasename(4), Some("loading tuples"));
+    assert_eq!(ivfflat_phasename(5), None);
 }
 
 #[test]

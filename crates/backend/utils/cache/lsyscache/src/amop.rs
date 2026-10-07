@@ -65,7 +65,7 @@ fn index_am_translate_strategy(strategy: i16, amoid: Oid, _opfamily: Oid) -> Com
             c if c != amoid => index_am_translate_strategy(strategy, c, _opfamily),
             // hnsw and bloom: amtranslatestrategy == NULL.
             _ => match extension_am_handler_name(amoid).as_deref() {
-                Some(b"hnswhandler") | Some(b"blhandler") => COMPARE_INVALID,
+                Some(b"hnswhandler") | Some(b"ivfflathandler") | Some(b"blhandler") => COMPARE_INVALID,
                 _ => panic!(
                     "IndexAmTranslateStrategy for non-builtin AM {amoid}: amapi.c unported"
                 ),
@@ -85,7 +85,7 @@ fn index_am_translate_cmptype(cmptype: CompareType, amoid: Oid, _opfamily: Oid) 
             c if c != amoid => index_am_translate_cmptype(cmptype, c, _opfamily),
             // hnsw and bloom: amtranslatecmptype == NULL.
             _ => match extension_am_handler_name(amoid).as_deref() {
-                Some(b"hnswhandler") | Some(b"blhandler") => InvalidStrategy,
+                Some(b"hnswhandler") | Some(b"ivfflathandler") | Some(b"blhandler") => InvalidStrategy,
                 _ => panic!(
                     "IndexAmTranslateCompareType for non-builtin AM {amoid}: amapi.c unported"
                 ),
@@ -104,7 +104,7 @@ pub(crate) fn index_am_consistent_flags(amoid: Oid) -> (bool, bool) {
             c if c != amoid => index_am_consistent_flags(c),
             // hnsw and bloom handlers: both consistency flags false.
             _ => match extension_am_handler_name(amoid).as_deref() {
-                Some(b"hnswhandler") | Some(b"blhandler") => (false, false),
+                Some(b"hnswhandler") | Some(b"ivfflathandler") | Some(b"blhandler") => (false, false),
                 _ => panic!(
                     "GetIndexAmRoutineByAmId for non-builtin AM {amoid}: amapi.c unported"
                 ),
@@ -184,7 +184,7 @@ fn get_opmethod_canorder(amoid: Oid) -> bool {
             // Extension AMs by handler symbol: hnsw and bloom set
             // amcanorder = false in their handlers.
             _ => match extension_am_handler_name(amoid).as_deref() {
-                Some(b"hnswhandler") | Some(b"blhandler") => false,
+                Some(b"hnswhandler") | Some(b"ivfflathandler") | Some(b"blhandler") => false,
                 _ => panic!(
                     "get_opmethod_canorder for non-builtin AM {amoid}: amapi.c unported"
                 ),

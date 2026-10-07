@@ -69,6 +69,7 @@ pg_locale = { path = "../../../utils/adt/pg_locale" }
 regexp_seams = { path = "../../../utils/adt/regexp_seams" }
 guc_tables = { path = "../../../utils/misc/guc_tables" }
 pgvector_hnsw = { path = "../../../../contrib/pgvector_hnsw" }
+pgvector_ivfflat = { path = "../../../../contrib/pgvector_ivfflat" }
 init_small = { path = "../../../utils/init/init_small" }
 tidbitmap = { path = "../../../nodes/tidbitmap" }
 types_rel = { path = "../../../../_support/types/rel" }

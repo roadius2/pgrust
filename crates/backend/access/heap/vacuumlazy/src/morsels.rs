@@ -200,6 +200,7 @@ pub(crate) fn admit(vacrel: &LVRelState<'_, '_>, nrequested: i32) -> Option<i32>
             | K::Spgist
             | K::Brin
             | K::Hnsw
+            | K::Ivfflat
             | K::Bloom => {}
             #[allow(unreachable_patterns)]
             _ => return None,

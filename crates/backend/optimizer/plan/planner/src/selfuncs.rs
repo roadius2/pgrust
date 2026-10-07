@@ -2113,6 +2113,7 @@ pub fn amcostestimate(
         types_relscan::IndexAmKind::Spgist => spgcostestimate(run, path_id, loop_count),
         types_relscan::IndexAmKind::Brin => brincostestimate(run, path_id, loop_count),
         types_relscan::IndexAmKind::Hnsw => hnswcostestimate(run, path_id, loop_count),
+        types_relscan::IndexAmKind::Ivfflat => ivfflatcostestimate(run, path_id, loop_count),
         types_relscan::IndexAmKind::Bloom => blcostestimate(run, path_id, loop_count),
         #[allow(unreachable_patterns)]
         other => panic!("amcostestimate (selfuncs.c): {other:?}; M2 index-AM lane"),
@@ -2228,6 +2229,95 @@ fn hnswcostestimate(
     let startup_pages = costs.num_index_pages * ratio;
     if startup_pages > rel_pages && ratio < 0.5 {
         costs.index_startup_cost -= startup_pages * (spc_random_page_cost - spc_seq_page_cost);
+        costs.index_startup_cost -= (startup_pages - rel_pages) * spc_seq_page_cost;
+    }
+
+    Ok(AmCostEstimate {
+        index_startup_cost: costs.index_startup_cost,
+        index_total_cost: costs.index_total_cost,
+        index_selectivity: costs.index_selectivity,
+        index_correlation: costs.index_correlation,
+        index_pages: costs.num_index_pages,
+    })
+}
+
+// ivfflatcostestimate (pgvector ivfflat.c:82-151). genericcostestimate
+// keeps its spc_random_page_cost to itself here, so the tablespace's page
+// costs are read again (C's costs.spc_random_page_cost and
+// get_tablespace_page_costs(reltablespace, NULL, &spc_seq_page_cost)).
+fn ivfflatcostestimate(
+    run: &mut PlannerRun<'_>,
+    path_id: types_pathnodes::PathId,
+    loop_count: f64,
+) -> PgResult<AmCostEstimate> {
+    let (has_orderbys, indexoid, reltablespace, rel_pages) = {
+        let PathNode::IndexPath(ip) = run.root.path(path_id) else {
+            panic!("ivfflatcostestimate: not an IndexPath")
+        };
+        let index = ip.indexinfo.as_ref().expect("indexinfo set");
+        let rel_pages = index
+            .rel
+            .as_ref()
+            .map(|r| run.root.rel(*r).pages as f64)
+            .unwrap_or(0.0);
+        (!ip.indexorderbys.is_empty(), index.indexoid, index.reltablespace, rel_pages)
+    };
+
+    // Never use index without order
+    if !has_orderbys {
+        // See "On disable_cost" thread on pgsql-hackers
+        run.root.path_mut(path_id).base_mut().disabled_nodes = 2;
+        return Ok(AmCostEstimate {
+            index_startup_cost: f64::INFINITY,
+            index_total_cost: f64::INFINITY,
+            index_selectivity: 0.0,
+            index_correlation: 0.0,
+            index_pages: 0.0,
+        });
+    }
+
+    let mut costs = GenericCosts {
+        num_index_tuples: 0.0,
+        num_sa_scans: 1.0,
+        index_startup_cost: 0.0,
+        index_total_cost: 0.0,
+        index_selectivity: 0.0,
+        index_correlation: 0.0,
+        num_index_pages: 0.0,
+    };
+    genericcostestimate(run, path_id, loop_count, &mut costs)?;
+
+    let lists = {
+        let mcx = run.mcx;
+        let index_rel = indexam::index_open(mcx, indexoid, types_rel::NoLock)?;
+        pgvector_ivfflat::utils::ivfflat_get_meta_page_info(&index_rel)?.0
+    };
+
+    // Get the ratio of lists that we need to visit
+    let mut ratio = guc_tables::vars::ivfflat_probes.read() as f64 / lists as f64;
+    if ratio > 1.0 {
+        ratio = 1.0;
+    }
+
+    let (spc_random_page_cost, spc_seq_page_cost) =
+        crate::costsize::get_tablespace_page_costs(run.mcx, reltablespace)?;
+    let sequential_ratio = 0.5;
+
+    // Change some page cost from random to sequential
+    costs.index_total_cost -=
+        sequential_ratio * costs.num_index_pages * (spc_random_page_cost - spc_seq_page_cost);
+
+    // Startup cost is cost before returning the first row
+    costs.index_startup_cost = costs.index_total_cost * ratio;
+
+    // Adjust cost if needed since TOAST not included in seq scan cost
+    let startup_pages = costs.num_index_pages * ratio;
+    if startup_pages > rel_pages && ratio < 0.5 {
+        // Change rest of page cost from random to sequential
+        costs.index_startup_cost -=
+            (1.0 - sequential_ratio) * startup_pages * (spc_random_page_cost - spc_seq_page_cost);
+
+        // Remove cost of extra pages
         costs.index_startup_cost -= (startup_pages - rel_pages) * spc_seq_page_cost;
     }
 

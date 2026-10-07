@@ -33,6 +33,7 @@ indexam_seams = { path = "../indexam_seams" }
 types_relscan = { path = "../relscan" }
 spgist = { path = "../../spgist/spgist" }
 pgvector_hnsw = { path = "../../../../contrib/pgvector_hnsw" }
+pgvector_ivfflat = { path = "../../../../contrib/pgvector_ivfflat" }
 gist = { path = "../../gist/gist" }
 nbtree = { path = "../../nbtree/nbtree" }
 hash = { path = "../../hash/hash" }
