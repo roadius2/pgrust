@@ -12,6 +12,7 @@ Date: 2026-10-07 · pgrust commit: 38f384cb0e (code: `f57ea4bf3f`'s, Task 5's, t
   - regress `ivfflat_bit`, `ivfflat_halfvec` and `ivfflat_vector`, so all 14 regression files now pass (spec §9's M4 exit criterion);
   - TAP `001`, `002`, `004`–`009`, `036`, `040`, `041`, `042` and `048`: 13 IVFFlat tests;
   - TAP `003`, `032` and `035` (the build-recall tests of the three types) now fail only on their parallel-build lines (M6). Every serial-build assertion, recall included, passes.
+- **Spec §9's M4 exit criteria hold for serial builds.** The three `ivfflat_*` regression files pass, so all 14 do. Every IVFFlat TAP test passes its serial-build assertions, and the lookup-coverage test passes. The parallel-worker assertions of `003`, `032` and `035` are left to M6.
 - **Gate also green:**
   - `harness_test.sh`: all passed (125 ok: Task 6's 127, less the two `upstream-sql` checks retired with the script).
   - `UT_M4`: 32 passed. `UT ivf_ block_sampler reservoir_ lookup_cover fmgr_stubs shipped_scripts` gave 24: `pgvector` 5 (`ivf_support_proc_symbol_requires_language_c`, `lookup_cover` 2, `fmgr_stubs`, `shipped_scripts`), `pgvector_ivfflat` 8, `pgvector_ivfflat_build` 5, `types_ivfflat` 3, `sampling` 3 (the moved sampler tests) and 0 in `main_main`. The `UT_CORE` half gave 8: `adt_amutils` 2, `types_relscan` 2, and `amapi`, `dfmgr`, `guc_tables` and `types_error` 1 each.
