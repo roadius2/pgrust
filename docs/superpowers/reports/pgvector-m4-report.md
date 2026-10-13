@@ -220,7 +220,7 @@ Every remaining failure is a parallel build (M6). I checked each against this ru
 **Seeded IVFFlat builds byte-identical to C in all eight cases.**
 - The seeded oracle is rebuilt with `-DIVFFLAT_BENCH`, the only C configuration that seeds IVFFlat builds (`SeedRandom(42)`, `ivfbuild.c:1075-1077`). On pgrust, the placeholder `pgrust.ivfflat_build_seed = 42` makes `ivfflatbuild` reseed at the same point (Decision 2).
 - The `vector` and `halfvec` cases use well-separated groups of four integer points (`256 × grid + {0,1}²`), so every k-means and assignment comparison has a clear winner. Their stored centers are element-wise sums divided once, which C and pgrust round alike.
-- `ivf_bit_hamming` uses `bit(64)` from md5 under integer Hamming distances. There, nearest-center ties are common: a rough simulation of its data put 9–13% of points on a tie, over five seeds. So the case also pins `bit`'s tie order (a strict `<`, toward the first list) in k-means and in list assignment, and it passes.
+- `ivf_bit_hamming` uses `bit(64)` from md5 under integer Hamming distances. There, nearest-center ties are common: a rough simulation of its data put 9–13% of points on a tie, over five seeds. So the case also pins `bit`'s tie order, and it passes. Build and insert assignment keep the first of equally near lists (a strict `<`, `ivfbuild.c:193`), and so does k-means' initial assignment (`ivfkmeans.c:335`). Elkan's later reassignment keeps a point's current center on a tie (`if (dxc < dxcx)`, `ivfkmeans.c:440`).
 
 | Case | Data | Blocks | Lists | What it exercises |
 |---|---|---|---|---|
@@ -465,8 +465,7 @@ Review minors deferred to a later cleanup, one line each. This section carries e
   - `ivf_bit_hamming` does. Its md5 data under integer Hamming distances tie often, so it pins `bit`'s tie order in k-means and list assignment.
   - Ties are also covered by TAP `008` and `036` and by the unit test `ivf_kmeans_fills_every_center_from_duplicates`. TAP `008` and `036` use duplicate values, where build, insert and scan must all break ties toward the first list.
   - HNSW's tie order rests on M1's pairing heap, as before.
-- **Sort spills.** No tier makes the IVFFlat build sort spill past `maintenance_work_mem`, or the scan sort spill past `work_mem`.
-  - The build-sort spill is the normal case for real-size builds, because every sorted tuple carries its vector.
-  - So within-list tuple order after a spilled build sort, and scan tie order after a spilled scan sort, are unverified.
+- **Sort spills.** No tier makes the IVFFlat build sort spill past `maintenance_work_mem`. The build-sort spill is the normal case for real-size builds, because every sorted tuple carries its vector, so within-list tuple order after a spilled build sort is unverified.
+  - The scan sort does spill past `work_mem` in TAP `003`, `032` and `035`: `test_recall(100, …)` probes all 100 lists of a 100,000-row index at the default 4 MB, which is more (float8, tid) tuples than fit. TAP checks recall only, so scan tie order after a spilled scan sort is not byte-compared.
   - Final-review Ruling 10: recorded here, with no new case in M4. A spill-order difference would be in core tuplesort.
 - **M2's I/O limits stand.** No tier feeds C-produced binary into pgrust's recv; the recv functions and binary-only error sites are checked by unit tests only.
