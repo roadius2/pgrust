@@ -112,6 +112,8 @@ There is an existing pgvector port (upstream 0.8.5 commit `159b79a`, brought to 
 - `crates/_support/types/types_hnsw`.
 - `crates/_support/types/types_ivfflat`.
 
+**Pre-M4 databases:** pgrust builds before M4 installed a trimmed `vector` 0.8.5, so `ALTER EXTENSION vector UPDATE` fails on their databases. To fix one, run `crates/contrib/pgvector/repair/pgrust-trimmed-0.8.5.sql` (generated; `PGVECTOR_REGEN_REPAIR=1` regenerates it) as a superuser in each affected database, then run `ALTER EXTENSION vector UPDATE`.
+
 Parallel index builds (M6) are **not ported**: both AMs build serially.
 
 Direction and roadmap: `docs/Vector Search for pgrust Algorithm & Benchmark Survey.md`. Phase 1 spec: `docs/superpowers/specs/2026-10-04-pgvector-phase1-design.md`; plans in `docs/superpowers/plans/`.
@@ -131,6 +133,7 @@ scripts/pgvector/run-bytecmp.sh {pgrust|ref} [case ...]         # HNSW and IVFFl
 scripts/pgvector/run-iterscan.sh {pgrust|ref} [case ...]        # iterative-scan stop points vs the seeded C build; --list prints the cases
 scripts/pgvector/run-diff.sh {pgrust|ref}                       # exact differential: diffrunner --pgvector + error LOCATIONs
 scripts/pgvector/sqldiff.sh {pgrust|ref} [--verbose] <file|->   # one SQL script on fresh ref and subject servers, diffed
+scripts/pgvector/run-repair-check.sh                            # the pre-M4 repair on all three trimmed 0.8.5 generations, a non-public schema, a 0.8.7 no-op and a rollback
 ```
 
-Stock C pgvector never seeds HNSW or IVFFlat builds. `SET pgrust.hnsw_build_seed = 42` and `SET pgrust.ivfflat_build_seed = 42` (unregistered placeholder options) make pgrust match the seeded C build. `SET pgrust.hnsw_memory = on` (also unregistered) makes pgrust scans print the seeded C build's per-batch `memory: N KB, tuples: T` INFO line; `run-iterscan.sh` compares them. Baselines: `docs/superpowers/reports/pgvector-m0-baseline.md`, `docs/superpowers/reports/pgvector-m1-report.md`, `docs/superpowers/reports/pgvector-m2-report.md`, `docs/superpowers/reports/pgvector-m3-report.md`, `docs/superpowers/reports/pgvector-m4-report.md`.
+Stock C pgvector never seeds HNSW or IVFFlat builds. `SET pgrust.hnsw_build_seed = 42` and `SET pgrust.ivfflat_build_seed = 42` (unregistered placeholder options) make pgrust match the seeded C build. `SET pgrust.hnsw_memory = on` (also unregistered) makes pgrust scans print the seeded C build's per-batch `memory: N KB, tuples: T` INFO line; `run-iterscan.sh` compares them. Baselines: `docs/superpowers/reports/pgvector-m0-baseline.md`, `docs/superpowers/reports/pgvector-m1-report.md`, `docs/superpowers/reports/pgvector-m2-report.md`, `docs/superpowers/reports/pgvector-m3-report.md`, `docs/superpowers/reports/pgvector-m4-report.md`, `docs/superpowers/reports/pgvector-m4-followups-report.md`.
