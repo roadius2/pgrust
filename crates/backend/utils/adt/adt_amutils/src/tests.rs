@@ -9,13 +9,6 @@ fn prop_names_case_insensitive() {
     assert!(matches!(lookup_prop_name(b"asc2"), Prop::Unknown));
 }
 
-// canonical_index_am consults the pg_am.amhandler syscache seam for
-// non-builtin oids (RelationInitTableAccessMethod's lookup); unit rigs have
-// no syscache below them. The stub answers with pg_am.dat's REAL builtin
-// handler oids (330-335) and None for unknown oids (C's !HeapTupleIsValid),
-// so the flag-vs-C assertions and the unknown-AM probe both exercise the
-// genuine paths — not a vacuous pass. Same projection-rig class as
-// type_is_visible / pg_constraint_primary_key_attnos / expandExpressionListStar.
 thread_local! {
     // Per test thread: the stub runs on its caller's thread, so tests running
     // in parallel never count each other's loads.
@@ -26,6 +19,13 @@ fn dummy_fn(_f: Option<&mut types_fmgr::FmgrInfo>, _c: &mut types_fmgr::Function
     Ok(datum::Datum::from_usize(0))
 }
 
+// canonical_index_am consults the pg_am.amhandler syscache seam for
+// non-builtin oids (RelationInitTableAccessMethod's lookup); unit rigs have
+// no syscache below them. The stub answers with pg_am.dat's REAL builtin
+// handler oids (330-335) and None for unknown oids (C's !HeapTupleIsValid),
+// so the flag-vs-C assertions and the unknown-AM probe both exercise the
+// genuine paths — not a vacuous pass. Same projection-rig class as
+// type_is_visible / pg_constraint_primary_key_attnos / expandExpressionListStar.
 fn install_amhandler_stub() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {

@@ -263,11 +263,11 @@ fn am_flags(amoid: Oid) -> PgResult<Option<&'static AmFlags>> {
     })
 }
 
-// C calls the handler (GetIndexAmRoutineByAmId, amutils.c:198 / amapi.c:56-84);
-// a LANGUAGE C handler's C symbol is its prosrc, which survives ALTER
-// FUNCTION ... RENAME. That call's fmgr_info loads the handler's library and
-// runs its _PG_init once per session (fmgr.c:127 -> fmgr_info_C_lang); pgrust
-// does the load and keeps the flag tables.
+// C calls the handler (amutils.c:198 / amutils.c:458 -> GetIndexAmRoutineByAmId
+// -> amapi.c:106); a LANGUAGE C handler's C symbol is its prosrc, which
+// survives ALTER FUNCTION ... RENAME. That call's fmgr_info loads the
+// handler's library and runs its _PG_init once per session (fmgr.c:127 ->
+// fmgr_info_C_lang); pgrust does the load and keeps the flag tables.
 fn extension_am_handler(amoid: Oid) -> PgResult<Option<Vec<u8>>> {
     let Some(handler) = syscache_seams::pg_am_amhandler::call(amoid).ok().flatten() else {
         return Ok(None);
