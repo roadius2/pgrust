@@ -72,6 +72,20 @@ fn am_flag_rows_match_c_handlers() {
     assert!(am_flags(42).is_none());
 }
 
+// amutils.c:368-369: bitmap_scan is amgetbitmap != NULL. Every core AM and
+// bloom has one; hnsw.c:315 and ivfflat.c:232 set amgetbitmap = NULL.
+#[test]
+fn amgetbitmap_matches_c_handlers() {
+    install_amhandler_stub();
+    for oid in [BTREE_AM_OID, HASH_AM_OID, GIST_AM_OID, GIN_AM_OID, SPGIST_AM_OID, BRIN_AM_OID, 20000] {
+        assert!(am_flags(oid).unwrap().has_amgetbitmap, "{oid}");
+    }
+    for oid in [20001, 20002] {
+        let f = am_flags(oid).unwrap();
+        assert!(!f.has_amgetbitmap && f.has_amgettuple, "{oid}");
+    }
+}
+
 #[test]
 fn phasenames_match_c() {
     assert_eq!(bt_phasename(1), Some("initializing"));
