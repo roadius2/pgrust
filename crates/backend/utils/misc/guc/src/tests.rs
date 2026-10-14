@@ -107,6 +107,15 @@ fn show(name: &str) -> Option<String> {
     with_store(|reg| get_config_option_by_name(reg, name, true).unwrap()).unwrap()
 }
 
+// (file, line, function) of an error's C source location, as the wire's
+// F/L/R fields carry it.
+fn loc(e: &types_error::PgError) -> (Option<&str>, i32, Option<&str>) {
+    let l = e.location().expect("location");
+    (l.filename.as_deref(), l.lineno, l.funcname.as_deref())
+}
+
+const PARSE_AND_VALIDATE: &str = "parse_and_validate_value";
+
 #[test]
 fn boot_defaults_seeded() {
     setup();
@@ -133,18 +142,49 @@ fn invalid_values_error_at_session_source() {
     setup();
     let e = set_session("work_mem", Some("banana")).unwrap_err();
     assert!(e.message().contains("invalid value for parameter \"work_mem\""));
+    assert_eq!(loc(&e), (Some("guc.c"), 3166, Some(PARSE_AND_VALIDATE)));
 
     let e = set_session("work_mem", Some("1XB")).unwrap_err();
     assert_eq!(e.hint(), Some(MEMORY_UNITS_HINT));
+    assert_eq!(loc(&e), (Some("guc.c"), 3166, Some(PARSE_AND_VALIDATE)));
 
     let e = set_session("work_mem", Some("1")).unwrap_err();
     assert!(e.message().contains("outside the valid range"), "{}", e.message());
+    assert_eq!(loc(&e), (Some("guc.c"), 3186, Some(PARSE_AND_VALIDATE)));
 
     let e = set_session("statement_timeout", Some("5banana")).unwrap_err();
     assert_eq!(e.hint(), Some(TIME_UNITS_HINT));
+    assert_eq!(loc(&e), (Some("guc.c"), 3166, Some(PARSE_AND_VALIDATE)));
 
     let e = set_session("enable_seqscan", Some("maybe")).unwrap_err();
     assert!(e.message().contains("requires a Boolean value"));
+    assert_eq!(loc(&e), (Some("guc.c"), 3145, Some(PARSE_AND_VALIDATE)));
+}
+
+// The real and enum legs of parse_and_validate_value (guc.c:3207, 3227,
+// 3282) and assignable_custom_variable_name's invalid-name leg (guc.c:1139).
+#[test]
+fn real_and_enum_errors_carry_c_locations() {
+    setup();
+    let e = set_session("seq_page_cost", Some("abc")).unwrap_err();
+    assert_eq!(e.message(), "invalid value for parameter \"seq_page_cost\": \"abc\"");
+    assert_eq!(loc(&e), (Some("guc.c"), 3207, Some(PARSE_AND_VALIDATE)));
+
+    let e = set_session("seq_page_cost", Some("-1")).unwrap_err();
+    assert!(e.message().contains("outside the valid range"), "{}", e.message());
+    assert_eq!(loc(&e), (Some("guc.c"), 3227, Some(PARSE_AND_VALIDATE)));
+
+    let e = set_session("client_min_messages", Some("bogus")).unwrap_err();
+    assert_eq!(e.message(), "invalid value for parameter \"client_min_messages\": \"bogus\"");
+    assert!(e.hint().is_some_and(|h| h.starts_with("Available values: ")), "{:?}", e.hint());
+    assert_eq!(loc(&e), (Some("guc.c"), 3282, Some(PARSE_AND_VALIDATE)));
+
+    let e = set_session("a..b", Some("x")).unwrap_err();
+    assert_eq!(e.message(), "invalid configuration parameter name \"a..b\"");
+    assert_eq!(
+        loc(&e),
+        (Some("guc.c"), 1139, Some("assignable_custom_variable_name"))
+    );
 }
 
 #[test]
@@ -429,6 +469,10 @@ fn custom_placeholder_variables() {
 
     let e = set_session("no_such_parameter", Some("x")).unwrap_err();
     assert!(e.message().contains("unrecognized configuration parameter"));
+    assert_eq!(
+        loc(&e),
+        (Some("guc.c"), 1169, Some("assignable_custom_variable_name"))
+    );
 }
 
 // DefineCustomStringVariable (guc.c:5224 / define_custom_variable
@@ -474,6 +518,10 @@ fn define_custom_string_variable_adopts_placeholder_values() {
     let e = set_session("b021ext.nope", Some("x")).unwrap_err();
     assert!(e.message().contains("invalid configuration parameter name"));
     assert_eq!(e.detail(), Some("\"b021ext\" is a reserved prefix."));
+    assert_eq!(
+        loc(&e),
+        (Some("guc.c"), 1156, Some("assignable_custom_variable_name"))
+    );
     assert_eq!(set_session("b021ext.app_name", Some("later")).unwrap(), 1);
     assert_eq!(show("b021ext.app_name"), Some("later".to_string()));
 }
@@ -855,6 +903,16 @@ fn guc_array_add_reserved_prefix_is_invalid_name() {
     assert_eq!(e.sqlstate(), types_error::ERRCODE_INVALID_NAME, "{}", e.message());
     assert_eq!(e.message(), "invalid configuration parameter name \"b035rsv.bogus\"");
     assert_eq!(e.detail(), Some("\"b035rsv\" is a reserved prefix."));
+    assert_eq!(
+        loc(&e),
+        (Some("guc.c"), 1156, Some("assignable_custom_variable_name"))
+    );
+    // check_GUC_name_for_parameter_acl takes the same path (guc.c:1156).
+    let e = check_GUC_name_for_parameter_acl("b035rsv.bogus").unwrap_err();
+    assert_eq!(
+        loc(&e),
+        (Some("guc.c"), 1156, Some("assignable_custom_variable_name"))
+    );
     // Malformed custom names take the same skip_errors=false path (42602).
     let e = GUCArrayAdd(&[], "b035rsv.bad..name", "x").unwrap_err();
     assert_eq!(e.sqlstate(), types_error::ERRCODE_INVALID_NAME, "{}", e.message());
@@ -1150,6 +1208,10 @@ fn reentrant_string_check(
     _extra: &mut Option<guc_tables::GucHookExtra>,
     _source: GucSource,
 ) -> types_error::PgResult<bool> {
+    // A rejecting hook (returns false with no GUC_check_errmsg) on a sentinel.
+    if newval.as_deref() == Some("reject") {
+        return Ok(false);
+    }
     // check_datestyle's shape: 'DEFAULT' resolves against the reset value.
     if newval.as_deref() == Some("reset") {
         *newval = Some(GetConfigOptionResetString("createrole_self_grant").expect("reset value"));
@@ -1165,6 +1227,76 @@ fn check_hook_may_read_the_store() {
     assert_eq!(get_string("createrole_self_grant"), Some(Some("set, inherit".to_string())));
     assert_eq!(set_session("createrole_self_grant", Some("reset")).unwrap(), 1);
     assert_eq!(get_string("createrole_self_grant"), Some(Some(String::new())));
+}
+
+fn reject_bool_check(
+    newval: &mut bool,
+    _extra: &mut Option<guc_tables::GucHookExtra>,
+    _source: GucSource,
+) -> types_error::PgResult<bool> {
+    Ok(!*newval)
+}
+
+fn reject_int_check(
+    newval: &mut i32,
+    _extra: &mut Option<guc_tables::GucHookExtra>,
+    _source: GucSource,
+) -> types_error::PgResult<bool> {
+    Ok(*newval != 12345)
+}
+
+fn reject_real_check(
+    newval: &mut f64,
+    _extra: &mut Option<guc_tables::GucHookExtra>,
+    _source: GucSource,
+) -> types_error::PgResult<bool> {
+    Ok(*newval != 0.5)
+}
+
+fn reject_enum_check(
+    newval: &mut i32,
+    _extra: &mut Option<guc_tables::GucHookExtra>,
+    _source: GucSource,
+) -> types_error::PgResult<bool> {
+    Ok(*newval != guc_tables::consts::XACT_SERIALIZABLE)
+}
+
+// call_*_check_hook (guc.c:6809-6987): a hook that returns false without
+// GUC_check_errmsg falls back to "invalid value for parameter", located at
+// the ereport in the matching call_<type>_check_hook. The slots are
+// process-global and once-only; each stub rejects only a sentinel no other
+// test in this binary sets.
+#[test]
+fn check_hook_failures_carry_c_locations() {
+    setup();
+    guc_tables::hooks::check_default_with_oids.install_if_absent(reject_bool_check);
+    guc_tables::hooks::check_temp_buffers.install_if_absent(reject_int_check);
+    guc_tables::hooks::check_random_seed.install_if_absent(reject_real_check);
+    guc_tables::hooks::check_createrole_self_grant.install_if_absent(reentrant_string_check);
+    guc_tables::hooks::check_transaction_isolation.install_if_absent(reject_enum_check);
+
+    let e = set_session("default_with_oids", Some("on")).unwrap_err();
+    assert_eq!(e.message(), "invalid value for parameter \"default_with_oids\": 1");
+    assert_eq!(loc(&e), (Some("guc.c"), 6834, Some("call_bool_check_hook")));
+
+    let e = set_session("temp_buffers", Some("12345")).unwrap_err();
+    assert_eq!(e.message(), "invalid value for parameter \"temp_buffers\": 12345");
+    assert_eq!(loc(&e), (Some("guc.c"), 6868, Some("call_int_check_hook")));
+
+    let e = set_session("seed", Some("0.5")).unwrap_err();
+    assert_eq!(e.message(), "invalid value for parameter \"seed\": 0.5");
+    assert_eq!(loc(&e), (Some("guc.c"), 6902, Some("call_real_check_hook")));
+
+    let e = set_session("createrole_self_grant", Some("reject")).unwrap_err();
+    assert_eq!(e.message(), "invalid value for parameter \"createrole_self_grant\": \"reject\"");
+    assert_eq!(loc(&e), (Some("guc.c"), 6945, Some("call_string_check_hook")));
+
+    let e = set_session("transaction_isolation", Some("serializable")).unwrap_err();
+    assert_eq!(
+        e.message(),
+        "invalid value for parameter \"transaction_isolation\": \"serializable\""
+    );
+    assert_eq!(loc(&e), (Some("guc.c"), 6987, Some("call_enum_check_hook")));
 }
 
 // help_config.c printMixedStruct rows as postgres 18.6 --describe-config
@@ -1262,6 +1394,7 @@ fn prefix_reservation_warnings_in_hash_order_with_context() {
             assert_eq!(e.level, types_error::WARNING);
             assert_eq!(e.detail(), Some("\"postgres_fdw\" is now a reserved prefix."));
             assert_eq!(e.context(), Some("SQL statement \"LOAD 'postgres_fdw'\""));
+            assert_eq!(loc(e), (Some("guc.c"), 5312, Some("MarkGUCPrefixReserved")));
             e.message()
                 .trim_start_matches("invalid configuration parameter name \"postgres_fdw.")
                 .trim_end_matches("\", removing it")

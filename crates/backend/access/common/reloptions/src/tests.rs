@@ -119,12 +119,22 @@ fn transform_expands_short_header_old_image() {
     assert_eq!(opts.n_distinct_inherited, 5.0);
 }
 
-fn parse_heap_err(mcx: Mcx<'_>, defs: &NodeList<'_>) -> (String, Option<String>) {
+fn parse_heap_pgerr(mcx: Mcx<'_>, defs: &NodeList<'_>) -> Box<::types_error::PgError> {
     let res = transformRelOptions(mcx, None, defs, None, HEAP_RELOPT_NAMESPACES, true, false)
         .and_then(|img| heap_reloptions(mcx, RELKIND_RELATION, img.as_deref(), true));
-    let e = res.unwrap_err();
-    let out = (e.message().to_string(), e.detail().map(|d| d.to_string()));
-    out
+    res.unwrap_err()
+}
+
+fn parse_heap_err(mcx: Mcx<'_>, defs: &NodeList<'_>) -> (String, Option<String>) {
+    let e = parse_heap_pgerr(mcx, defs);
+    (e.message().to_string(), e.detail().map(|d| d.to_string()))
+}
+
+// (file, line, function) of an error's C source location, as the wire's
+// F/L/R fields carry it.
+fn loc(e: &::types_error::PgError) -> (Option<&str>, i32, Option<&str>) {
+    let l = e.location().expect("location");
+    (l.filename.as_deref(), l.lineno, l.funcname.as_deref())
 }
 
 #[test]
@@ -133,22 +143,25 @@ fn validation_error_texts_match_c() {
     let mcx = cx.mcx();
 
     let l = NodeList::make1(mcx, def(mcx, None, "fillfactor", Some("2"))).unwrap();
-    let (m, d) = parse_heap_err(mcx, &l);
-    assert_eq!(m, "value 2 out of bounds for option \"fillfactor\"");
-    assert_eq!(d.as_deref(), Some("Valid values are between \"10\" and \"100\"."));
+    let e = parse_heap_pgerr(mcx, &l);
+    assert_eq!(e.message(), "value 2 out of bounds for option \"fillfactor\"");
+    assert_eq!(e.detail(), Some("Valid values are between \"10\" and \"100\"."));
+    assert_eq!(loc(&e), (Some("reloptions.c"), 1637, Some("parse_one_reloption")));
 
     let l = NodeList::make1(
         mcx,
         def(mcx, None, "autovacuum_analyze_scale_factor", Some("110.0")),
     )
     .unwrap();
-    let (m, d) = parse_heap_err(mcx, &l);
-    assert_eq!(m, "value 110.0 out of bounds for option \"autovacuum_analyze_scale_factor\"");
-    assert_eq!(d.as_deref(), Some("Valid values are between \"0.000000\" and \"100.000000\"."));
+    let e = parse_heap_pgerr(mcx, &l);
+    assert_eq!(e.message(), "value 110.0 out of bounds for option \"autovacuum_analyze_scale_factor\"");
+    assert_eq!(e.detail(), Some("Valid values are between \"0.000000\" and \"100.000000\"."));
+    assert_eq!(loc(&e), (Some("reloptions.c"), 1657, Some("parse_one_reloption")));
 
     let l = NodeList::make1(mcx, def(mcx, None, "not_existing_option", Some("2"))).unwrap();
-    let (m, _) = parse_heap_err(mcx, &l);
-    assert_eq!(m, "unrecognized parameter \"not_existing_option\"");
+    let e = parse_heap_pgerr(mcx, &l);
+    assert_eq!(e.message(), "unrecognized parameter \"not_existing_option\"");
+    assert_eq!(loc(&e), (Some("reloptions.c"), 1488, Some("parseRelOptionsInternal")));
 
     let l = NodeList::make1(
         mcx,
@@ -159,23 +172,26 @@ fn validation_error_texts_match_c() {
     assert_eq!(m, "unrecognized parameter namespace \"not_existing_namespace\"");
 
     let l = NodeList::make1(mcx, def(mcx, None, "fillfactor", Some("string"))).unwrap();
-    let (m, _) = parse_heap_err(mcx, &l);
-    assert_eq!(m, "invalid value for integer option \"fillfactor\": string");
+    let e = parse_heap_pgerr(mcx, &l);
+    assert_eq!(e.message(), "invalid value for integer option \"fillfactor\": string");
+    assert_eq!(loc(&e), (Some("reloptions.c"), 1629, Some("parse_one_reloption")));
 
     let l = NodeList::make1(mcx, def(mcx, None, "autovacuum_enabled", Some("12"))).unwrap();
-    let (m, _) = parse_heap_err(mcx, &l);
-    assert_eq!(m, "invalid value for boolean option \"autovacuum_enabled\": 12");
+    let e = parse_heap_pgerr(mcx, &l);
+    assert_eq!(e.message(), "invalid value for boolean option \"autovacuum_enabled\": 12");
+    assert_eq!(loc(&e), (Some("reloptions.c"), 1617, Some("parse_one_reloption")));
 
     let l = NodeList::make1(
         mcx,
         def(mcx, None, "autovacuum_analyze_scale_factor", Some("string")),
     )
     .unwrap();
-    let (m, _) = parse_heap_err(mcx, &l);
+    let e = parse_heap_pgerr(mcx, &l);
     assert_eq!(
-        m,
+        e.message(),
         "invalid value for floating point option \"autovacuum_analyze_scale_factor\": string"
     );
+    assert_eq!(loc(&e), (Some("reloptions.c"), 1649, Some("parse_one_reloption")));
 
     let l = NodeList::make2(
         mcx,
@@ -183,19 +199,93 @@ fn validation_error_texts_match_c() {
         def(mcx, None, "fillfactor", Some("40")),
     )
     .unwrap();
-    let (m, _) = parse_heap_err(mcx, &l);
-    assert_eq!(m, "parameter \"fillfactor\" specified more than once");
+    let e = parse_heap_pgerr(mcx, &l);
+    assert_eq!(e.message(), "parameter \"fillfactor\" specified more than once");
+    assert_eq!(loc(&e), (Some("reloptions.c"), 1601, Some("parse_one_reloption")));
 
     // Name-only non-boolean: "fillfactor" flattens to fillfactor=true.
     let l = NodeList::make1(mcx, def(mcx, None, "fillfactor", None)).unwrap();
-    let (m, _) = parse_heap_err(mcx, &l);
-    assert_eq!(m, "invalid value for integer option \"fillfactor\": true");
+    let e = parse_heap_pgerr(mcx, &l);
+    assert_eq!(e.message(), "invalid value for integer option \"fillfactor\": true");
+    assert_eq!(loc(&e), (Some("reloptions.c"), 1629, Some("parse_one_reloption")));
 
     // -30.1 parses via the strtod leg, rint()s to -30, then bounds-fails
     // with the original string in the message.
     let l = NodeList::make1(mcx, def(mcx, None, "fillfactor", Some("-30.1"))).unwrap();
-    let (m, _) = parse_heap_err(mcx, &l);
-    assert_eq!(m, "value -30.1 out of bounds for option \"fillfactor\"");
+    let e = parse_heap_pgerr(mcx, &l);
+    assert_eq!(e.message(), "value -30.1 out of bounds for option \"fillfactor\"");
+    assert_eq!(loc(&e), (Some("reloptions.c"), 1637, Some("parse_one_reloption")));
+}
+
+// The enum leg of parse_one_reloption (reloptions.c:1681) and the unknown-key
+// leg of parseRelOptionsInternal (reloptions.c:1488), through a heap
+// reloption and an index AM's (the opclass-free `index_reloptions` path).
+#[test]
+fn reloption_enum_and_unrecognized_locations() {
+    let cx = MemoryContext::new("t");
+    let mcx = cx.mcx();
+
+    let l = NodeList::make1(mcx, def(mcx, None, "vacuum_index_cleanup", Some("maybe"))).unwrap();
+    let e = parse_heap_pgerr(mcx, &l);
+    assert_eq!(e.message(), "invalid value for enum option \"vacuum_index_cleanup\": maybe");
+    assert_eq!(e.detail(), Some("Valid values are \"on\", \"off\", and \"auto\"."));
+    assert_eq!(loc(&e), (Some("reloptions.c"), 1681, Some("parse_one_reloption")));
+
+    let l = NodeList::make1(mcx, def(mcx, None, "buffering", Some("sometimes"))).unwrap();
+    let img = transformRelOptions(mcx, None, &l, None, &[], false, false).unwrap().unwrap();
+    let e = index_reloptions(mcx, GIST_AM_OID, Some(&img), true).unwrap_err();
+    assert_eq!(e.message(), "invalid value for enum option \"buffering\": sometimes");
+    assert_eq!(loc(&e), (Some("reloptions.c"), 1681, Some("parse_one_reloption")));
+
+    let l = NodeList::make1(mcx, def(mcx, None, "no_such_option", Some("1"))).unwrap();
+    let e = parse_heap_pgerr(mcx, &l);
+    assert_eq!(e.message(), "unrecognized parameter \"no_such_option\"");
+    assert_eq!(loc(&e), (Some("reloptions.c"), 1488, Some("parseRelOptionsInternal")));
+
+    let l = NodeList::make1(mcx, def(mcx, None, "no_such_option", Some("1"))).unwrap();
+    let img = transformRelOptions(mcx, None, &l, None, &[], false, false).unwrap().unwrap();
+    let e = index_reloptions(mcx, GIST_AM_OID, Some(&img), true).unwrap_err();
+    assert_eq!(e.message(), "unrecognized parameter \"no_such_option\"");
+    assert_eq!(loc(&e), (Some("reloptions.c"), 1488, Some("parseRelOptionsInternal")));
+}
+
+// The opclass (local) options path shares parse_opt_value and repeats the
+// duplicate and unknown-key checks inline (reloptions.c:1601, 1488).
+#[test]
+fn local_reloption_locations() {
+    let cx = MemoryContext::new("t");
+    let mcx = cx.mcx();
+    let mut relopts = LocalRelopts::new();
+    relopts.init(8);
+    relopts.add_int("siglen", 8, 1, 100, 4);
+
+    let build = |defs: &NodeList<'_>| {
+        let img = transformRelOptions(mcx, None, defs, None, &[], false, false)
+            .unwrap()
+            .unwrap();
+        build_local_reloptions(mcx, &relopts, Datum::from_usize(img.as_ptr() as usize), true)
+            .unwrap_err()
+    };
+
+    let l = NodeList::make2(
+        mcx,
+        def(mcx, None, "siglen", Some("8")),
+        def(mcx, None, "siglen", Some("9")),
+    )
+    .unwrap();
+    let e = build(&l);
+    assert_eq!(e.message(), "parameter \"siglen\" specified more than once");
+    assert_eq!(loc(&e), (Some("reloptions.c"), 1601, Some("parse_one_reloption")));
+
+    let l = NodeList::make1(mcx, def(mcx, None, "nope", Some("1"))).unwrap();
+    let e = build(&l);
+    assert_eq!(e.message(), "unrecognized parameter \"nope\"");
+    assert_eq!(loc(&e), (Some("reloptions.c"), 1488, Some("parseRelOptionsInternal")));
+
+    let l = NodeList::make1(mcx, def(mcx, None, "siglen", Some("101"))).unwrap();
+    let e = build(&l);
+    assert_eq!(e.message(), "value 101 out of bounds for option \"siglen\"");
+    assert_eq!(loc(&e), (Some("reloptions.c"), 1637, Some("parse_one_reloption")));
 }
 
 #[test]

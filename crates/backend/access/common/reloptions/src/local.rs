@@ -101,6 +101,7 @@ pub fn build_local_reloptions(
                                 "parameter \"{kw}\" specified more than once"
                             ))
                             .into_error()
+                            .with_location("reloptions.c", 1601, "parse_one_reloption")
                             .into());
                     }
                     if let Some(v) =
@@ -122,6 +123,7 @@ pub fn build_local_reloptions(
                     .errcode(ERRCODE_INVALID_PARAMETER_VALUE)
                     .errmsg(format!("unrecognized parameter \"{name}\""))
                     .into_error()
+                    .with_location("reloptions.c", 1488, "parseRelOptionsInternal")
                     .into());
             }
         }

@@ -100,6 +100,14 @@ else
   r=FAIL
 fi
 printf 'library_load\t%s\n' "$r" | tee -a "$out/summary.tsv"
+# Core error sites pgvector SQL reaches (reloptions.c, guc.c; float.c and
+# mcxt.c from Task 5), LOCATION included (M4 follow-ups).
+if "$here/sqldiff.sh" "$mode" --verbose "$here/sql/core-error-locations.sql" >"$out/core-error-locations.log" 2>&1; then
+  r=ok
+else
+  r=FAIL
+fi
+printf 'core_error_locations\t%s\n' "$r" | tee -a "$out/summary.tsv"
 
 total=$(wc -l <"$out/summary.tsv" | tr -d ' ')
 passed=$(grep -c $'\tok$' "$out/summary.tsv" || true)

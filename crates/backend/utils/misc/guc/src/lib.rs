@@ -387,7 +387,7 @@ pub fn assignable_custom_variable_name(name: &str, skip_errors: bool) -> PgResul
                         "Custom parameter names must be two or more simple identifiers separated by dots.",
                     )
                     .into_error()
-                    .with_funcname("assignable_custom_variable_name")
+                    .with_location("guc.c", 1139, "assignable_custom_variable_name")
                     .into());
             }
             return Ok(false);
@@ -406,7 +406,7 @@ pub fn assignable_custom_variable_name(name: &str, skip_errors: bool) -> PgResul
                     .errmsg(format!("invalid configuration parameter name \"{name}\""))
                     .errdetail(format!("\"{rcprefix}\" is a reserved prefix."))
                     .into_error()
-                    .with_funcname("assignable_custom_variable_name")
+                    .with_location("guc.c", 1156, "assignable_custom_variable_name")
                     .into());
             }
             return Ok(false);
@@ -415,7 +415,9 @@ pub fn assignable_custom_variable_name(name: &str, skip_errors: bool) -> PgResul
     }
 
     if !skip_errors {
-        return Err(unrecognized(name).with_funcname("assignable_custom_variable_name").into());
+        return Err(unrecognized(name)
+            .with_location("guc.c", 1169, "assignable_custom_variable_name")
+            .into());
     }
     Ok(false)
 }
@@ -625,7 +627,7 @@ pub fn MarkGUCPrefixReserved(class_name: &str) {
             .errcode(types_error::ERRCODE_INVALID_NAME)
             .errmsg(format!("invalid configuration parameter name \"{name}\", removing it"))
             .errdetail(format!("\"{class_name}\" is now a reserved prefix."))
-            .finish(types_error::ErrorLocation::new(file!(), line!() as i32, "MarkGUCPrefixReserved"));
+            .finish(types_error::ErrorLocation::new("guc.c", 5312, "MarkGUCPrefixReserved"));
     }
     RESERVED_CLASS_PREFIX.with(|s| {
         let prefixes = &mut s.borrow_mut().prefixes;

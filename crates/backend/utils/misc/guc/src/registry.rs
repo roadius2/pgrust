@@ -549,6 +549,7 @@ pub fn parse_and_validate_value(
                         ERRCODE_INVALID_PARAMETER_VALUE,
                         format!("parameter \"{name}\" requires a Boolean value"),
                     )
+                    .with_location("guc.c", 3145, "parse_and_validate_value")
                     .into())
                 }
             };
@@ -558,7 +559,9 @@ pub fn parse_and_validate_value(
         GucVariable::Int(conf) => {
             let mut newval = match parse_int(value, gen.flags) {
                 ParseNum::Ok(v) => v,
-                ParseNum::Err { hint } => return Err(invalid_value_error(name, value, hint).into()),
+                ParseNum::Err { hint } => {
+                    return Err(invalid_value_error(name, value, hint, 3166).into())
+                }
             };
             if newval < conf.min || newval > conf.max {
                 let (unit, sp) = unit_and_space(gen.flags);
@@ -569,6 +572,7 @@ pub fn parse_and_validate_value(
                         conf.min, conf.max
                     ),
                 )
+                .with_location("guc.c", 3186, "parse_and_validate_value")
                 .into());
             }
             let extra = call_int_check_hook(conf, &mut newval, source)?;
@@ -577,7 +581,9 @@ pub fn parse_and_validate_value(
         GucVariable::Real(conf) => {
             let mut newval = match parse_real(value, gen.flags) {
                 ParseNum::Ok(v) => v,
-                ParseNum::Err { hint } => return Err(invalid_value_error(name, value, hint).into()),
+                ParseNum::Err { hint } => {
+                    return Err(invalid_value_error(name, value, hint, 3207).into())
+                }
             };
             if newval < conf.min || newval > conf.max {
                 // guc.c: "%g%s%s is outside the valid range ..." — %g, so
@@ -592,6 +598,7 @@ pub fn parse_and_validate_value(
                         fmt_g(conf.max)
                     ),
                 )
+                .with_location("guc.c", 3227, "parse_and_validate_value")
                 .into());
             }
             let extra = call_real_check_hook(conf, &mut newval, source)?;
@@ -618,6 +625,7 @@ pub fn parse_and_validate_value(
                         ))
                         .errhint(hint)
                         .into_error()
+                        .with_location("guc.c", 3282, "parse_and_validate_value")
                         .into());
                 }
             };
@@ -641,7 +649,9 @@ fn truncate_name(s: &str) -> PgResult<String> {
     Ok(String::from_utf8_lossy(&ident).into_owned())
 }
 
-fn invalid_value_error(name: &str, value: &str, hint: Option<&str>) -> PgError {
+// `line` is the closing line of the ereport in parse_and_validate_value
+// (guc.c:3166 for the int leg, 3207 for the real leg).
+fn invalid_value_error(name: &str, value: &str, hint: Option<&str>, line: i32) -> PgError {
     let mut b = ereport(ERROR)
         .errcode(ERRCODE_INVALID_PARAMETER_VALUE)
         .errmsg(format!(
@@ -650,7 +660,7 @@ fn invalid_value_error(name: &str, value: &str, hint: Option<&str>) -> PgError {
     if let Some(h) = hint {
         b = b.errhint(h.to_string());
     }
-    b.into_error()
+    b.into_error().with_location("guc.c", line, "parse_and_validate_value")
 }
 
 fn unit_and_space(flags: i32) -> (&'static str, &'static str) {
@@ -684,7 +694,7 @@ fn check_hook_error(fallback: String) -> PgError {
 }
 
 macro_rules! check_hook_caller {
-    ($fname:ident, $conf:ty, $val:ty, $fallback:expr) => {
+    ($fname:ident, $conf:ty, $val:ty, $line:expr, $fallback:expr) => {
         fn $fname(
             conf: &$conf,
             newval: &mut $val,
@@ -701,7 +711,11 @@ macro_rules! check_hook_caller {
             if (slot.get())(newval, &mut extra, source)? {
                 Ok(extra.map(SharedExtra::new))
             } else {
-                Err(check_hook_error($fallback(conf, newval)).into())
+                // guc.c's call_<type>_check_hook ereport; stringify!($fname)
+                // is C's function name.
+                Err(check_hook_error($fallback(conf, newval))
+                    .with_location("guc.c", $line, stringify!($fname))
+                    .into())
             }
         }
     };
@@ -711,6 +725,7 @@ check_hook_caller!(
     call_bool_check_hook,
     config_bool,
     bool,
+    6834,
     |c: &config_bool, v: &bool| format!(
         "invalid value for parameter \"{}\": {}",
         c.gen.name, *v as i32
@@ -720,18 +735,21 @@ check_hook_caller!(
     call_int_check_hook,
     config_int,
     i32,
+    6868,
     |c: &config_int, v: &i32| format!("invalid value for parameter \"{}\": {}", c.gen.name, v)
 );
 check_hook_caller!(
     call_real_check_hook,
     config_real,
     f64,
+    6902,
     |c: &config_real, v: &f64| format!("invalid value for parameter \"{}\": {}", c.gen.name, v)
 );
 check_hook_caller!(
     call_string_check_hook,
     config_string,
     Option<String>,
+    6945,
     |c: &config_string, v: &Option<String>| format!(
         "invalid value for parameter \"{}\": \"{}\"",
         c.gen.name,
@@ -742,6 +760,7 @@ check_hook_caller!(
     call_enum_check_hook,
     config_enum,
     i32,
+    6987,
     |c: &config_enum, v: &i32| format!(
         "invalid value for parameter \"{}\": \"{}\"",
         c.gen.name,

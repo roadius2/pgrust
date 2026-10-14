@@ -434,6 +434,7 @@ pub fn parseRelOptions<'mcx>(
                 .errcode(ERRCODE_INVALID_PARAMETER_VALUE)
                 .errmsg(format!("unrecognized parameter \"{name}\""))
                 .into_error()
+                .with_location("reloptions.c", 1488, "parseRelOptionsInternal")
                 .into());
         }
     }
@@ -446,6 +447,7 @@ fn parse_one_reloption(option: &mut RelOptValue, value: &str, validate: bool) ->
             .errcode(ERRCODE_INVALID_PARAMETER_VALUE)
             .errmsg(format!("parameter \"{}\" specified more than once", option.def.name))
             .into_error()
+            .with_location("reloptions.c", 1601, "parse_one_reloption")
             .into());
     }
     if let Some(v) = parse_opt_value(option.def.name, &option.def.data, value, validate)? {
@@ -474,6 +476,7 @@ fn parse_opt_value(
                         .errcode(ERRCODE_INVALID_PARAMETER_VALUE)
                         .errmsg(format!("invalid value for boolean option \"{name}\": {value}"))
                         .into_error()
+                        .with_location("reloptions.c", 1617, "parse_one_reloption")
                         .into());
                 }
                 None
@@ -489,6 +492,7 @@ fn parse_opt_value(
                             "Valid values are between \"{min}\" and \"{max}\"."
                         ))
                         .into_error()
+                        .with_location("reloptions.c", 1637, "parse_one_reloption")
                         .into());
                 }
                 Some(OptVal::Int(v))
@@ -499,6 +503,7 @@ fn parse_opt_value(
                         .errcode(ERRCODE_INVALID_PARAMETER_VALUE)
                         .errmsg(format!("invalid value for integer option \"{name}\": {value}"))
                         .into_error()
+                        .with_location("reloptions.c", 1629, "parse_one_reloption")
                         .into());
                 }
                 None
@@ -514,6 +519,7 @@ fn parse_opt_value(
                             "Valid values are between \"{min:.6}\" and \"{max:.6}\"."
                         ))
                         .into_error()
+                        .with_location("reloptions.c", 1657, "parse_one_reloption")
                         .into());
                 }
                 Some(OptVal::Real(v))
@@ -526,6 +532,7 @@ fn parse_opt_value(
                             "invalid value for floating point option \"{name}\": {value}"
                         ))
                         .into_error()
+                        .with_location("reloptions.c", 1649, "parse_one_reloption")
                         .into());
                 }
                 None
@@ -541,6 +548,7 @@ fn parse_opt_value(
                             .errmsg(format!("invalid value for enum option \"{name}\": {value}"))
                             .errdetail(detailmsg.to_string())
                             .into_error()
+                            .with_location("reloptions.c", 1681, "parse_one_reloption")
                             .into());
                     }
                     None
