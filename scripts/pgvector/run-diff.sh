@@ -92,6 +92,14 @@ else
   r=FAIL
 fi
 printf 'ivfflat_errors\t%s\n' "$r" | tee -a "$out/summary.tsv"
+# Where a session first loads vector (_PG_init's prefix reservation), against
+# C's fmgr loads at the AM handler call sites (M4 follow-ups, Task 3).
+if "$here/sqldiff.sh" "$mode" "$here/sql/library-load.sql" >"$out/library-load.log" 2>&1; then
+  r=ok
+else
+  r=FAIL
+fi
+printf 'library_load\t%s\n' "$r" | tee -a "$out/summary.tsv"
 
 total=$(wc -l <"$out/summary.tsv" | tr -d ' ')
 passed=$(grep -c $'\tok$' "$out/summary.tsv" || true)

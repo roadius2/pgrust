@@ -199,9 +199,10 @@ fn lookup_am_handler_func(
     // set — a builtin handler, or a LANGUAGE internal alias whose prosrc
     // names one (fmgr.c:236-247 fmgr_lookupByName) — so the catalog never
     // carries an AM that cannot run; the amapi / relcache resolvers keep loud
-    // backstops behind this fence.
+    // backstops behind this fence. C never calls the handler here
+    // (amcmds.c:78), so the library is not loaded.
     let known = match amtype {
-        AMTYPE_INDEX => amapi::GetIndexAmRoutine(handlerOid).is_ok(),
+        AMTYPE_INDEX => amapi::index_am_kind_of_handler(handlerOid).is_ok(),
         // Handler proc oid 3 = heap_tableam_handler (pg_proc.dat); the
         // closed-AM engine carries no other table AM handler (pgrcolumnar is
         // resolved by pg_am.amname, docs/design/pgrcolumnar-impl.md §7.1).

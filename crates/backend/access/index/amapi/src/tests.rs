@@ -104,48 +104,80 @@ fn constants_match_pg_am_h() {
     );
 }
 
+// The pg_proc stubs behind the handler-dispatch tests. Seams are set once
+// per test binary, so the install is guarded.
+fn install_proname_stub() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        fn named(name: &str) -> NameData {
+            let mut n = NameData::default();
+            n.namestrcpy(name);
+            n
+        }
+        syscache_seams::pg_proc_proname::set(|funcid| {
+            Ok(match funcid {
+                5000 => Some(named("blhandler")),
+                5001 => Some(named("int4pl")),
+                5002 => Some(named("fpb4_bt_handler")),
+                5003 => Some(named("fpb4_int4pl")),
+                5004 => Some(named("ivfflathandler")),
+                _ => None,
+            })
+        });
+        // 5002/5003: CREATE FUNCTION ... LANGUAGE internal aliases (prolang 12);
+        // fmgr_info dispatches them by prosrc (fmgr.c:236-247 fmgr_lookupByName).
+        syscache_seams::lookup_pg_proc_fmgr::set(|funcid| {
+            Ok(match funcid {
+                5002 | 5003 => Some(syscache_seams::PgProcFmgrShape {
+                    prolang: 12,
+                    prorettype: 325,
+                    pronargs: 1,
+                    proisstrict: true,
+                    proretset: false,
+                    prosecdef: false,
+                    proconfig_isnull: true,
+                    xmin: 0,
+                    tid: Default::default(),
+                }),
+                _ => None,
+            })
+        });
+        syscache_seams::lookup_pg_proc_prosrc::set(|cx, funcid| {
+            Ok(match funcid {
+                5002 => Some(mcx::PgString::from_str_in("bthandler", cx)?),
+                5003 => Some(mcx::PgString::from_str_in("int4pl", cx)?),
+                _ => None,
+            })
+        });
+    });
+}
+
+thread_local! {
+    // Per test thread: the stub runs on its caller's thread, so tests running
+    // in parallel never count each other's loads.
+    static FMGR_INFO_CALLS: std::cell::RefCell<Vec<Oid>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn dummy_fn(_f: Option<&mut types_fmgr::FmgrInfo>, _c: &mut types_fmgr::FunctionCallInfoBaseData) -> PgResult<datum::Datum> {
+    Ok(datum::Datum::from_usize(0))
+}
+
+fn install_fmgr_info_stub() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if !fmgr_seams::fmgr_info::is_installed() {
+            fmgr_seams::fmgr_info::set(|oid| {
+                FMGR_INFO_CALLS.with(|c| c.borrow_mut().push(oid));
+                Ok(types_fmgr::FmgrInfo::new(dummy_fn, 0, 0, true, false))
+            });
+        }
+    });
+}
+
 #[test]
 fn handler_dispatch_is_the_closed_set() {
-    fn named(name: &str) -> NameData {
-        let mut n = NameData::default();
-        n.namestrcpy(name);
-        n
-    }
-    syscache_seams::pg_proc_proname::set(|funcid| {
-        Ok(match funcid {
-            5000 => Some(named("blhandler")),
-            5001 => Some(named("int4pl")),
-            5002 => Some(named("fpb4_bt_handler")),
-            5003 => Some(named("fpb4_int4pl")),
-            5004 => Some(named("ivfflathandler")),
-            _ => None,
-        })
-    });
-    // 5002/5003: CREATE FUNCTION ... LANGUAGE internal aliases (prolang 12);
-    // fmgr_info dispatches them by prosrc (fmgr.c:236-247 fmgr_lookupByName).
-    syscache_seams::lookup_pg_proc_fmgr::set(|funcid| {
-        Ok(match funcid {
-            5002 | 5003 => Some(syscache_seams::PgProcFmgrShape {
-                prolang: 12,
-                prorettype: 325,
-                pronargs: 1,
-                proisstrict: true,
-                proretset: false,
-                prosecdef: false,
-                proconfig_isnull: true,
-                xmin: 0,
-                tid: Default::default(),
-            }),
-            _ => None,
-        })
-    });
-    syscache_seams::lookup_pg_proc_prosrc::set(|cx, funcid| {
-        Ok(match funcid {
-            5002 => Some(mcx::PgString::from_str_in("bthandler", cx)?),
-            5003 => Some(mcx::PgString::from_str_in("int4pl", cx)?),
-            _ => None,
-        })
-    });
+    install_proname_stub();
+    install_fmgr_info_stub();
     assert_eq!(GetIndexAmRoutine(F_BTHANDLER).unwrap(), IndexAmKind::Btree);
     assert_eq!(GetIndexAmRoutine(F_BRINHANDLER).unwrap(), IndexAmKind::Brin);
     assert_eq!(GetIndexAmRoutine(5000).unwrap(), IndexAmKind::Bloom);
@@ -169,6 +201,25 @@ fn handler_dispatch_is_the_closed_set() {
         "index access method handler function 5001 did not return an IndexAmRoutine struct"
     );
     assert_eq!(e.sqlstate(), ERRCODE_INTERNAL_ERROR);
+}
+
+// amapi.c:38 OidFunctionCall0(amhandler): fmgr_info loads a LANGUAGE c
+// handler's library (fmgr_info_C_lang, running _PG_init once per session);
+// the builtin handlers and the no-load resolver never reach it.
+#[test]
+fn extension_handlers_load_their_library() {
+    install_proname_stub();
+    install_fmgr_info_stub();
+    let before = |oid| FMGR_INFO_CALLS.with(|c| c.borrow().iter().filter(|&&o| o == oid).count());
+    let (bl, ivf) = (before(5000), before(5004));
+    assert_eq!(GetIndexAmRoutine(5004).unwrap(), IndexAmKind::Ivfflat);
+    assert_eq!(GetIndexAmRoutine(5000).unwrap(), IndexAmKind::Bloom);
+    assert_eq!((before(5000), before(5004)), (bl + 1, ivf + 1));
+    assert_eq!(index_am_kind_of_handler(5004).unwrap(), IndexAmKind::Ivfflat);
+    assert_eq!(before(5004), ivf + 1);
+    let n = FMGR_INFO_CALLS.with(|c| c.borrow().len());
+    assert_eq!(GetIndexAmRoutine(F_BTHANDLER).unwrap(), IndexAmKind::Btree);
+    assert_eq!(FMGR_INFO_CALLS.with(|c| c.borrow().len()), n);
 }
 
 #[test]

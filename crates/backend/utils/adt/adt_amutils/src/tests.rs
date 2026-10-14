@@ -16,9 +16,25 @@ fn prop_names_case_insensitive() {
 // so the flag-vs-C assertions and the unknown-AM probe both exercise the
 // genuine paths — not a vacuous pass. Same projection-rig class as
 // type_is_visible / pg_constraint_primary_key_attnos / expandExpressionListStar.
+thread_local! {
+    // Per test thread: the stub runs on its caller's thread, so tests running
+    // in parallel never count each other's loads.
+    static FMGR_INFO_CALLS: std::cell::RefCell<Vec<Oid>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn dummy_fn(_f: Option<&mut types_fmgr::FmgrInfo>, _c: &mut types_fmgr::FunctionCallInfoBaseData) -> PgResult<datum::Datum> {
+    Ok(datum::Datum::from_usize(0))
+}
+
 fn install_amhandler_stub() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
+        if !fmgr_seams::fmgr_info::is_installed() {
+            fmgr_seams::fmgr_info::set(|oid| {
+                FMGR_INFO_CALLS.with(|c| c.borrow_mut().push(oid));
+                Ok(types_fmgr::FmgrInfo::new(dummy_fn, 0, 0, true, false))
+            });
+        }
         syscache_seams::pg_am_amhandler::set(|amoid| {
             Ok(match amoid {
                 BTREE_AM_OID => Some(330),
@@ -50,26 +66,26 @@ fn install_amhandler_stub() {
 #[test]
 fn extension_am_identified_by_handler_prosrc() {
     install_amhandler_stub();
-    let bloom = am_flags(20000).unwrap();
+    let bloom = am_flags(20000).unwrap().unwrap();
     assert!(bloom.amcanmulticol && !bloom.has_ambuildphasename && !bloom.amcanorderbyop);
-    let hnsw = am_flags(20001).unwrap();
+    let hnsw = am_flags(20001).unwrap().unwrap();
     assert!(hnsw.amcanorderbyop && hnsw.has_ambuildphasename && !hnsw.amcanmulticol);
-    let ivfflat = am_flags(20002).unwrap();
+    let ivfflat = am_flags(20002).unwrap().unwrap();
     assert!(ivfflat.amcanorderbyop && ivfflat.has_ambuildphasename && !ivfflat.amcanmulticol);
 }
 
 #[test]
 fn am_flag_rows_match_c_handlers() {
     install_amhandler_stub();
-    let bt = am_flags(BTREE_AM_OID).unwrap();
+    let bt = am_flags(BTREE_AM_OID).unwrap().unwrap();
     assert!(bt.amcanorder && bt.amcanunique && bt.amsearcharray && bt.has_ambuildphasename);
-    let hash = am_flags(HASH_AM_OID).unwrap();
+    let hash = am_flags(HASH_AM_OID).unwrap().unwrap();
     assert!(hash.amcanbackward && !hash.amcanorder && !hash.amcaninclude);
-    let gin = am_flags(GIN_AM_OID).unwrap();
+    let gin = am_flags(GIN_AM_OID).unwrap().unwrap();
     assert!(!gin.has_amgettuple && gin.has_ambuildphasename && gin.amcanmulticol);
-    let brin = am_flags(BRIN_AM_OID).unwrap();
+    let brin = am_flags(BRIN_AM_OID).unwrap().unwrap();
     assert!(!brin.has_amgettuple && brin.amsearchnulls && !brin.amclusterable);
-    assert!(am_flags(42).is_none());
+    assert!(am_flags(42).unwrap().is_none());
 }
 
 // amutils.c:368-369: bitmap_scan is amgetbitmap != NULL. Every core AM and
@@ -78,12 +94,26 @@ fn am_flag_rows_match_c_handlers() {
 fn amgetbitmap_matches_c_handlers() {
     install_amhandler_stub();
     for oid in [BTREE_AM_OID, HASH_AM_OID, GIST_AM_OID, GIN_AM_OID, SPGIST_AM_OID, BRIN_AM_OID, 20000] {
-        assert!(am_flags(oid).unwrap().has_amgetbitmap, "{oid}");
+        assert!(am_flags(oid).unwrap().unwrap().has_amgetbitmap, "{oid}");
     }
     for oid in [20001, 20002] {
-        let f = am_flags(oid).unwrap();
+        let f = am_flags(oid).unwrap().unwrap();
         assert!(!f.has_amgetbitmap && f.has_amgettuple, "{oid}");
     }
+}
+
+// amutils.c:198 calls the extension AM's handler: its library loads. Core AMs
+// resolve without fmgr.
+#[test]
+fn extension_am_properties_load_the_library() {
+    install_amhandler_stub();
+    let calls = |oid| FMGR_INFO_CALLS.with(|c| c.borrow().iter().filter(|&&o| o == oid).count());
+    let before = calls(9998);
+    assert!(am_flags(20001).unwrap().unwrap().amcanorderbyop);
+    assert_eq!(calls(9998), before + 1);
+    let n = FMGR_INFO_CALLS.with(|c| c.borrow().len());
+    assert!(am_flags(BTREE_AM_OID).unwrap().is_some());
+    assert_eq!(FMGR_INFO_CALLS.with(|c| c.borrow().len()), n);
 }
 
 #[test]

@@ -27,12 +27,26 @@ const NAMEDATALEN: usize = 64;
 /// C calls the handler by OID and gets a palloc'd IndexAmRoutine; the closed
 /// AM set makes the routine the IndexAmKind enum. The builtin handlers need
 /// no catalog access, so this is safe while bootstrapping catalog indexes
-/// (relcache relies on that). Any other handler resolves the way C's
-/// OidFunctionCall0(amhandler) does: no pg_proc row is fmgr.c:183 "cache
-/// lookup failed for function %u"; a proc that is not one of the ported
-/// handlers is amapi.c:42 "index access method handler function %u did not
-/// return an IndexAmRoutine struct" — catchable XX000s, never a panic.
+/// (relcache relies on that).
 pub fn GetIndexAmRoutine(amhandler: Oid) -> PgResult<IndexAmKind> {
+    let kind = index_am_kind_of_handler(amhandler)?;
+    // amapi.c:38 OidFunctionCall0(amhandler): its fmgr_info (fmgr.c:127 ->
+    // fmgr_info_C_lang) loads a LANGUAGE c handler's library and runs its
+    // _PG_init once per session. The in-tree extension AMs dispatch by
+    // IndexAmKind, so pgrust runs that fmgr_info and never calls the handler.
+    if matches!(kind, IndexAmKind::Hnsw | IndexAmKind::Ivfflat | IndexAmKind::Bloom)
+        && builtin_index_am(amhandler).is_none()
+    {
+        fmgr_seams::fmgr_info::call(amhandler)?;
+    }
+    Ok(kind)
+}
+
+/// The IndexAmKind `amhandler` dispatches to, without loading its library:
+/// for the callers where C never calls the handler (CREATE ACCESS METHOD's
+/// lookup_am_handler_func, amcmds.c:78) or where relcache already has
+/// (from_relam's per-scan resolver).
+pub fn index_am_kind_of_handler(amhandler: Oid) -> PgResult<IndexAmKind> {
     match builtin_index_am(amhandler) {
         Some(kind) => Ok(kind),
         None => resolve_extension_handler(amhandler),
@@ -494,7 +508,7 @@ fn resolve_index_am_kind(amoid: Oid) -> Option<IndexAmKind> {
         .map(|d| d.as_oid())
         .ok()?;
     ReleaseSysCache(tuple);
-    GetIndexAmRoutine(amhandler).ok()
+    index_am_kind_of_handler(amhandler).ok()
 }
 
 pub fn init_seams() {

@@ -98,7 +98,7 @@ struct AmFlags {
     has_ambuildphasename: bool,
 }
 
-fn am_flags(amoid: Oid) -> Option<&'static AmFlags> {
+fn am_flags(amoid: Oid) -> PgResult<Option<&'static AmFlags>> {
     const BT: AmFlags = AmFlags {
         amcanorder: true,
         amcanorderbyop: false,
@@ -247,29 +247,40 @@ fn am_flags(amoid: Oid) -> Option<&'static AmFlags> {
         has_amproperty: false,
         has_ambuildphasename: true,
     };
-    match canonical_index_am(amoid) {
+    Ok(match canonical_index_am(amoid) {
         BTREE_AM_OID => Some(&BT),
         HASH_AM_OID => Some(&HASH),
         GIST_AM_OID => Some(&GIST),
         GIN_AM_OID => Some(&GIN),
         SPGIST_AM_OID => Some(&SPGIST),
         BRIN_AM_OID => Some(&BRIN),
-        other => match extension_am_handler(other).as_deref() {
+        other => match extension_am_handler(other)?.as_deref() {
             Some(b"hnswhandler") => Some(&HNSW),
             Some(b"ivfflathandler") => Some(&IVFFLAT),
             Some(b"blhandler") => Some(&BLOOM),
             _ => None,
         },
-    }
+    })
 }
 
-// C calls the handler; a LANGUAGE C handler's C symbol is its prosrc, which
-// survives ALTER FUNCTION ... RENAME.
-fn extension_am_handler(amoid: Oid) -> Option<Vec<u8>> {
-    let handler = syscache_seams::pg_am_amhandler::call(amoid).ok()??;
+// C calls the handler (GetIndexAmRoutineByAmId, amutils.c:198 / amapi.c:56-84);
+// a LANGUAGE C handler's C symbol is its prosrc, which survives ALTER
+// FUNCTION ... RENAME. That call's fmgr_info loads the handler's library and
+// runs its _PG_init once per session (fmgr.c:127 -> fmgr_info_C_lang); pgrust
+// does the load and keeps the flag tables.
+fn extension_am_handler(amoid: Oid) -> PgResult<Option<Vec<u8>>> {
+    let Some(handler) = syscache_seams::pg_am_amhandler::call(amoid).ok().flatten() else {
+        return Ok(None);
+    };
     let scratch = ::mcx::MemoryContext::new("amutils handler prosrc");
-    let prosrc = syscache_seams::lookup_pg_proc_prosrc::call(scratch.mcx(), handler).ok()??;
-    Some(prosrc.as_bytes().to_vec())
+    let Some(prosrc) = syscache_seams::lookup_pg_proc_prosrc::call(scratch.mcx(), handler).ok().flatten() else {
+        return Ok(None);
+    };
+    let symbol = prosrc.as_bytes().to_vec();
+    if matches!(symbol.as_slice(), b"hnswhandler" | b"ivfflathandler" | b"blhandler") {
+        fmgr_seams::fmgr_info::call(handler)?;
+    }
+    Ok(Some(symbol))
 }
 
 // pg_am.amhandler -> the handler's builtin AM (C reads the IndexAmRoutine, so
@@ -463,7 +474,7 @@ fn indexam_property(
         return Ok(None);
     }
 
-    let Some(routine) = am_flags(amoid) else {
+    let Some(routine) = am_flags(amoid)? else {
         // C returns NULL for an invalid/non-index AM OID; a real out-of-core
         // index AM is an unported lane, not a NULL.
         if amoid != 0 && is_index_am(amoid)? {
@@ -613,9 +624,9 @@ pub fn fc_pg_indexam_progress_phasename(
     let name = match canonical_index_am(amoid) {
         BTREE_AM_OID => bt_phasename(phasenum),
         GIN_AM_OID => gin_phasename(phasenum),
-        other => match extension_am_handler(other).as_deref() {
+        other => match extension_am_handler(other)?.as_deref() {
             Some(b"ivfflathandler") => ivfflat_phasename(phasenum),
-            _ => match am_flags(amoid) {
+            _ => match am_flags(amoid)? {
                 Some(_) => None,
                 None if is_index_am(amoid)? => {
                     // unported: out-of-core index AM build-phase-name lane.
