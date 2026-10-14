@@ -35,9 +35,10 @@
 set -euo pipefail
 . "$(dirname "$0")/common.sh"
 
-# Default cases. *_golomb data are tie-free: x = 2*p*k + (k*k % p) is an
-# Erdos-Turan Golomb ruler, so all pairwise distances differ. *_grid and dups
-# have many equal distances, which exercises C's pairingheap tie order.
+# Default cases. Golomb data with p = 1009 (l2_, l1_, wide_, unlogged_ and
+# insert_golomb) are tie-free: x = 2*p*k + (k*k % p) is an Erdos-Turan Golomb
+# ruler, so all pairwise distances differ. *_grid and dups have many equal
+# distances, which exercises C's pairingheap tie order.
 # insert_grid, the tie-heavy on-disk insert case, is opt-in (see its arm).
 CASES="l2_golomb l1_golomb m4_golomb wide_golomb unlogged_golomb insert_golomb l2_grid ip_grid dups big_golomb halfvec_l2_grid halfvec_cosine_grid sparsevec_l2_grid sparsevec_l2_frac sparsevec_cosine_grid insert_sparsevec_cosine wide_sparsevec bit_hamming bit_jaccard bq_expression ivf_l2_groups ivf_big ivf_halfvec_groups ivf_bit_hamming ivf_insert ivf_unlogged ivf_vacuum ivf_wide"
 # Opt-in only (known divergences, run by name): spill cosine insert_grid
@@ -141,8 +142,9 @@ SQL
       ;;
     big_golomb)
       # 10,000 rows (p = 10007): C's in-memory graph (about 6 MB) spans
-      # several 1 MB graph blocks; Golomb data are tie-free, so it does not
-      # exercise the pointer tie-break.
+      # several 1 MB graph blocks. Its float4 values exceed 2^24 and round, so
+      # some distances tie (often a point's two nearest neighbors); whether a
+      # tie reaches the cross-block pointer tie-break is unmeasured.
       # run-iterscan.sh's `big` table builds this same index.
       cat <<SQL
 CREATE TABLE $1 (id int, v vector(3));
