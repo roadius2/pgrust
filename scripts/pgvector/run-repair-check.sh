@@ -6,10 +6,13 @@
 # EXTENSION vector UPDATE fails, run the repair twice (the second run
 # creates nothing), update, and compare the catalog with a fresh CREATE
 # EXTENSION vector (sql/repair-verify.sql); the data and the index survive
-# and an ivfflat index builds. Once more with the extension in schema s, and
-# once on a fresh 0.8.7 install (nothing to repair).
-# pgrust only: a scratch server under $PGV_WORK/repair-check; the staged old
-# script is removed on exit.
+# and an ivfflat index builds. Once more with the extension in schema s; once
+# with a repair that fails at its last statement, which must leave the
+# catalog unchanged and the database still unrepaired; and once on a fresh
+# 0.8.7 install (nothing to repair). Six rows; all must pass.
+# pgrust only: a scratch server under $PGV_WORK/repair-check. On exit the
+# staged old script and the scratch server's data and socket directories are
+# removed; $PGV_WORK/repair-check/out keeps every step's output.
 # usage: run-repair-check.sh
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -26,7 +29,13 @@ mkdir -p "$out"
 
 cleanup() {
   rm -f "$staged/vector--0.8.5.sql"
-  "$here/server.sh" stop pgrust >/dev/null 2>&1 || true
+  # Remove the scratch server's directories only once it has stopped, and
+  # only under the repair-check work dir (never the harness's own data).
+  if "$here/server.sh" stop pgrust >/dev/null 2>&1; then
+    case "$PGV_WORK" in
+      */repair-check) rm -rf "$PGV_WORK/data" "$PGV_WORK/sock" ;;
+    esac
+  fi
 }
 trap cleanup EXIT
 
@@ -97,6 +106,43 @@ check() {
   result "$label" ok
 }
 
+# A repair that fails at its last statement (the footer's search_path reset,
+# replaced by RAISE EXCEPTION) must roll back everything it created.
+# $1 label, $2 revision, $3 database.
+rollback_check() {
+  local label="$1" rev="$2" db="$3"
+  local log="$out/$3.log" broken="$out/repair-injected.sql"
+  sed "s/^  PERFORM set_config('search_path', v_old_path, true);\$/  RAISE EXCEPTION 'injected';/" "$repair" >"$broken"
+  if [ "$(grep -c "^  RAISE EXCEPTION 'injected';\$" "$broken")" != 1 ]; then
+    result "$label" "FAIL (could not inject the failure; $broken)"
+    return
+  fi
+  git -C "$PGV_REPO" show "$rev:crates/contrib/pgvector/extension/vector--0.8.5.sql" >"$staged/vector--0.8.5.sql"
+  if ! {
+    q -c "CREATE DATABASE $db" &&
+      q -d "$db" -c "CREATE EXTENSION vector VERSION '0.8.5'"
+  } >"$log" 2>&1; then
+    result "$label" "FAIL (setup; $log)"
+    return
+  fi
+  q -d "$db" -f "$verify" >"$out/$db.before"
+  if q -d "$db" -f "$broken" >"$out/$db.repair1" 2>&1 ||
+    ! grep -q 'ERROR:  injected' "$out/$db.repair1"; then
+    result "$label" "FAIL (the injected repair did not fail; $out/$db.repair1)"
+    return
+  fi
+  q -d "$db" -f "$verify" >"$out/$db.after"
+  if ! cmp -s "$out/$db.before" "$out/$db.after"; then
+    result "$label" "FAIL (a failed repair changed the catalog; $out/$db.before vs $out/$db.after)"
+    return
+  fi
+  if q -d "$db" -c "ALTER EXTENSION vector UPDATE" >>"$log" 2>&1; then
+    result "$label" "FAIL (UPDATE worked after a failed repair; $log)"
+    return
+  fi
+  result "$label" ok
+}
+
 "$here/server.sh" fresh pgrust >"$out/server.log" 2>&1
 fresh_catalog fresh ""
 fresh_catalog fresh_s s
@@ -104,6 +150,7 @@ for rev in 79ad992ede 88f29c4ccf c1c5da11cc; do
   check "$rev" "$rev" "g_$rev" "" "$out/fresh.txt"
 done
 check "79ad992ede/schema" 79ad992ede g_schema s "$out/fresh_s.txt"
+rollback_check "79ad992ede/rollback" 79ad992ede g_rollback
 if q -d fresh -f "$repair" 2>&1 | grep -q 'nothing to repair'; then
   result "0.8.7/no-op" ok
 else

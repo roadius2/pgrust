@@ -14,6 +14,7 @@ DECLARE
   v_nsp text;
   v_nsp_oid oid;
   v_old_path text := current_setting('search_path');
+  v_old_cmm text := current_setting('client_min_messages');
   n int := 0;
 BEGIN
   SELECT e.extversion, n2.nspname, n2.oid INTO v_ver, v_nsp, v_nsp_oid
@@ -26,7 +27,15 @@ BEGIN
     RAISE NOTICE 'vector is at %; nothing to repair', v_ver;
     RETURN;
   END IF;
-  PERFORM set_config('search_path', quote_ident(v_nsp) || ', pg_catalog', true);
+  -- As execute_extension_script runs an extension script: the extension's
+  -- schema, then pg_temp, with pg_catalog searched implicitly before both
+  -- (listing it after the schema "would be bad for security",
+  -- extension.c:1290-1312); and notices below WARNING off
+  -- (extension.c:1271-1274).
+  PERFORM set_config('search_path', quote_ident(v_nsp) || ', pg_temp', true);
+  IF current_setting('client_min_messages') NOT IN ('warning', 'error') THEN
+    PERFORM set_config('client_min_messages', 'warning', true);
+  END IF;
   IF to_regtype('vector') IS NULL THEN
     CREATE TYPE vector;
     n := n + 1;
@@ -1546,6 +1555,7 @@ BEGIN
     n := n + 1;
   END IF;
   PERFORM set_config('search_path', v_old_path, true);
+  PERFORM set_config('client_min_messages', v_old_cmm, true);
   RAISE NOTICE 'vector: created % missing objects; now run ALTER EXTENSION vector UPDATE', n;
 END
 $repair$;
