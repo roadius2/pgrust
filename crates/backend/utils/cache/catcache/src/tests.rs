@@ -442,11 +442,14 @@ fn payload_alloc_failure_is_a_catchable_error() {
         crate::payload_alloc(cx.mcx(), 1usize << 31).map(|_| ())
     }));
     let payload = r.expect_err("over-ceiling request must unwind");
-    let msg = payload
-        .downcast_ref::<String>()
-        .cloned()
-        .unwrap_or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()).unwrap_or_default());
-    assert!(msg.contains("invalid memory alloc request size"), "{msg}");
+    let err = ::types_error::pg_error_from_panic(payload)
+        .unwrap_or_else(|_| panic!("expected a structured PgError, got an unstructured panic"));
+    assert!(err.message().contains("invalid memory alloc request size"), "{}", err.message());
+    let l = err.location().expect("location");
+    assert_eq!(
+        (l.filename.as_deref(), l.lineno, l.funcname.as_deref()),
+        (Some("mcxt.c"), 1180, Some("MemoryContextSizeFailure"))
+    );
 }
 
 // C SearchCatCacheMiss copies the caller's raw NAME datum into the scan key
