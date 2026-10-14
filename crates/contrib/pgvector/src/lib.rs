@@ -16,6 +16,8 @@ pub mod bitvec;
 pub mod funcs;
 pub mod halfutils;
 pub mod halfvec;
+#[cfg(test)]
+mod repair_gen;
 pub mod sparsevec;
 pub mod vec;
 
