@@ -177,6 +177,11 @@ fn check_element_closer_mem(
 // SelectNeighbors (in-memory). C's candidate list holds pointers into the
 // caller's neighbor array, so e->closer updates land in that array; we take
 // `c` mutably and write the computed closer flags back by origin index.
+// Tie order: C's in-memory serial build also breaks equal distances by raw
+// element pointer (base == NULL, hnswutils.c:1007-1011), but every element
+// comes from one Generation context (HnswMemoryContextAlloc, hnswbuild.c:650),
+// so addresses rise with insertion order within a 1 MB block; element ids
+// reproduce that order.
 #[allow(clippy::too_many_arguments)]
 fn select_neighbors_mem(
     graph: &Graph<'_>,

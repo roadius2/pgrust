@@ -38,8 +38,9 @@ set -euo pipefail
 # Default cases. *_golomb data are tie-free: x = 2*p*k + (k*k % p) is an
 # Erdos-Turan Golomb ruler, so all pairwise distances differ. *_grid and dups
 # have many equal distances, which exercises C's pairingheap tie order.
-CASES="l2_golomb l1_golomb m4_golomb wide_golomb unlogged_golomb insert_golomb l2_grid ip_grid dups insert_grid big_golomb halfvec_l2_grid halfvec_cosine_grid sparsevec_l2_grid sparsevec_l2_frac sparsevec_cosine_grid insert_sparsevec_cosine wide_sparsevec bit_hamming bit_jaccard bq_expression ivf_l2_groups ivf_big ivf_halfvec_groups ivf_bit_hamming ivf_insert ivf_unlogged ivf_vacuum ivf_wide"
-# Opt-in only (known divergences, run by name): spill cosine
+# insert_grid, the tie-heavy on-disk insert case, is opt-in (see its arm).
+CASES="l2_golomb l1_golomb m4_golomb wide_golomb unlogged_golomb insert_golomb l2_grid ip_grid dups big_golomb halfvec_l2_grid halfvec_cosine_grid sparsevec_l2_grid sparsevec_l2_frac sparsevec_cosine_grid insert_sparsevec_cosine wide_sparsevec bit_hamming bit_jaccard bq_expression ivf_l2_groups ivf_big ivf_halfvec_groups ivf_bit_hamming ivf_insert ivf_unlogged ivf_vacuum ivf_wide"
+# Opt-in only (known divergences, run by name): spill cosine insert_grid
 
 GOLOMB1009='ARRAY[2*1009*k + (k*k) % 1009, 0, 0]::vector'
 GRID='ARRAY[i % 17, (i * 7) % 23, (i * 13) % 31]::vector'
@@ -124,6 +125,13 @@ CREATE INDEX $1_idx ON $1 USING hnsw (v vector_l2_ops);
 SQL
       ;;
     insert_grid)
+      # Known divergence (opt-in): on-disk inserts into a tie-heavy graph. C's
+      # HnswUpdateConnection breaks equal distances by raw element pointer
+      # (CompareCandidateDistances, hnswutils.c:1007-1011, base == NULL); the
+      # new element lives in insertCtx (AllocSet, hnswinsert.c:788) and the
+      # loaded neighbors in updateCtx (Generation, hnswinsert.c:551), whose
+      # relative addresses vary per run, so C differs from itself (~2 in 37
+      # seeded C-vs-C runs). pgrust ranks the new element first, C's usual order.
       cat <<SQL
 CREATE TABLE $1 (id int, v vector(3));
 INSERT INTO $1 SELECT i, $GRID FROM generate_series(1, 800) i;
@@ -133,8 +141,8 @@ SQL
       ;;
     big_golomb)
       # 10,000 rows (p = 10007): C's in-memory graph (about 6 MB) spans
-      # several 1 MB Generation blocks, so this checks that SelectNeighbors'
-      # tie-break by element id still follows C's by address (M1 report).
+      # several 1 MB graph blocks; Golomb data are tie-free, so it does not
+      # exercise the pointer tie-break.
       # run-iterscan.sh's `big` table builds this same index.
       cat <<SQL
 CREATE TABLE $1 (id int, v vector(3));
@@ -309,7 +317,7 @@ INSERT INTO $1 SELECT i, ARRAY[1 + i % 17, 1 + (i * 7) % 23, 1 + (i * 13) % 31]:
 CREATE INDEX $1_idx ON $1 USING hnsw (v vector_cosine_ops);
 SQL
       ;;
-    *) die "unknown case '$1' (default cases: $CASES; opt-in: spill cosine)" ;;
+    *) die "unknown case '$1' (default cases: $CASES; opt-in: spill cosine insert_grid)" ;;
   esac
   echo "SELECT 'rel|idx|' || pg_relation_filepath('$1_idx');"
 }

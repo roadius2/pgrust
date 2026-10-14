@@ -862,6 +862,15 @@ fn check_element_closer(
 }
 
 // SelectNeighbors (algorithm 4). `c` is consumed; result ordered as C's r.
+// DIVERGENCE (tie order only): with sort_candidates, C breaks equal distances
+// by raw element POINTER when base == NULL (CompareCandidateDistances,
+// hnswutils.c:1007-1011), smaller address first; pgrust ranks by element id
+// (pool order). On an on-disk insert (HnswUpdateConnection from
+// GetUpdateIndex, hnswinsert.c:441) the new element sits in insertCtx
+// (AllocSet, hnswinsert.c:788) and the loaded neighbors in updateCtx
+// (Generation, hnswinsert.c:551): their relative addresses vary per run, so
+// C's own tie order is not reproducible. pgrust always ranks the new element
+// (lowest id) first, C's usual outcome; bytecmp insert_grid is opt-in.
 #[allow(clippy::too_many_arguments)]
 pub fn select_neighbors(
     pool: &ElementPool<'_>,
