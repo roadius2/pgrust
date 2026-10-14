@@ -7,7 +7,7 @@
 # creates nothing), update, and compare the catalog with a fresh CREATE
 # EXTENSION vector (sql/repair-verify.sql); the data and the index survive
 # and an ivfflat index builds. Once more with the extension in schema s; once
-# with a repair that fails at its last statement, which must leave the
+# with a repair that fails after its last object block, which must leave the
 # catalog unchanged and the database still unrepaired; and once on a fresh
 # 0.8.7 install (nothing to repair). Six rows; all must pass.
 # pgrust only: a scratch server under $PGV_WORK/repair-check. On exit the
@@ -106,13 +106,13 @@ check() {
   result "$label" ok
 }
 
-# A repair that fails at its last statement (the footer's search_path reset,
-# replaced by RAISE EXCEPTION) must roll back everything it created.
+# A repair that fails after its last object block (the footer's search_path
+# reset, replaced by RAISE EXCEPTION) must roll back everything it created.
 # $1 label, $2 revision, $3 database.
 rollback_check() {
   local label="$1" rev="$2" db="$3"
   local log="$out/$3.log" broken="$out/repair-injected.sql"
-  sed "s/^  PERFORM set_config('search_path', v_old_path, true);\$/  RAISE EXCEPTION 'injected';/" "$repair" >"$broken"
+  sed "s/^  PERFORM pg_catalog\.set_config('search_path', v_old_path, true);\$/  RAISE EXCEPTION 'injected';/" "$repair" >"$broken"
   if [ "$(grep -c "^  RAISE EXCEPTION 'injected';\$" "$broken")" != 1 ]; then
     result "$label" "FAIL (could not inject the failure; $broken)"
     return

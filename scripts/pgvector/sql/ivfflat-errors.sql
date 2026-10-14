@@ -3,8 +3,8 @@
 -- :384), IvfflatCheckMemoryUsage (ivfutils.c:133), IvfflatCheckExpectedDim
 -- (ivfutils.c:289, from the scan, even on an empty index) and the
 -- little-data NOTICE (ivfbuild.c:477). Errors raised by core (the lists
--- reloption, the ivfflat.* settings) are left to the regression files:
--- pgrust reports their LOCATION as reloptions.c:0 / guc.c:0. NULL queries
+-- reloption, the ivfflat.* settings) have their LOCATIONs compared in
+-- core-error-locations.sql (the core_error_locations row). NULL queries
 -- use the (SELECT NULL::type) form so they reach the index scan (a literal
 -- NULL is constant-folded), and EXPLAIN pins that plan; a zero query on a
 -- cosine index orders NaN distances by the sort's tie order.

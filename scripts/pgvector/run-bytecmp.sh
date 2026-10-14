@@ -12,7 +12,8 @@
 #           SET pgrust.hnsw_build_seed = $PGV_BYTECMP_SEED (default 42)
 #           and SET pgrust.ivfflat_build_seed.
 #   ref:    the subject is a second, fresh seeded C cluster: C-vs-C proof that
-#           the oracle and every case are deterministic (must always pass).
+#           the oracle and every default case are deterministic (must always
+#           pass; the opt-in insert_grid, run by name, is not).
 #   PGV_BYTECMP_SUBJECT={pgrust|ref|seeded} overrides the subject (self-tests);
 #   PGV_BYTECMP_SEED= (empty) omits the SET (self-test of the opt-in seed).
 #   PGV_KEEP_DATA=1 keeps each side's cluster under $PGV_WORK/bytecmp/<mode>/data

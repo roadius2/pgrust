@@ -13,17 +13,21 @@ DECLARE
   v_ver text;
   v_nsp text;
   v_nsp_oid oid;
-  v_old_path text := current_setting('search_path');
-  v_old_cmm text := current_setting('client_min_messages');
+  v_old_path text := pg_catalog.current_setting('search_path');
+  v_old_cmm text := pg_catalog.current_setting('client_min_messages');
   n int := 0;
 BEGIN
+  -- The caller's search_path is in force until the search_path set_config
+  -- below, and again once the end restores it, so every function, relation
+  -- and operator used in those stretches is schema-qualified.
   SELECT e.extversion, n2.nspname, n2.oid INTO v_ver, v_nsp, v_nsp_oid
-    FROM pg_extension e JOIN pg_namespace n2 ON n2.oid = e.extnamespace
-   WHERE e.extname = 'vector';
+    FROM pg_catalog.pg_extension e
+    JOIN pg_catalog.pg_namespace n2 ON n2.oid OPERATOR(pg_catalog.=) e.extnamespace
+   WHERE e.extname OPERATOR(pg_catalog.=) 'vector';
   IF v_ver IS NULL THEN
     RAISE EXCEPTION 'extension "vector" is not installed in this database';
   END IF;
-  IF v_ver <> '0.8.5' THEN
+  IF v_ver OPERATOR(pg_catalog.<>) '0.8.5' THEN
     RAISE NOTICE 'vector is at %; nothing to repair', v_ver;
     RETURN;
   END IF;
@@ -32,9 +36,10 @@ BEGIN
   -- (listing it after the schema "would be bad for security",
   -- extension.c:1290-1312); and notices below WARNING off
   -- (extension.c:1271-1274).
-  PERFORM set_config('search_path', quote_ident(v_nsp) || ', pg_temp', true);
-  IF current_setting('client_min_messages') NOT IN ('warning', 'error') THEN
-    PERFORM set_config('client_min_messages', 'warning', true);
+  PERFORM pg_catalog.set_config('search_path',
+    pg_catalog.quote_ident(v_nsp) OPERATOR(pg_catalog.||) ', pg_temp', true);
+  IF pg_catalog.current_setting('client_min_messages') NOT IN ('warning', 'error') THEN
+    PERFORM pg_catalog.set_config('client_min_messages', 'warning', true);
   END IF;
   IF to_regtype('vector') IS NULL THEN
     CREATE TYPE vector;
@@ -1554,8 +1559,8 @@ BEGIN
     ALTER EXTENSION vector ADD OPERATOR FAMILY sparsevec_l1_ops USING hnsw;
     n := n + 1;
   END IF;
-  PERFORM set_config('search_path', v_old_path, true);
-  PERFORM set_config('client_min_messages', v_old_cmm, true);
+  PERFORM pg_catalog.set_config('search_path', v_old_path, true);
+  PERFORM pg_catalog.set_config('client_min_messages', v_old_cmm, true);
   RAISE NOTICE 'vector: created % missing objects; now run ALTER EXTENSION vector UPDATE', n;
 END
 $repair$;
