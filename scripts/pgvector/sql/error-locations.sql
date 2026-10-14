@@ -1,8 +1,45 @@
 -- Error locations (run-diff.sh's error_locations row): one statement per
--- ereport/elog in halfvec.c, halfutils.h, sparsevec.c and bitvec.c that SQL
--- can reach. sqldiff.sh --verbose compares each LOCATION line (C function,
--- file, and the call's last line). Binary-only sites (the recv functions)
--- are pinned by unit tests instead.
+-- ereport/elog in vector.c, halfvec.c, halfutils.h, sparsevec.c and
+-- bitvec.c that SQL can reach. sqldiff.sh --verbose compares each LOCATION
+-- line (C function, file, and the call's last line). Binary-only sites (the
+-- recv functions) are pinned by unit tests instead.
+-- vector.c
+SELECT '[1,2]'::vector + '[3]';
+SELECT '[1,2,3]'::vector(2);
+SELECT '[1,2,3]'::vector(3)::vector(2);
+SELECT '{}'::real[]::vector;
+SELECT array_fill(0, ARRAY[16000])::vector || '[1]';
+SELECT '[NaN,1]'::vector;
+SELECT '[Infinity,1]'::vector;
+SELECT '{NaN}'::real[]::vector;
+SELECT vector_avg('{1,NaN}'::float8[]);
+SELECT vector_avg('{{2,2,4,6}}'::float8[]);
+SELECT vector_accum('{{1,2}}'::float8[], '[1]');
+SELECT vector_combine('{}'::float8[], '{1,2}'::float8[]);
+SELECT vector_combine('{1,1,2}'::float8[], '{1,1,2,3}'::float8[]);
+SELECT halfvec_combine('{1,1,2}'::float8[], '{1,1,2,3}'::float8[]);
+SELECT vector_combine(array_fill(1::float8, ARRAY[16002]), '{0}'::float8[]);
+SELECT avg(v) FROM (VALUES ('[1,2]'::vector), ('[1]')) t(v);
+SELECT '1,2,3'::vector;
+SELECT '[]'::vector;
+SELECT ('[' || array_to_string(array_fill(1, ARRAY[16001]), ',') || ']')::vector;
+SELECT '['::vector;
+SELECT '[hello,1]'::vector;
+SELECT '[4e38]'::vector;
+SELECT '[1,2,3'::vector;
+SELECT '[1,2,3]9'::vector;
+SELECT '[1,2,3]'::vector(3, 2);
+SELECT '[1,2,3]'::vector(0);
+SELECT '[1,2,3]'::vector(16001);
+SELECT '{{1}}'::real[]::vector;
+SELECT '{NULL}'::real[]::vector;
+SELECT subvector('[1,2,3,4,5]'::vector, 1, 0);
+SELECT subvector('[1,2,3,4,5]'::vector, 2147483647, 10);
+SELECT subvector('[1,2,3,4,5]'::vector, -2, 1);
+SELECT '[1,2]'::halfvec::vector(3);
+SELECT '{1:1}/2'::sparsevec::vector(3);
+SELECT '{1:1}/16001'::sparsevec::vector;
+SELECT '[3e38]'::vector * '[10]';
 -- halfvec.c
 SELECT '[1,2]'::halfvec + '[3]';
 SELECT '[1,2,3]'::halfvec(2);

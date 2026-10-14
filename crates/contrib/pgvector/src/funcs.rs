@@ -1,5 +1,6 @@
 use datum::Datum;
 use mcx::{Mcx, PgVec};
+use stringinfo::StringInfo;
 use types_core::{Oid, FLOAT4OID, FLOAT8OID, INT4OID, NUMERICOID};
 use types_error::{
     PgError, PgResult, ERRCODE_DATA_EXCEPTION, ERRCODE_INVALID_PARAMETER_VALUE,
@@ -9,7 +10,7 @@ use types_fmgr::{cstring_result, FmgrInfo, FunctionCallInfoBaseData as Fcinfo};
 use types_tuple::varatt;
 
 use crate::vec::{
-    check_dim, check_dims, check_element, check_expected_dim, inner_product,
+    check_dim, check_dims, check_element, check_expected_dim, ereport, inner_product,
     cosine_similarity, l1_distance, l2_squared_distance, parse_vector, vector_cmp_internal,
     vector_norm, VecBuilder, VecView, VECTOR_MAX_DIM,
 };
@@ -97,12 +98,14 @@ pub fn fc_vector_typmod_in(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> Pg
     if tl.len() != 1 {
         return Err(PgError::error("invalid type modifier")
             .with_sqlstate(ERRCODE_INVALID_PARAMETER_VALUE)
+            .with_location("vector.c", 356, "vector_typmod_in")
             .into());
     }
     if tl[0] < 1 {
         return Err(
             PgError::error("dimensions for type vector must be at least 1")
                 .with_sqlstate(ERRCODE_INVALID_PARAMETER_VALUE)
+                .with_location("vector.c", 361, "vector_typmod_in")
                 .into(),
         );
     }
@@ -111,36 +114,43 @@ pub fn fc_vector_typmod_in(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> Pg
             "dimensions for type vector cannot exceed {VECTOR_MAX_DIM}"
         ))
         .with_sqlstate(ERRCODE_INVALID_PARAMETER_VALUE)
+        .with_location("vector.c", 366, "vector_typmod_in")
         .into());
     }
     Ok(Datum::from_i32(tl[0]))
 }
 
-pub fn fc_vector_recv(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
-    // SAFETY: recv arg0 is the live StringInfo per the recv ABI.
-    let buf = unsafe { fcinfo.arg_stringinfo(0) };
-    let typmod = fcinfo.arg_i32(2);
+// vector_recv's body (vector.c:374-403): i16 dim, i16 unused, then dim
+// float4s. CheckDim takes the signed i16, so a negative dim reports
+// "at least 1 dimension".
+pub(crate) fn vector_recv_body<'m>(mcx: Mcx<'m>, buf: &mut StringInfo<'_>, typmod: i32) -> PgResult<PgVec<'m, u8>> {
     let dim = pqformat::pq_getmsgint(buf, 2)? as u16 as i16;
     let unused = pqformat::pq_getmsgint(buf, 2)? as u16 as i16;
-    if dim < 1 {
-        check_dim(0)?;
-    }
-    check_dim(dim as usize)?;
-    check_expected_dim(typmod, dim as usize)?;
+    check_dim(dim as i32)?;
+    check_expected_dim(typmod, dim as i32)?;
     if unused != 0 {
         return Err(
             PgError::error(format!("expected unused to be 0, not {unused}"))
                 .with_sqlstate(ERRCODE_DATA_EXCEPTION)
+                .with_location("vector.c", 393, "vector_recv")
                 .into(),
         );
     }
-    let mut b = VecBuilder::new(fcinfo.result_mcx(), dim as usize)?;
+    let mut b = VecBuilder::new(mcx, dim as usize)?;
     for i in 0..dim as usize {
         let x = pqformat::pq_getmsgfloat4(buf)?;
         check_element(x)?;
         b.set(i, x);
     }
-    Ok(image_datum(b.image()))
+    Ok(b.image())
+}
+
+// vector_recv (vector.c:374-403).
+pub fn fc_vector_recv(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
+    // SAFETY: recv arg0 is the live StringInfo per the recv ABI.
+    let buf = unsafe { fcinfo.arg_stringinfo(0) };
+    let typmod = fcinfo.arg_i32(2);
+    Ok(image_datum(vector_recv_body(fcinfo.result_mcx(), buf, typmod)?))
 }
 
 pub fn fc_vector_send(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
@@ -159,77 +169,31 @@ pub fn fc_vector(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Dat
     // SAFETY: strict fn — arg0 vector, arg1 typmod.
     let v = unsafe { arg_vector(fcinfo, 0)? };
     let typmod = fcinfo.arg_i32(1);
-    check_expected_dim(typmod, v.dim())?;
+    check_expected_dim(typmod, v.dim() as i32)?;
     Ok(fcinfo.arg(0))
 }
 
+// array_to_vector (vector.c:443-512).
 pub fn fc_array_to_vector(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
     let mcx = fcinfo.result_mcx();
     // SAFETY: strict fn — arg0 array, arg1 typmod.
     let arr = unsafe { detoasted_image(mcx, fcinfo.arg(0))? };
     let typmod = fcinfo.arg_i32(1);
-
-    if arrayfuncs::arr_ndim(arr) > 1 {
-        return Err(PgError::error("array must be 1-D")
-            .with_sqlstate(ERRCODE_DATA_EXCEPTION)
-            .into());
-    }
-    if arrayfuncs::arr_hasnull(arr) && arrayfuncs::array_contains_nulls(arr) {
-        return Err(PgError::error("array must not contain nulls")
-            .with_sqlstate(ERRCODE_NULL_VALUE_NOT_ALLOWED)
-            .into());
-    }
-
-    let elemtype: Oid = arrayfuncs::arr_elemtype(arr);
-    // numeric is not in builtin_meta: varlena, int-aligned.
-    let (elmlen, elmbyval, elmalign) = if elemtype == NUMERICOID {
-        (-1, false, b'i')
-    } else {
-        arrayfuncs::construct::builtin_meta(elemtype)?
-    };
-    let (elems, _nulls) = arrayfuncs::deconstruct_array(mcx, arr, elmlen, elmbyval, elmalign, true)?;
+    let site = ArraySite { file: "vector.c", func: "array_to_vector", ndim_line: 459, nulls_line: 464 };
+    let (elemtype, elems) = cast_array_elems(mcx, arr, &site)?;
     let n = elems.len();
-    check_dim(n)?;
-    check_expected_dim(typmod, n)?;
+    check_dim(n as i32)?;
+    check_expected_dim(typmod, n as i32)?;
 
     let mut b = VecBuilder::new(mcx, n)?;
-    match elemtype {
-        INT4OID => {
-            for (i, d) in elems.iter().enumerate() {
-                b.set(i, d.as_i32() as f32);
-            }
-        }
-        FLOAT8OID => {
-            for (i, d) in elems.iter().enumerate() {
-                b.set(i, d.as_f64() as f32);
-            }
-        }
-        FLOAT4OID => {
-            for (i, d) in elems.iter().enumerate() {
-                b.set(i, d.as_f32());
-            }
-        }
-        NUMERICOID => {
-            for (i, d) in elems.iter().enumerate() {
-                let p = d.as_usize() as *const u8;
-                // SAFETY: non-null numeric element datum inside the array image.
-                let payload = unsafe {
-                    let total = varatt::varsize_any(p);
-                    let hdr = if varatt::varatt_is_1b(p) { 1 } else { 4 };
-                    core::slice::from_raw_parts(p.add(hdr), total - hdr)
-                };
-                b.set(i, adt_numeric::ops::numeric_float4(
-                    adt_numeric::Num::from_payload(payload),
-                )?);
-            }
-        }
-        _ => {
-            return Err(PgError::error("unsupported array type")
-                .with_sqlstate(ERRCODE_DATA_EXCEPTION)
-                .into())
-        }
+    for (i, d) in elems.iter().enumerate() {
+        let Some(v) = cast_elem_f32(elemtype, *d)? else {
+            return Err(ereport(ERRCODE_DATA_EXCEPTION, "unsupported array type", 498, "array_to_vector"));
+        };
+        b.set(i, v);
     }
 
+    // Check elements
     for i in 0..n {
         check_element(b.get(i))?;
     }
@@ -244,9 +208,9 @@ pub(crate) struct ArraySite {
     pub nulls_line: i32,
 }
 
-// The array casts' shared prologue (halfvec.c:453-464, sparsevec.c:707-718):
-// reject a multi-dimensional array or one holding NULLs, then deconstruct it.
-// fc_array_to_vector keeps its own copy (pre-M2 code, unchanged).
+// The array casts' shared prologue (vector.c:456-467, halfvec.c:453-464,
+// sparsevec.c:707-718): reject a multi-dimensional array or one holding
+// NULLs, then deconstruct it.
 pub(crate) fn cast_array_elems<'m>(
     mcx: Mcx<'m>,
     arr: &[u8],
@@ -312,8 +276,8 @@ pub fn fc_halfvec_to_vector(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> P
     // SAFETY: strict fn — arg0 halfvec, arg1 typmod.
     let v = unsafe { crate::halfvec::arg_halfvec(fcinfo, 0)? };
     let typmod = fcinfo.arg_i32(1);
-    check_dim(v.dim())?;
-    check_expected_dim(typmod, v.dim())?;
+    check_dim(v.dim() as i32)?;
+    check_expected_dim(typmod, v.dim() as i32)?;
     let mut b = VecBuilder::new(fcinfo.result_mcx(), v.dim())?;
     for i in 0..v.dim() {
         b.set(i, crate::halfutils::half_to_float4(v.x(i)));
@@ -328,8 +292,8 @@ pub fn fc_sparsevec_to_vector(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) ->
     let typmod = fcinfo.arg_i32(1);
     let dim = svec.dim();
     // dim >= 1 (SparseView); vector's limit is 16,000, checked before allocating.
-    check_dim(dim as usize)?;
-    check_expected_dim(typmod, dim as usize)?;
+    check_dim(dim)?;
+    check_expected_dim(typmod, dim)?;
     let mut r = VecBuilder::new(fcinfo.result_mcx(), dim as usize)?;
     for i in 0..svec.nnz() {
         let index = svec.index(i);
@@ -486,7 +450,7 @@ pub fn fc_vector_mul(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult
 pub fn fc_vector_concat(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<Datum> {
     let (a, b) = binary_2arg(fcinfo)?;
     let dim = a.dim() + b.dim();
-    check_dim(dim)?;
+    check_dim(dim as i32)?;
     let mut r = VecBuilder::new(fcinfo.result_mcx(), dim)?;
     for i in 0..a.dim() {
         r.set(i, a.x(i));
@@ -523,27 +487,24 @@ pub fn fc_subvector(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult<
     let count = fcinfo.arg_i32(2);
 
     if count < 1 {
-        check_dim(0)?;
+        return Err(ereport(ERRCODE_DATA_EXCEPTION, "vector must have at least 1 dimension", 998, "subvector"));
     }
     let adim = a.dim() as i32;
-    // start + count without i32 overflow (both checked positive / bounded).
+    // Check if (start + count > a->dim), avoiding integer overflow. a->dim
+    // and count are both positive, so a->dim - count won't overflow.
     let end = if start > adim - count { adim + 1 } else { start + count };
+    // Indexing starts at 1, like substring
     if start < 1 {
         start = 1;
     } else if start > adim {
-        check_dim(0)?;
+        return Err(ereport(ERRCODE_DATA_EXCEPTION, "vector must have at least 1 dimension", 1015, "subvector"));
     }
-    // C's CheckDim takes a signed dim: a negative (end - start) must raise
-    // the 22000 "at least 1 dimension" error, not wrap through usize into
-    // the 54000 max-dimension branch.
+    // C's CheckDim takes a signed dim: a negative span reports its
+    // "at least 1 dimension" (vector.c:100).
     let dim = end - start;
-    if dim < 1 {
-        check_dim(0)?;
-    }
-    let dim = dim as usize;
     check_dim(dim)?;
-    let mut r = VecBuilder::new(fcinfo.result_mcx(), dim)?;
-    for i in 0..dim {
+    let mut r = VecBuilder::new(fcinfo.result_mcx(), dim as usize)?;
+    for i in 0..dim as usize {
         r.set(i, a.x((start - 1) as usize + i));
     }
     Ok(image_datum(r.image()))
@@ -590,6 +551,8 @@ pub(crate) struct StateArray<'a> {
 }
 
 impl<'a> StateArray<'a> {
+    // CheckStateArray (vector.c:162-171). halfvec's check_state_array
+    // overrides this with halfvec.c:173.
     pub(crate) fn check(mcx: Mcx<'a>, d: Datum, caller: &str) -> PgResult<StateArray<'a>> {
         // SAFETY: caller passes a non-null float8[] state datum.
         let img = unsafe { detoasted_image(mcx, d)? };
@@ -598,7 +561,9 @@ impl<'a> StateArray<'a> {
             || arrayfuncs::arr_hasnull(img)
             || arrayfuncs::arr_elemtype(img) != FLOAT8OID
         {
-            return Err(PgError::error(format!("{caller}: expected state array")).into());
+            return Err(PgError::error(format!("{caller}: expected state array"))
+                .with_location("vector.c", 169, "CheckStateArray")
+                .into());
         }
         Ok(StateArray {
             img,
@@ -632,7 +597,7 @@ pub fn fc_vector_accum(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResu
     if newarr {
         dim = newval.dim();
     } else {
-        check_expected_dim(dim as i32, newval.dim())?;
+        check_expected_dim(dim as i32, newval.dim() as i32)?;
     }
 
     let n = state.value(0) + 1.0;
@@ -681,15 +646,15 @@ pub fn fc_vector_combine(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgRe
     let mut datums: PgVec<'_, Datum> = if dim1 == 0 && dim2 == 0 {
         copy_state_datums(mcx, &s1, 0)?
     } else if dim1 == 0 {
-        check_dim(dim2)?;
+        check_dim(dim2 as i32)?;
         copy_state_datums(mcx, &s2, dim2)?
     } else if dim2 == 0 {
-        check_dim(dim1)?;
+        check_dim(dim1 as i32)?;
         copy_state_datums(mcx, &s1, dim1)?
     } else {
         let dim = dim1;
-        check_dim(dim)?;
-        check_expected_dim(dim as i32, dim2)?;
+        check_dim(dim as i32)?;
+        check_expected_dim(dim as i32, dim2 as i32)?;
         let mut d: PgVec<'_, Datum> = mcx::vec_with_capacity_in(mcx, dim + 1)?;
         d.push(Datum::null());
         for i in 1..=dim {
@@ -715,7 +680,7 @@ pub fn fc_vector_avg(_f: Option<&mut FmgrInfo>, fcinfo: &mut Fcinfo) -> PgResult
         return Ok(Datum::null());
     }
     let dim = state.state_dims();
-    check_dim(dim)?;
+    check_dim(dim as i32)?;
     let mut b = VecBuilder::new(mcx, dim)?;
     for i in 0..dim {
         let v = (state.value(i + 1) / n) as f32;
@@ -752,7 +717,90 @@ mod tests {
         assert_eq!((v.x(0), v.x(1), v.x(2)), (1.0, 2.5, -3.0));
     }
 
-    fn combine(m: Mcx<'_>, a: &[f64], b: &[f64]) -> Result<Vec<f64>, String> {
+    fn loc(e: &PgError) -> (Option<&str>, i32, Option<&str>) {
+        let l = e.location().expect("location");
+        (l.filename.as_deref(), l.lineno, l.funcname.as_deref())
+    }
+
+    // An array_to_vector of int2[], which no SQL cast reaches.
+    #[test]
+    fn array_to_vector_unsupported_type_location() {
+        let ctx = mcx::MemoryContext::new("pgvector-test");
+        let mcx = ctx.mcx();
+        let elems = [Datum::from_i32(1), Datum::from_i32(2)];
+        let arr = arrayfuncs::construct_array(mcx, &elems, types_core::INT2OID, 2, true, b's').unwrap();
+        let mut fcinfo = types_fmgr::LocalFcinfo::<2>::new(0);
+        // SAFETY: ctx outlives the call.
+        unsafe { fcinfo.set_result_mcx(mcx) };
+        fcinfo.set_arg(0, Datum::from_usize(arr.as_ptr() as usize));
+        fcinfo.set_arg(1, Datum::from_i32(-1));
+        let e = fc_array_to_vector(None, &mut fcinfo).unwrap_err();
+        assert_eq!(e.message(), "unsupported array type");
+        assert_eq!(e.sqlstate(), ERRCODE_DATA_EXCEPTION);
+        assert_eq!(loc(&e), (Some("vector.c"), 498, Some("array_to_vector")));
+    }
+
+    fn recv(bytes: &[u8], typmod: i32) -> Box<PgError> {
+        let ctx = mcx::MemoryContext::new("pgvector-test");
+        let mcx = ctx.mcx();
+        let mut buf = stringinfo::StringInfo::new_in(mcx).unwrap();
+        buf.append_bytes(bytes).unwrap();
+        vector_recv_body(mcx, &mut buf, typmod).err().expect("recv error")
+    }
+
+    // vector_recv's wire image: i16 dim, i16 unused, f32 x[], big-endian.
+    fn msg(dim: i16, unused: i16, xs: &[f32]) -> Vec<u8> {
+        let mut v = dim.to_be_bytes().to_vec();
+        v.extend(unused.to_be_bytes());
+        for x in xs {
+            v.extend(x.to_bits().to_be_bytes());
+        }
+        v
+    }
+
+    // vector_recv (vector.c:374-403): a negative i16 dim reports CheckDim's
+    // "at least 1 dimension", as C's signed int does.
+    #[test]
+    fn vector_recv_errors_carry_vector_c_locations() {
+        let cases: [(Vec<u8>, i32, &str, i32, &str); 7] = [
+            (msg(0, 0, &[]), -1, "vector must have at least 1 dimension", 100, "CheckDim"),
+            (msg(-1, 0, &[]), -1, "vector must have at least 1 dimension", 100, "CheckDim"),
+            (msg(16001, 0, &[]), -1, "vector cannot have more than 16000 dimensions", 105, "CheckDim"),
+            (msg(3, 0, &[]), 2, "expected 2 dimensions, not 3", 88, "CheckExpectedDim"),
+            (msg(1, 1, &[]), -1, "expected unused to be 0, not 1", 393, "vector_recv"),
+            (msg(1, 0, &[f32::NAN]), -1, "NaN not allowed in vector", 117, "CheckElement"),
+            (msg(1, 0, &[f32::INFINITY]), -1, "infinite value not allowed in vector", 122, "CheckElement"),
+        ];
+        for (bytes, typmod, message, line, func) in cases {
+            let e = recv(&bytes, typmod);
+            assert_eq!(e.message(), message);
+            assert_eq!(loc(&e), (Some("vector.c"), line, Some(func)), "{message}");
+        }
+    }
+
+    // CheckStateArray is vector.c:169 from vector's aggregates;
+    // halfvec's check_state_array still reports halfvec.c:173.
+    #[test]
+    fn state_array_location_vector_and_halfvec() {
+        let ctx = mcx::MemoryContext::new("pgvector-test");
+        let m = ctx.mcx();
+        let elems = [Datum::from_f32(1.0), Datum::from_f32(2.0)];
+        let arr = arrayfuncs::construct_array(m, &elems, FLOAT4OID, 4, true, b'i').unwrap();
+        let d = Datum::from_usize(arr.as_ptr() as usize);
+        let e = StateArray::check(m, d, "vector_avg").err().unwrap();
+        assert_eq!(e.message(), "vector_avg: expected state array");
+        assert_eq!(loc(&e), (Some("vector.c"), 169, Some("CheckStateArray")));
+
+        let mut fc = types_fmgr::LocalFcinfo::<1>::new(0);
+        // SAFETY: ctx outlives the call.
+        unsafe { fc.set_result_mcx(m) };
+        fc.set_arg(0, d);
+        let e = crate::halfvec::fc_halfvec_avg(None, &mut fc).unwrap_err();
+        assert_eq!(e.message(), "halfvec_avg: expected state array");
+        assert_eq!(loc(&e), (Some("halfvec.c"), 173, Some("CheckStateArray")));
+    }
+
+    fn combine(m: Mcx<'_>, a: &[f64], b: &[f64]) -> Result<Vec<f64>, Box<PgError>> {
         let mk = |v: &[f64]| {
             let e: Vec<Datum> = v.iter().map(|x| Datum::from_f64(*x)).collect();
             arrayfuncs::construct_array(m, &e, FLOAT8OID, 8, true, b'd').unwrap()
@@ -768,7 +816,7 @@ mod tests {
                 let s = StateArray::check(m, d, "test").unwrap();
                 Ok((0..s.n_items).map(|i| s.value(i)).collect())
             }
-            Err(e) => Err(e.message().to_string()),
+            Err(e) => Err(e),
         }
     }
 
@@ -784,11 +832,15 @@ mod tests {
         assert_eq!(combine(m, &[0.0, 1.0, 2.0], &[3.0, 4.0, 5.0]).unwrap(), vec![3.0, 5.0, 7.0]);
         // dim1 == 0 but n1 != 0 (0.8.5: "expected 0 dimensions, not 1").
         assert_eq!(combine(m, &[5.0], &[3.0, 4.0]).unwrap(), vec![8.0, 4.0]);
-        assert_eq!(combine(m, &[1.0, 2.0], &[3.0, 4.0, 5.0]).unwrap_err(), "expected 1 dimensions, not 2");
+        let e = combine(m, &[1.0, 2.0], &[3.0, 4.0, 5.0]).unwrap_err();
+        assert_eq!(e.message(), "expected 1 dimensions, not 2");
+        assert_eq!(loc(&e), (Some("vector.c"), 88, Some("CheckExpectedDim")));
         // regress vector_type (expected lines 723-727): 16,001 dimensions.
         let big: Vec<f64> = (1..=16002).map(|n| n as f64).collect();
         for (a, b) in [(&[0.0][..], &big[..]), (&big[..], &[0.0][..]), (&big[..], &big[..])] {
-            assert_eq!(combine(m, a, b).unwrap_err(), "vector cannot have more than 16000 dimensions");
+            let e = combine(m, a, b).unwrap_err();
+            assert_eq!(e.message(), "vector cannot have more than 16000 dimensions");
+            assert_eq!(loc(&e), (Some("vector.c"), 105, Some("CheckDim")));
         }
     }
 }

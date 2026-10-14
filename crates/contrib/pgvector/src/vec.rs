@@ -1,6 +1,6 @@
 use mcx::{Mcx, PgVec};
 use types_error::{
-    PgError, PgResult, ERRCODE_DATA_EXCEPTION, ERRCODE_INVALID_TEXT_REPRESENTATION,
+    PgError, PgResult, SqlState, ERRCODE_DATA_EXCEPTION, ERRCODE_INVALID_TEXT_REPRESENTATION,
     ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE, ERRCODE_PROGRAM_LIMIT_EXCEEDED,
 };
 
@@ -97,68 +97,57 @@ impl<'mcx> VecBuilder<'mcx> {
     }
 }
 
-#[track_caller]
+// An ereport/elog of vector.c, located at the call's last line.
 #[cold]
-fn dim_error() -> Box<PgError> {
-    PgError::error("vector must have at least 1 dimension")
-        .with_sqlstate(ERRCODE_DATA_EXCEPTION)
-        .into()
+pub(crate) fn ereport(code: SqlState, msg: impl Into<String>, line: i32, func: &'static str) -> Box<PgError> {
+    PgError::error(msg).with_sqlstate(code).with_location("vector.c", line, func).into()
 }
 
-#[track_caller]
-#[cold]
-fn max_dim_error() -> Box<PgError> {
-    PgError::error(format!(
-        "vector cannot have more than {VECTOR_MAX_DIM} dimensions"
-    ))
-    .with_sqlstate(ERRCODE_PROGRAM_LIMIT_EXCEEDED)
-    .into()
-}
-
-pub fn check_dim(dim: usize) -> PgResult<()> {
+// CheckDim (vector.c:96-106). Signed like C's int: a negative dimension
+// (an i16 off the wire, a subvector span) reports "at least 1 dimension".
+pub fn check_dim(dim: i32) -> PgResult<()> {
     if dim < 1 {
-        return Err(dim_error());
+        return Err(ereport(ERRCODE_DATA_EXCEPTION, "vector must have at least 1 dimension", 100, "CheckDim"));
     }
-    if dim > VECTOR_MAX_DIM {
-        return Err(max_dim_error());
-    }
-    Ok(())
-}
-
-pub fn check_expected_dim(typmod: i32, dim: usize) -> PgResult<()> {
-    if typmod != -1 && typmod as usize != dim {
-        return Err(PgError::error(format!(
-            "expected {typmod} dimensions, not {dim}"
-        ))
-        .with_sqlstate(ERRCODE_DATA_EXCEPTION)
-        .into());
+    if dim > VECTOR_MAX_DIM as i32 {
+        return Err(ereport(
+            ERRCODE_PROGRAM_LIMIT_EXCEEDED,
+            format!("vector cannot have more than {VECTOR_MAX_DIM} dimensions"),
+            105,
+            "CheckDim",
+        ));
     }
     Ok(())
 }
 
+// CheckExpectedDim (vector.c:83-89).
+pub fn check_expected_dim(typmod: i32, dim: i32) -> PgResult<()> {
+    if typmod != -1 && typmod != dim {
+        return Err(ereport(ERRCODE_DATA_EXCEPTION, format!("expected {typmod} dimensions, not {dim}"), 88, "CheckExpectedDim"));
+    }
+    Ok(())
+}
+
+// CheckElement (vector.c:111-123).
 pub fn check_element(value: f32) -> PgResult<()> {
     if value.is_nan() {
-        return Err(PgError::error("NaN not allowed in vector")
-            .with_sqlstate(ERRCODE_DATA_EXCEPTION)
-            .into());
+        return Err(ereport(ERRCODE_DATA_EXCEPTION, "NaN not allowed in vector", 117, "CheckElement"));
     }
     if value.is_infinite() {
-        return Err(PgError::error("infinite value not allowed in vector")
-            .with_sqlstate(ERRCODE_DATA_EXCEPTION)
-            .into());
+        return Err(ereport(ERRCODE_DATA_EXCEPTION, "infinite value not allowed in vector", 122, "CheckElement"));
     }
     Ok(())
 }
 
+// CheckDims (vector.c:71-77).
 pub fn check_dims(a: &VecView<'_>, b: &VecView<'_>) -> PgResult<()> {
     if a.dim() != b.dim() {
-        return Err(PgError::error(format!(
-            "different vector dimensions {} and {}",
-            a.dim(),
-            b.dim()
-        ))
-        .with_sqlstate(ERRCODE_DATA_EXCEPTION)
-        .into());
+        return Err(ereport(
+            ERRCODE_DATA_EXCEPTION,
+            format!("different vector dimensions {} and {}", a.dim(), b.dim()),
+            76,
+            "CheckDims",
+        ));
     }
     Ok(())
 }
@@ -168,14 +157,15 @@ pub(crate) fn vector_isspace(ch: u8) -> bool {
     matches!(ch, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
 }
 
-#[track_caller]
+// vector_in's invalid-input ereports (vector.c:191-271), at `line`.
 #[cold]
-fn invalid_text(lit: &[u8], detail: Option<&str>) -> Box<PgError> {
+fn invalid_text(lit: &[u8], detail: Option<&str>, line: i32) -> Box<PgError> {
     let mut e = PgError::error(format!(
         "invalid input syntax for type vector: \"{}\"",
         String::from_utf8_lossy(lit)
     ))
-    .with_sqlstate(ERRCODE_INVALID_TEXT_REPRESENTATION);
+    .with_sqlstate(ERRCODE_INVALID_TEXT_REPRESENTATION)
+    .with_location("vector.c", line, "vector_in");
     if let Some(d) = detail {
         e = e.with_detail(d);
     }
@@ -192,37 +182,42 @@ pub fn parse_vector(lit: &[u8], typmod: i32, x: &mut [f32; VECTOR_MAX_DIM]) -> P
         pt += 1;
     }
     if pt >= n || lit[pt] != b'[' {
-        return Err(invalid_text(lit, Some("Vector contents must start with \"[\".")));
+        return Err(invalid_text(lit, Some("Vector contents must start with \"[\"."), 194));
     }
     pt += 1;
     while pt < n && vector_isspace(lit[pt]) {
         pt += 1;
     }
     if pt < n && lit[pt] == b']' {
-        return Err(dim_error());
+        return Err(ereport(ERRCODE_DATA_EXCEPTION, "vector must have at least 1 dimension", 204, "vector_in"));
     }
 
     loop {
         if dim == VECTOR_MAX_DIM {
-            return Err(max_dim_error());
+            return Err(ereport(
+                ERRCODE_PROGRAM_LIMIT_EXCEEDED,
+                format!("vector cannot have more than {VECTOR_MAX_DIM} dimensions"),
+                214,
+                "vector_in",
+            ));
         }
         while pt < n && vector_isspace(lit[pt]) {
             pt += 1;
         }
         if pt >= n {
-            return Err(invalid_text(lit, None));
+            return Err(invalid_text(lit, None, 223));
         }
         let (val, consumed) = match strtof_prefix(&lit[pt..]) {
             Some(r) => r,
-            None => return Err(invalid_text(lit, None)),
+            None => return Err(invalid_text(lit, None, 234)),
         };
         if let StrtofVal::Erange(tok_len) = val {
-            return Err(PgError::error(format!(
-                "\"{}\" is out of range for type vector",
-                String::from_utf8_lossy(&lit[pt..pt + tok_len])
-            ))
-            .with_sqlstate(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE)
-            .into());
+            return Err(ereport(
+                ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE,
+                format!("\"{}\" is out of range for type vector", String::from_utf8_lossy(&lit[pt..pt + tok_len])),
+                240,
+                "vector_in",
+            ));
         }
         let StrtofVal::Ok(val) = val else { unreachable!() };
         check_element(val)?;
@@ -239,7 +234,7 @@ pub fn parse_vector(lit: &[u8], typmod: i32, x: &mut [f32; VECTOR_MAX_DIM]) -> P
             pt += 1;
             break;
         } else {
-            return Err(invalid_text(lit, None));
+            return Err(invalid_text(lit, None, 260));
         }
     }
 
@@ -247,11 +242,11 @@ pub fn parse_vector(lit: &[u8], typmod: i32, x: &mut [f32; VECTOR_MAX_DIM]) -> P
         pt += 1;
     }
     if pt != n {
-        return Err(invalid_text(lit, Some("Junk after closing right brace.")));
+        return Err(invalid_text(lit, Some("Junk after closing right brace."), 271));
     }
 
-    check_dim(dim)?;
-    check_expected_dim(typmod, dim)?;
+    check_dim(dim as i32)?;
+    check_expected_dim(typmod, dim as i32)?;
     Ok(dim)
 }
 
@@ -539,6 +534,40 @@ mod tests {
         match parse_vector(s.as_bytes(), -1, &mut x) {
             Ok(n) => Ok(x[..n].to_vec()),
             Err(e) => Err(e.message().to_string()),
+        }
+    }
+
+    fn parse_err(s: &str, typmod: i32) -> Box<PgError> {
+        let mut x = Box::new([0.0f32; VECTOR_MAX_DIM]);
+        parse_vector(s.as_bytes(), typmod, &mut x).err().expect("parse error")
+    }
+
+    fn loc(e: &PgError) -> (Option<&str>, i32, Option<&str>) {
+        let l = e.location().expect("location");
+        (l.filename.as_deref(), l.lineno, l.funcname.as_deref())
+    }
+
+    // vector_in (vector.c:176-281) and the CheckElement/CheckExpectedDim
+    // helpers it calls, each at its ereport's last line.
+    #[test]
+    fn parse_errors_carry_vector_c_locations() {
+        let big = format!("[{}]", vec!["1"; 16001].join(","));
+        let cases: [(&str, i32, i32, &str); 11] = [
+            ("1,2,3", -1, 194, "vector_in"),
+            ("[]", -1, 204, "vector_in"),
+            (&big, -1, 214, "vector_in"),
+            ("[", -1, 223, "vector_in"),
+            ("[hello,1]", -1, 234, "vector_in"),
+            ("[4e38]", -1, 240, "vector_in"),
+            ("[1,2,3", -1, 260, "vector_in"),
+            ("[1,2,3]9", -1, 271, "vector_in"),
+            ("[NaN,1]", -1, 117, "CheckElement"),
+            ("[Infinity,1]", -1, 122, "CheckElement"),
+            ("[1,2,3]", 2, 88, "CheckExpectedDim"),
+        ];
+        for (lit, typmod, line, func) in cases {
+            let e = parse_err(lit, typmod);
+            assert_eq!(loc(&e), (Some("vector.c"), line, Some(func)), "{}", &lit[..lit.len().min(16)]);
         }
     }
 

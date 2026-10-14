@@ -7,9 +7,6 @@
 //! upgrade scripts and vector.control (spec §4.6). The library reports
 //! PG_MODULE_MAGIC_EXT's "0.8.7" (vector.c:49) and reserves the hnsw and
 //! ivfflat GUC prefixes on load, as _PG_init does.
-//! DIVERGENCE: errors raised by the pre-M2 vector code (vec.rs, funcs.rs)
-//! carry crate-derived locations, not vector.c's; halfvec_to_vector and
-//! sparsevec_to_vector inherit that through vector's CheckDim helpers.
 //! DIVERGENCE: the sparsevec inner product and L2 merges fuse multiply-adds
 //! only on aarch64, matching C's codegen per target; neither emulates C's
 //! vectorized L2/L1 tails (see sparsevec.rs fmadd_step).
