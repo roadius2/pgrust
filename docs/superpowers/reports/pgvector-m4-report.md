@@ -346,7 +346,7 @@ The final whole-branch review's fix wave (`87a34c8584`, code only; this docs com
 The M4 follow-ups plan closed these items. Details are in `pgvector-m4-followups-report.md`, under the task named on each line. This report's numbers above are a snapshot and are not rewritten.
 - The `insert_grid` flake: the case is now an opt-in known divergence (C's pointer tie-break), so the default bytecmp list is 28 (Task 1).
 - `bitmap_scan`: `pg_index_has_property` now follows `amgetbitmap`, so it is `f` for hnsw and ivfflat indexes, as in C (Task 2).
-- `_PG_init` load timing: pgrust loads `vector` where C calls the AM handler (a session's first index open, `CREATE INDEX` and amutils), and not at `CREATE ACCESS METHOD` (Task 3).
+- `_PG_init` load timing: pgrust loads `vector` where C calls the AM handler (among them a session's first index open, `CREATE INDEX` and amutils; the follow-ups report lists every load point), and not at `CREATE ACCESS METHOD` (Task 3).
 - The `reloptions.c:0`, `guc.c:0`, `float.c:0` and `mcxt.c` locations: every site the plan listed, which covers those pgvector SQL reaches, now reports C's `file:line, function` (Tasks 4 and 5).
 - `pgvector.c:0`: every SQL-reachable vector.c site reports its vector.c location (Task 6).
 - The `{hnsw.c` source-map row is now `hnsw.c` (Task 5).

@@ -1,6 +1,6 @@
 # pgvector conformance after the M4 follow-ups
 
-Date: 2026-10-14 · pgrust commit: `06fd88bd88` (the last code commit, Task 7's fix round; this docs commit changes no code) · Reference: PostgreSQL 18.6 + pgvector 0.8.7 (`pgvec`), seeded oracle `pgvec-seeded` (-DHNSW_MEMORY -DIVFFLAT_BENCH) · Plan: `docs/superpowers/plans/2026-10-13-pgvector-m4-followups.md`
+Date: 2026-10-14 · pgrust commit: `06fd88bd88` (the server's last code commit, Task 7's fix round; the gate below ran on it, and the final fix wave, `4d9df37777`, changed only the repair script, its test-only generator and harness files) · Reference: PostgreSQL 18.6 + pgvector 0.8.7 (`pgvec`), seeded oracle `pgvec-seeded` (-DHNSW_MEMORY -DIVFFLAT_BENCH) · Plan: `docs/superpowers/plans/2026-10-13-pgvector-m4-followups.md`
 
 ## Summary
 - **C reference:** 130/130 (regress 14/14, TAP 48/48, bytecmp 28/28, iterscan 19/19, diff 21/21).
@@ -201,9 +201,11 @@ Every remaining failure is a parallel build (M6), the same 8 tests and the same 
 ### Task 3: where a session loads `vector`
 - **C's behavior.** `OidFunctionCall0(amhandler)` runs `fmgr_info`, which loads a `LANGUAGE c` handler's library and runs its `_PG_init` once per session. That reserves the `hnsw` and `ivfflat` GUC prefixes and removes their placeholders with a WARNING.
   - C calls the handler at `CREATE INDEX` (`DefineIndex`, `indexcmds.c:864`), at a session's first open of an hnsw or ivfflat index (`relcache.c:1432` → `amapi.c:38`), and in amutils (`amutils.c:198`/`:458` → `GetIndexAmRoutineByAmId` → `amapi.c:106`).
+  - It also calls it at `CREATE OPERATOR CLASS` and `ALTER OPERATOR FAMILY` (`opclasscmds.c:380`, `:838`), in `amvalidate()` (`amapi.c:192`), in the strategy translators `IndexAmTranslateStrategy` and `IndexAmTranslateCompareType` (`amapi.c:128`, `:158`), in `pg_get_indexdef` (`ruleutils.c:1348`), in `ALTER TABLE ... ALTER COLUMN TYPE`'s `CheckIndexCompatible` (`indexcmds.c:230`), in logical replication's index check (`relation.c:879`), and in lsyscache (Still open).
   - C does not call it at `SELECT ... FROM pg_am`, or at `CREATE ACCESS METHOD` (`amcmds.c:78` checks the handler's return type without calling it), or per scan.
 - **The change.**
   - `amapi`'s `GetIndexAmRoutine` calls `fmgr_info` for an hnsw, ivfflat or bloom handler. The new no-load `index_am_kind_of_handler` serves the `CREATE ACCESS METHOD` fence and the per-scan resolver.
+  - pgrust's ports of every caller above reach `GetIndexAmRoutine` (directly or through `GetIndexAmRoutineByAmId`) at C's position, so each loads there too. lsyscache's own name-matched copies of the translators and AM flags are the exception (Still open).
   - `adt_amutils`' `extension_am_handler` calls `fmgr_info` and returns `PgResult`; `am_flags` returns `PgResult<Option<..>>`, so a load failure propagates while a lookup miss stays `None`.
   - `pgvector`'s `pg_init` loses its load-timing `DIVERGENCE` paragraph.
 - **`scripts/pgvector/sql/library-load.sql`**, the diff row `library_load`. Each section starts a fresh session with `\c`, sets a placeholder, runs one statement, sets a second placeholder and lists the loaded modules. C prints:
@@ -213,17 +215,20 @@ Every remaining failure is a parallel build (M6), the same 8 tests and the same 
   | 1. Negative control | `SELECT amname FROM pg_am` | No WARNING. Both SETs succeed. No module row. |
   | 2. Negative control | `CREATE ACCESS METHOD hnsw2 TYPE INDEX HANDLER hnswhandler` | No WARNING. Both SETs succeed. No module row. |
   | 3. amutils | `pg_indexam_has_property(oid, 'can_order')` on hnsw | At the SELECT: `WARNING: invalid configuration parameter name "hnsw.typo", removing it` with `DETAIL: "hnsw" is now a reserved prefix.`, and the same for `ivfflat.typo`. Then `SET hnsw.typo2` fails: `ERROR: invalid configuration parameter name "hnsw.typo2"`, `DETAIL: "hnsw" is a reserved prefix.` The module row is `vector \| 0.8.7`. |
-  | 4. First index open | `INSERT INTO t (id) VALUES (1)` (t has an hnsw index) | The `hnsw.typo` WARNING at the INSERT, then the `hnsw.typo2` ERROR and `vector \| 0.8.7`. |
-  | 5. Failing `CREATE INDEX` | `CREATE INDEX ON t USING ivfflat (id)` | The `ivfflat.typo` WARNING, then `ERROR: data type integer has no default operator class for access method "ivfflat"` with its HINT. Then the `ivfflat.typo2` ERROR and `vector \| 0.8.7`. |
-  | 6. `CREATE INDEX` | `CREATE INDEX t_v_ivf ON t USING ivfflat (v vector_l2_ops) WITH (lists = 1)` | The `ivfflat.typo` WARNING, then `NOTICE: ivfflat index created with little data` with its DETAIL and HINT. Then the `ivfflat.typo2` ERROR and `vector \| 0.8.7`. |
+  | 4. `amvalidate()` | `SELECT amvalidate(oid) FROM pg_opclass` for hnsw's `vector_l2_ops` | The `hnsw.typo` WARNING at the SELECT, which returns `t`. Then the `hnsw.typo2` ERROR and `vector \| 0.8.7`. |
+  | 5. Failing `CREATE OPERATOR CLASS` | `CREATE OPERATOR CLASS bogus_ops FOR TYPE int4 USING hnsw AS FUNCTION 99 int4eq(int4, int4)` | The `hnsw.typo` WARNING, then `ERROR: invalid function number 99, must be between 1 and 3`. Then the `hnsw.typo2` ERROR and `vector \| 0.8.7`. |
+  | 6. First index open | `INSERT INTO t (id) VALUES (1)` (t has an hnsw index) | The `hnsw.typo` WARNING at the INSERT, then the `hnsw.typo2` ERROR and `vector \| 0.8.7`. |
+  | 7. Failing `CREATE INDEX` | `CREATE INDEX ON t USING ivfflat (id)` | The `ivfflat.typo` WARNING, then `ERROR: data type integer has no default operator class for access method "ivfflat"` with its HINT. Then the `ivfflat.typo2` ERROR and `vector \| 0.8.7`. |
+  | 8. `CREATE INDEX` | `CREATE INDEX t_v_ivf ON t USING ivfflat (v vector_l2_ops) WITH (lists = 1)` | The `ivfflat.typo` WARNING, then `NOTICE: ivfflat index created with little data` with its DETAIL and HINT. Then the `ivfflat.typo2` ERROR and `vector \| 0.8.7`. |
 
-  - Section 5 fails after `DefineIndex`'s handler call and before anything else could load `vector`, so it isolates that load point. Section 6 matched C even before the change, because another vector function loaded the library on that path.
-  - Before the change, pgrust printed no WARNING in sections 3 and 4, accepted the second SET and listed no module. All three placeholder WARNINGs came late, at `CREATE TABLE t (id int, v vector(3))` (the typmod input).
-  - Two probe builds showed the row catches a regression. Without `GetIndexAmRoutine`'s load, sections 4 and 5 differ from C. With the `CREATE ACCESS METHOD` fence back on the loading path, section 2 differs from C.
+  - Section 7 fails after `DefineIndex`'s handler call and before anything else could load `vector`, so it isolates that load point. Section 5 does the same for `DefineOpClass`'s (`opclasscmds.c:380`): the item-number check that fails comes after it. Section 8 matched C even before the change, because another vector function loaded the library on that path.
+  - Before the change, pgrust printed no WARNING in sections 3 and 6, accepted the second SET and listed no module. All three placeholder WARNINGs came late, at `CREATE TABLE t (id int, v vector(3))` (the typmod input).
+  - Two probe builds showed the row catches a regression. Without `GetIndexAmRoutine`'s load, sections 6 and 7 differ from C. With the `CREATE ACCESS METHOD` fence back on the loading path, section 2 differs from C.
+  - Sections 4 and 5 came with the final fix wave. C printed what the table says before they were kept, and pgrust matched. The same no-load probe, rebuilt then, made both differ from C as well: no WARNING, the second SET accepted, no module row.
 - **Unit tests.** `extension_handlers_load_their_library` (amapi) counts `fmgr_info` calls per handler: `GetIndexAmRoutine` loads for the extension handlers, while `index_am_kind_of_handler` and the builtin handlers do not. `extension_am_properties_load_the_library` (adt_amutils) does the same for amutils. `handler_dispatch_is_the_closed_set` (amapi) still pins the handler dispatch and its errors.
 
 ### Tasks 4 and 5: C error locations in core
-Every edit adds `.with_location(..)` and nothing else: messages, SQLSTATEs, DETAILs, HINTs and elevels are unchanged. Each line is the C call's closing `);`, checked against the vendored source. "Diff" means `scripts/pgvector/sql/core-error-locations.sql` (the diff row `core_error_locations`), run with `sqldiff.sh --verbose`, where C and pgrust print the same `LOCATION:` line; the count is how many times C prints it.
+Every edit gives an error C's location and leaves its message, SQLSTATE, DETAIL, HINT and elevel unchanged. Most edits only add `.with_location(..)`. At the three `assignable_custom_variable_name` sites Task 4 replaced a `.with_funcname(..)` with it, and at `MarkGUCPrefixReserved` it replaced the WARNING's `file!()`/`line!()` location with `guc.c`, 5312. Task 5 also changed the over-ceiling panic's payload type (below). Each line is the C call's closing `);`, checked against the vendored source. "Diff" means `scripts/pgvector/sql/core-error-locations.sql` (the diff row `core_error_locations`), run with `sqldiff.sh --verbose`, where C and pgrust print the same `LOCATION:` line; the count is how many times C prints it.
 
 | C location | Error | Pinned by |
 |---|---|---|
@@ -258,7 +263,7 @@ Every edit adds `.with_location(..)` and nothing else: messages, SQLSTATEs, DETA
 | `float8in_internal, float.c:497` | invalid input syntax | unit `float_input_errors_carry_c_locations`; diff (`'abc'::float8`) |
 | `float8in_internal, float.c:511` | trailing junk | unit `float_input_errors_carry_c_locations`; diff (`'1.5x'::float8`) |
 | `MemoryContextAllocationFailure, mcxt.c:1167` | `out of memory`, with the context's DETAIL | unit `oom_error_shape_matches_mcxt_c`, `ivf_kmeans_buffers_raise_out_of_memory` |
-| `MemoryContextSizeFailure, mcxt.c:1180` | `invalid memory alloc request size <n>` | unit `alloc_size_gate_matches_palloc`, `allocator_rejects_over_ceiling_allocate`/`_grow`, catcache `payload_alloc_failure_is_a_catchable_error`; diff (`repeat('x', 500000000) \|\| repeat('y', 600000000)`, size 1100000004) |
+| `MemoryContextSizeFailure, mcxt.c:1180` | `invalid memory alloc request size <n>` | unit `alloc_size_gate_matches_palloc`, `allocator_rejects_over_ceiling_allocate`/`_grow`, `ivf_kmeans_buffers_raise_out_of_memory`, catcache `payload_alloc_failure_is_a_catchable_error`; diff (`repeat('x', 500000000) \|\| repeat('y', 600000000)`, size 1100000004) |
 
 - **Soft errors stay soft.** `pg_input_is_valid('abc', 'float4')` is `f` and `pg_input_error_info` gives `invalid input syntax for type real: "abc"` on both sides (diff), and `float_soft_input_errors_stay_soft` checks the saved error's SQLSTATE, message and location.
 - **GUC elevels.** Only the location changed, so `ALTER SYSTEM` and config-file paths keep their elevels and messages.
@@ -292,10 +297,11 @@ All 24 SQL- or wire-reachable vector.c sites that lacked a location now carry `v
 
 ### Task 7: the pre-M4 repair
 - **The problem (M4 report, "Upgrading from M1–M3 clusters").** pgrust builds before M4 installed a trimmed `vector` labelled 0.8.5. `ALTER EXTENSION vector UPDATE` then fails at `vector--0.8.6--0.8.7.sql`'s `COMMENT ON FUNCTION ivfflathandler(internal)` (line 104), because the function does not exist.
-- **The repair.** `crates/contrib/pgvector/repair/pgrust-trimmed-0.8.5.sql` (1,561 lines), generated from upstream `sql/vector.sql` by the test-only `crates/contrib/pgvector/src/repair_gen.rs`.
+- **The repair.** `crates/contrib/pgvector/repair/pgrust-trimmed-0.8.5.sql` (1,566 lines), generated from upstream `sql/vector.sql` by the test-only `crates/contrib/pgvector/src/repair_gen.rs`.
   - It is one `DO` block with 213 guarded blocks in upstream order. Each creates a missing upstream object and adds it to the extension, so the script is atomic and idempotent.
   - It does nothing unless `vector` is at 0.8.5 (`vector is at 0.8.7; nothing to repair`), and raises if `vector` is not installed. It ends with `vector: created N missing objects; now run ALTER EXTENSION vector UPDATE`.
   - It runs the way `execute_extension_script` runs an extension script: `search_path` is the extension's schema then `pg_temp`, with `pg_catalog` searched implicitly first (`extension.c:1290-1312`), and `client_min_messages` is raised to `warning` (`extension.c:1271-1274`), then restored before the summary NOTICE.
+  - Its prologue runs under the caller's `search_path` until it sets the extension's, and its end runs under it again once restored. Since the final fix wave, every function, relation and operator in those stretches is qualified with `pg_catalog` (`OPERATOR(pg_catalog.=)` and so on), so a caller's path cannot redirect them. On both C and pgrust, with `search_path = evil, pg_catalog` and an `evil.current_setting(text)` that raises, the old script fails at its `DECLARE` and the new one prints `nothing to repair`.
   - `repair_script_is_generated_from_upstream` fails when the file is stale, and `PGVECTOR_REGEN_REPAIR=1` rewrites it. `repair_covers_every_upstream_object` counts 213 guards.
   - Usage is in CLAUDE.md ("Pre-M4 databases").
 - **Two guards differ from the plan's table**, and both plan forms fail the same way on C PostgreSQL:
@@ -309,10 +315,10 @@ All 24 SQL- or wire-reachable vector.c sites that lacked a location now carry `v
   | `88f29c4ccf` (M2, 190 statements) | same | created 24 | created 0 | identical |
   | `c1c5da11cc` (M3, 203 statements) | same | created 11 | created 0 | identical |
   | `79ad992ede/schema` (extension in schema `s`) | same | created 145 | created 0 | identical to a fresh install in `s` |
-  | `79ad992ede/rollback` (repair fails at its last statement) | same | `ERROR: injected` | — | catalog unchanged (150 rows), still 0.8.5, update still fails |
+  | `79ad992ede/rollback` (repair fails after its last object block) | same | `ERROR: injected` | — | catalog unchanged (150 rows), still 0.8.5, update still fails |
   | `0.8.7/no-op` | — | `vector is at 0.8.7; nothing to repair` | — | — |
 
-  This run: 6/6 passed with the same counts: 145, 24, 11 and 145 on the first repair and 0 on every second. Each first repair prints one NOTICE, the summary. Every catalog diff is empty, the rollback's dumps before and after are identical (150 rows), and the staged old script and the scratch server's directories are gone afterwards.
+  This run: 6/6 passed with the same counts: 145, 24, 11 and 145 on the first repair and 0 on every second. Each first repair prints one NOTICE, the summary. Every catalog diff is empty, the rollback's dumps before and after are identical (150 rows), and the staged old script and the scratch server's directories are gone afterwards. The final fix wave reran it on the qualified script: 6/6, with the same counts and an identical 150-row rollback dump.
 - **The dev cluster.** `~/.cache/pgrust/pgv-016`, database `postgres`: `vector` 0.8.5 with 73 members and a table `tst` (9 rows of `vector(1900)`) with an hnsw index.
   - The repair created 145 objects, and `ALTER EXTENSION vector UPDATE` took it to 0.8.7. Its catalog equals a fresh install's, `tst` is unchanged, and the plan still uses `Index Scan using tst_v_idx`. `template1` has no `vector`.
   - That repair ran before the fix round changed the script's `search_path` and `client_min_messages` handling. The created objects are the same, so it was not rerun. A rerun now prints `nothing to repair`.
@@ -339,18 +345,37 @@ One, under the plan's stop rule (a statement that does not error on C is fixed o
   - Task 7: the fix round added the rollback row, the scratch-directory cleanup and the `client_min_messages` handling, so the check has six rows.
   - Task 7: the plan's mapping table stays as written; this report documents the shipped guards.
   - Task 8: the expected repair check is 6/6, not the plan's 5/5.
+- **Final review** (whole branch, `cf8ef63d3d..f73940d5a9`): ready to merge with fixes; fixed in `4d9df37777` (the repair and its check, `library-load.sql`, and two script comments) and this report's commit. Its rulings:
+  - One fix wave covers the Important finding (this report's load points and coverage), the Task 8 report-fidelity minors folded into it, five other minors, and two optional `library-load.sql` sections, each kept only if C behaves as expected and pgrust matches. Both were kept (sections 4 and 5).
+  - The repair's prologue is hardened now, not deferred, because it is a superuser-run script.
+  - Every other deferred minor, and the review's declined-to-judge items, stay follow-ups (Still open).
+  - Fix-wave verification: `run-diff.sh ref` and `run-diff.sh pgrust` 21/21 each, `run-repair-check.sh` 6/6, the `repair_` tests with and without `PGVECTOR_REGEN_REPAIR`, `UT_KEEP` 87 passed, both lints PASS, and both reference trees clean. The other tiers were not rerun, because the server binary is unchanged: the probe rebuild was reverted, and the rebuilt binary is byte-identical to the one the wave started from (`06fd88bd88`'s code).
 
 ## Still open
-- **lsyscache's name-matched AM arms** (`amop.rs`, plan Decision 2) do not load the library. They run only after relcache has opened an index of that AM, which already loaded it.
+- **lsyscache's name-matched AM arms** (`amop.rs`, plan Decision 2) do not load the library, where C's do.
+  - C calls the handler for every non-core `pg_amop` row of the operator it is given, whether or not an index of that AM was opened: in `get_opmethod_canorder` (`lsyscache.c:235`; called from `get_op_index_interpretation` at `:752` and from `get_ordering_op_properties`, `get_equality_op_for_ordering_op` and `get_mergejoin_opfamilies`), in `get_op_index_interpretation`'s negator pass (`:793`), and in `equality_ops_are_compatible` (`:874`) and `comparison_ops_are_compatible` (`:930`), these two only for an opfamily that holds the second operator too.
+  - For pgvector this is invisible. Its hnsw and ivfflat opfamilies hold only ORDER BY distance operators, which return `float8`, so they are never the boolean operator of a qual, join clause or sort that reaches those functions. The scope decision stands. Bloom differs (below).
 - **Other `unrecognized configuration parameter` constructions** that port other C functions stay unlocated (`unrecognized()` itself serves several C sites).
 - **Hand-written `out of memory` errors in other crates**, each a different C site, stay unlocated. Those built through `mcx::oom_named` now report `mcxt.c:1167`.
+- **`invalid memory alloc request size` outside mcx: none is hand-written.**
+  - The final review expected hand-written ones in other crates to stay unlocated, citing `be_fsstubs/src/lib.rs:690`. That line is a test assertion.
+  - A search of non-test code finds the message built only in mcx, by `invalid_alloc_size_error`. `check_alloc_size` returns it (`be_fsstubs`' `be_loread` goes through `check_alloc_size`), and the over-ceiling panic carries it, so every such error reports `mcxt.c:1180`.
+  - What stays unlocated in mcx is `add_size`'s and `mul_size`'s `invalid memory allocation request size <a> + <b>` and `<a> * <b>` (C: `add_size_error, mcxt.c:1699`; `mul_size_error, :1718`).
 - **pgvector_hnsw's 13 internal-guard errors**, unreachable from SQL, report `hnsw.c:0` (before, `{hnsw.c:0`).
 - **The remaining source-map garbage keys.** Five path-shaped rows (`source_map_table.rs:94-106`, the pgclient row among them) can never match a lookup, so they are harmless. The value check skips them; delete them when `scripts/error-source-map.py` is restored.
-- **The M3 report's `big_golomb` line** (`pgvector-m3-report.md:193`) says the multi-block tie-break is verified. After Task 1's measurement that is unproven. Reports are snapshots, so it is noted here.
-- **The M4 report's deferred minors** stand, except those this plan closed (its "Resolved after M4" section).
+- **The M3 report's `big_golomb` lines** (`pgvector-m3-report.md:193`, `:252`) say the multi-block tie-break is verified. After Task 1's measurement that is unproven. Reports are snapshots, so it is noted here.
+- **The M4 report's still-standing known divergences and its deferred minors** stand, except those this plan closed (its "Resolved after M4" section). The divergences are under its "Known divergences left open"; for example, the static `ivfflat.*` and `hnsw.*` GUCs exist before the library loads (`pgvector-m4-report.md:277`).
+- **The final review's declined-to-judge items.** Each predates this branch or lies outside the plan, and none changes a gate result; all are follow-ups.
+  - PL/pgSQL `EXCEPTION` blocks re-raise panic payloads (`plpgsql/src/exec.rs:3152-3160`), so an over-ceiling allocation inside `BEGIN ... EXCEPTION` cannot be caught in pgrust, where C's handler catches the ERROR.
+  - `amapi` identifies an extension handler by its `proname`, while amutils uses its `prosrc`, so the two can disagree after `ALTER FUNCTION ... RENAME`.
+  - Bloom's load timing differs through lsyscache's non-loading arms: bloom's opfamilies hold `=` operators, which do reach them.
+  - `run-repair-check.sh` runs its scratch server on the harness's pgrust port, and a SIGKILL skips its trap, leaving the staged `vector--0.8.5.sql` behind.
+  - `GetIndexAmRoutine` resolves the AM kind before it loads the library. So a foreign `LANGUAGE C` handler, reachable only past a bypassed `CREATE ACCESS METHOD` fence, errors before its library would load in C.
+  - x86_64 and wasm are untested (Coverage limits).
 - **This plan's deferred review minors:**
   - Task 1:
-    - `run-bytecmp.sh:13-14` says `ref` proves "every case deterministic"; it should say every default case.
+    - `run-bytecmp.sh:13-14` says `ref` proves "every case deterministic"; it should say every default case. (Fixed in the final fix wave.)
+    - Spec §8.2 or the M1 report might still repeat the old `big_golomb` claim (not checked in Task 1). Checked now: neither does. Spec §8.2 says only that C's graph spans several 1 MB blocks, and `pgvector-m1-report.md:107` calls the multi-block case unverified. The M3 report does, at `:193` and `:252` (above).
     - The `utils.rs` `DIVERGENCE` note covers on-disk inserts only; vacuum's repair (`RepairGraphElement` → `HnswUpdateNeighborsOnDisk`, `hnswvacuum.c:273`, `tmpCtx` at `:749`) reaches the same pointer tie-break.
   - Task 2:
     - The HNSW and IVFFlat `AmFlags` rows both cite `hnsw.c:315 / ivfflat.c:232`; one citation each would be more precise.
@@ -374,15 +399,16 @@ One, under the plan's stop rule (a statement that does not error on C is fixed o
     - The RED evidence covered the compile error only, not the location asserts of the other four tests.
   - Task 7:
     - `repair-verify.sql` compares members, comments, function-definition md5s, amop, amproc and opclass rows, not `pg_type`, `pg_operator`, `pg_cast` or `pg_aggregate` attributes.
-    - The guards test existence, not extension membership: a planted non-member object with the same signature would be skipped, not added.
+    - The guards test existence, not extension membership: a planted non-member object with the same signature would be skipped, not added. An already-member shell makes the repair abort instead (fail-safe).
     - `run-repair-check.sh`'s unconditional verify and fresh-catalog steps abort under `set -e` with no summary line.
-    - `repair_covers_every_upstream_object`'s comment says HEADER has two precondition `IF`s; it has three (the assertion is right).
+    - `repair_covers_every_upstream_object`'s comment says HEADER has two precondition `IF`s; it has three (the assertion is right). (Fixed in the final fix wave.)
     - The repair does not mirror C's other extension-script settings (`log_min_messages`, `check_function_bodies = off`); every function is `LANGUAGE C`, so there is no practical effect.
-    - A user-made shell type named `vector`, `halfvec` or `sparsevec` makes the repair fail and roll back (safe, not self-healing).
+- **Task 7's implementer also noted** (a concern, not a review minor): a user-made shell type named `vector`, `halfvec` or `sparsevec` makes the repair fail and roll back (safe, not self-healing).
 
 ## Coverage limits
 - **macOS arm64 only.** Every tier ran on macOS arm64.
 - **wasm not built.** `wasm/wasm-build.sh` was not run, so the changed crates are not checked against `wasm32-wasip1`.
 - **GUC check hooks.** No pgvector GUC has a check hook, so the five `call_*_check_hook` locations are covered by unit tests only.
 - **`insert_grid`** is outside the gate by design. Run by name, it can fail on C against C.
-- **The repair's rollback** is checked by injecting a failure at the script's last statement only.
+- **Library load points.** `library-load.sql` tests `CREATE INDEX` (succeeding, and failing after the handler call), a session's first index open, amutils, `amvalidate()` and a failing `CREATE OPERATOR CLASS`, with two negative controls (`SELECT ... FROM pg_am` and `CREATE ACCESS METHOD`). `ALTER OPERATOR FAMILY`, the strategy translators, `pg_get_indexdef`, `CheckIndexCompatible` and logical replication's index check are untested: their ports reach the same `GetIndexAmRoutine` load, checked by reading the code only.
+- **The repair's rollback** is checked by injecting a failure after the script's last object block only.
