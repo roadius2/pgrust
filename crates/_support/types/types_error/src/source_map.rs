@@ -76,6 +76,23 @@ mod tests {
         for (k, v) in table::OVERRIDES {
             assert_ne!(*v, alloc::format!("{k}.c"), "redundant override for {k}");
             assert!(!k.is_empty() && !v.is_empty());
+            // Every value a lookup can return is a bare C basename,
+            // [A-Za-z0-9_.+-]+\.(c|l|y): no `{`, `(`, `)`, `/` or whitespace.
+            // Keys are not checked, but a path-shaped key (`crates/...`) is
+            // never looked up (crate_dir_of yields one path component), so
+            // its value never reaches the wire.
+            if k.contains('/') {
+                continue;
+            }
+            let stem = v
+                .strip_suffix(".c")
+                .or_else(|| v.strip_suffix(".l"))
+                .or_else(|| v.strip_suffix(".y"));
+            assert!(
+                stem.is_some_and(|s| !s.is_empty()
+                    && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.+-".contains(&b))),
+                "override value for {k} is not a C basename: {v:?}"
+            );
         }
     }
 
@@ -134,6 +151,10 @@ mod tests {
         let mapped = c_basename_for_rust_path("crates/x/y/brand_new_crate/src/lib.rs").unwrap();
         assert_eq!(mapped, "brand_new_crate.c");
         assert!(!mapped.contains('/'));
+        assert_eq!(
+            c_basename_for_rust_path("crates/contrib/pgvector_hnsw/src/scan.rs").as_deref(),
+            Some("hnsw.c")
+        );
         // C names pass through untouched.
         assert_eq!(c_basename_for_rust_path("postgres.c"), None);
         assert_eq!(c_basename_for_rust_path("scan.l"), None);

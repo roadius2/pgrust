@@ -1662,6 +1662,7 @@ pub fn oom_named(context_name: &str, request: usize) -> PgError {
         .with_detail(alloc::format!(
             "Failed on request of size {request} in memory context \"{context_name}\"."
         ))
+        .with_location("mcxt.c", 1167, "MemoryContextAllocationFailure")
 }
 
 #[cfg(debug_assertions)]
@@ -1842,6 +1843,12 @@ impl fmt::Debug for Mcx<'_> {
 #[cold]
 #[inline(never)]
 fn alloc_ceiling_exceeded(size: usize) -> ! {
+    // A PgError payload: the statement boundary's pg_error_from_panic keeps
+    // its LOCATION (MemoryContextSizeFailure, mcxt.c:1180). no_std builds
+    // keep the string form.
+    #[cfg(any(feature = "std", test))]
+    std::panic::panic_any(alloc::boxed::Box::new(invalid_alloc_size_error(size)));
+    #[cfg(not(any(feature = "std", test)))]
     panic!("invalid memory alloc request size {size}")
 }
 
@@ -2107,7 +2114,14 @@ pub const MAX_ALLOC_HUGE_SIZE: usize = usize::MAX / 2;
 
 #[cold]
 fn invalid_alloc_size(request: usize) -> alloc::boxed::Box<PgError> {
-    PgError::error(alloc::format!("invalid memory alloc request size {request}")).into()
+    invalid_alloc_size_error(request).into()
+}
+
+// MemoryContextSizeFailure (mcxt.c:1172-1181): elog(ERROR), XX000.
+#[cold]
+fn invalid_alloc_size_error(request: usize) -> PgError {
+    PgError::error(alloc::format!("invalid memory alloc request size {request}"))
+        .with_location("mcxt.c", 1180, "MemoryContextSizeFailure")
 }
 
 #[inline]

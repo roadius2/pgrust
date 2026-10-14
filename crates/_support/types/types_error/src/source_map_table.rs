@@ -194,7 +194,7 @@ pub(crate) const OVERRIDES: &[(&str, &str)] = &[
     ("pg_trgm", "trgm_gin.c"),
     ("pglz", "pg_lzcompress.c"),
     ("pgstatfuncs+pseudorandomfuncs", "pgstatfuncs.c"),
-    ("pgvector_hnsw", "{hnsw.c"),
+    ("pgvector_hnsw", "hnsw.c"),
     ("pgvector_ivfflat", "ivfflat.c"),
     ("pgvector_ivfflat_build", "ivfbuild.c"),
     ("planner(clausesel.rs", "clausesel.c"),

@@ -312,23 +312,28 @@ fn round_to_float(token: &[u8], mantissa_bits: u32, exp_bits: u32) -> f64 {
     }
 }
 
+// `line`/`func` name the C ereport site: float4in_internal or
+// float8in_internal, whatever type_name the caller passed (the geometric
+// types report float8in_internal too).
 #[cold]
 #[inline(never)]
-fn invalid_input(type_name: &str, orig_string: &str) -> PgError {
+fn invalid_input(type_name: &str, orig_string: &str, line: i32, func: &'static str) -> PgError {
     PgError::error(format!(
         "invalid input syntax for type {type_name}: \"{orig_string}\""
     ))
     .with_sqlstate(ERRCODE_INVALID_TEXT_REPRESENTATION)
+    .with_location("float.c", line, func)
 }
 
 // C truncates the reported number at endptr; the type name is fixed.
 #[cold]
 #[inline(never)]
-fn out_of_range(errnumber: &str, fixed_type: &str) -> PgError {
+fn out_of_range(errnumber: &str, fixed_type: &str, line: i32, func: &'static str) -> PgError {
     PgError::error(format!(
         "\"{errnumber}\" is out of range for type {fixed_type}"
     ))
     .with_sqlstate(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE)
+    .with_location("float.c", line, func)
 }
 
 // endptr_consumed mirrors C's endptr_p: Some => report the stop offset (past
@@ -732,7 +737,7 @@ pub fn float8in_internal(
         return ereturn(
             escontext.as_deref_mut(),
             0.0,
-            invalid_input(type_name, orig_string),
+            invalid_input(type_name, orig_string, 414, "float8in_internal"),
         );
     }
 
@@ -753,7 +758,7 @@ pub fn float8in_internal(
                 return ereturn(
                     escontext.as_deref_mut(),
                     0.0,
-                    out_of_range(token, "double precision"),
+                    out_of_range(token, "double precision", 490, "float8in_internal"),
                 );
             }
             (parsed, tok.len)
@@ -764,7 +769,7 @@ pub fn float8in_internal(
                 return ereturn(
                     escontext.as_deref_mut(),
                     0.0,
-                    invalid_input(type_name, orig_string),
+                    invalid_input(type_name, orig_string, 497, "float8in_internal"),
                 )
             }
         },
@@ -781,7 +786,7 @@ pub fn float8in_internal(
         return ereturn(
             escontext.as_deref_mut(),
             0.0,
-            invalid_input(type_name, orig_string),
+            invalid_input(type_name, orig_string, 511, "float8in_internal"),
         );
     }
 
@@ -806,7 +811,7 @@ pub fn float4in_internal(
         return ereturn(
             escontext.as_deref_mut(),
             0.0,
-            invalid_input(type_name, orig_string),
+            invalid_input(type_name, orig_string, 208, "float4in_internal"),
         );
     }
 
@@ -824,7 +829,11 @@ pub fn float4in_internal(
                 NumKind::Hex => parse_hex_float32(token.as_bytes()),
             };
             if parsed.is_infinite() || (parsed == 0.0 && tok.nonzero) {
-                return ereturn(escontext.as_deref_mut(), 0.0, out_of_range(token, "real"));
+                return ereturn(
+                    escontext.as_deref_mut(),
+                    0.0,
+                    out_of_range(token, "real", 288, "float4in_internal"),
+                );
             }
             (parsed, tok.len)
         }
@@ -834,7 +843,7 @@ pub fn float4in_internal(
                 return ereturn(
                     escontext.as_deref_mut(),
                     0.0,
-                    invalid_input(type_name, orig_string),
+                    invalid_input(type_name, orig_string, 295, "float4in_internal"),
                 )
             }
         },
@@ -851,7 +860,7 @@ pub fn float4in_internal(
         return ereturn(
             escontext.as_deref_mut(),
             0.0,
-            invalid_input(type_name, orig_string),
+            invalid_input(type_name, orig_string, 309, "float4in_internal"),
         );
     }
 

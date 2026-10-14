@@ -11,6 +11,8 @@ fn alloc_size_gate_matches_palloc() {
         err.message(),
         alloc::format!("invalid memory alloc request size {}", MAX_ALLOC_SIZE + 1)
     );
+    // MemoryContextSizeFailure's elog (mcxt.c:1180).
+    assert_eq!(loc(&err), (Some("mcxt.c"), 1180, Some("MemoryContextSizeFailure")));
 
     let ctx = MemoryContext::new("t");
     let r: PgResult<PgVec<u64>> = vec_with_capacity_in(ctx.mcx(), (-1i32) as isize as usize);
@@ -18,6 +20,11 @@ fn alloc_size_gate_matches_palloc() {
         .unwrap_err()
         .message()
         .starts_with("invalid memory alloc request size"));
+}
+
+fn loc(e: &PgError) -> (Option<&str>, i32, Option<&str>) {
+    let l = e.location().expect("location");
+    (l.filename.as_deref(), l.lineno, l.funcname.as_deref())
 }
 
 #[test]
@@ -99,6 +106,8 @@ fn oom_error_shape_matches_mcxt_c() {
         e.detail.as_deref(),
         Some("Failed on request of size 64 in memory context \"ExprContext\".")
     );
+    // MemoryContextAllocationFailure's ereport (mcxt.c:1163-1167).
+    assert_eq!(loc(&e), (Some("mcxt.c"), 1167, Some("MemoryContextAllocationFailure")));
 }
 
 #[test]
@@ -1487,22 +1496,23 @@ fn allocator_rejects_over_ceiling_grow() {
     assert!(refused.is_err(), "resize above MaxAllocSize must unwind, not abort");
 }
 
-// Over-ceiling requests unwind with C's MemoryContextSizeFailure message so
-// the statement boundary recovers them as ERROR.
+// Over-ceiling requests unwind with C's MemoryContextSizeFailure error, a
+// PgError payload, so the statement boundary's pg_error_from_panic recovers
+// it as ERROR with its LOCATION. (Unit tests always link std, so the no_std
+// string payload never reaches this helper.)
 fn assert_ceiling_error<T: core::fmt::Debug>(
     r: Result<Result<T, ()>, std::boxed::Box<dyn core::any::Any + Send>>,
     size: Option<usize>,
 ) {
     let payload = r.expect_err("over-ceiling request must unwind, not return");
-    let msg = payload
-        .downcast_ref::<std::string::String>()
-        .cloned()
-        .or_else(|| payload.downcast_ref::<&str>().map(|s| std::string::String::from(*s)))
-        .unwrap_or_default();
+    let err = ::types_error::pg_error_from_panic(payload)
+        .unwrap_or_else(|_| panic!("over-ceiling unwind must carry a PgError payload"));
+    let msg = err.message();
     match size {
         Some(size) => assert_eq!(msg, alloc::format!("invalid memory alloc request size {size}")),
         None => assert!(msg.starts_with("invalid memory alloc request size "), "{msg}"),
     }
+    assert_eq!(loc(&err), (Some("mcxt.c"), 1180, Some("MemoryContextSizeFailure")));
 }
 
 #[test]

@@ -46,3 +46,23 @@ CREATE INDEX ON t USING ivfflat (v vector_l2_ops) WITH (nope = 1);
 CREATE INDEX t_h ON t USING hnsw (v vector_l2_ops) WITH (m = 8);
 ALTER INDEX t_h SET (m = 1);
 ALTER INDEX t_h SET (ef_construction = 'abc');
+-- float.c (float_overflow_error, float_underflow_error,
+-- float_zero_divide_error, float4in_internal, float8in_internal) and mcxt.c
+-- (MemoryContextSizeFailure), M4 follow-ups, Task 5.
+SELECT '1e38'::float4 * 10::float4;
+SELECT '1e-38'::float4 * '1e-10'::float4;
+SELECT 1e300::float8 * 1e300::float8;
+SELECT 1.0::float8 / 0.0::float8;
+SELECT 1.0::float4 / 0.0::float4;
+SELECT 1e39::numeric::float4;
+SELECT '1e40'::float4;
+SELECT '1e400'::float8;
+SELECT ''::float4;
+SELECT 'abc'::float4;
+SELECT '1.5x'::float4;
+SELECT ''::float8;
+SELECT 'abc'::float8;
+SELECT '1.5x'::float8;
+SELECT pg_input_is_valid('abc', 'float4'), (pg_input_error_info('abc', 'float4')).message;
+SELECT '[3e38]'::vector + '[3e38]';
+SELECT (repeat('x', 500000000) || repeat('y', 600000000));

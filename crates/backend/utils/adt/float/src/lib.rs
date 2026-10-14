@@ -69,7 +69,9 @@ pub fn get_float8_nan() -> f64 {
 #[cold]
 #[inline(never)]
 pub fn float_overflow_error() -> PgError {
-    PgError::error("value out of range: overflow").with_sqlstate(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE)
+    PgError::error("value out of range: overflow")
+        .with_sqlstate(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE)
+        .with_location("float.c", 90, "float_overflow_error")
 }
 
 #[cold]
@@ -77,12 +79,15 @@ pub fn float_overflow_error() -> PgError {
 pub fn float_underflow_error() -> PgError {
     PgError::error("value out of range: underflow")
         .with_sqlstate(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE)
+        .with_location("float.c", 98, "float_underflow_error")
 }
 
 #[cold]
 #[inline(never)]
 pub fn float_zero_divide_error() -> PgError {
-    PgError::error("division by zero").with_sqlstate(ERRCODE_DIVISION_BY_ZERO)
+    PgError::error("division by zero")
+        .with_sqlstate(ERRCODE_DIVISION_BY_ZERO)
+        .with_location("float.c", 106, "float_zero_divide_error")
 }
 
 #[inline]

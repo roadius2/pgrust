@@ -102,6 +102,58 @@ fn float8in_error_surface_matches_live_pg() {
     assert!(soft.error_occurred());
 }
 
+fn loc(e: &types_error::PgError) -> (Option<&str>, i32, Option<&str>) {
+    let l = e.location().expect("location");
+    (l.filename.as_deref(), l.lineno, l.funcname.as_deref())
+}
+
+// float.c:85-107, the three ereport helpers.
+#[test]
+fn float_error_helpers_carry_c_locations() {
+    assert_eq!(
+        loc(&float_overflow_error()),
+        (Some("float.c"), 90, Some("float_overflow_error"))
+    );
+    assert_eq!(
+        loc(&float_underflow_error()),
+        (Some("float.c"), 98, Some("float_underflow_error"))
+    );
+    assert_eq!(
+        loc(&float_zero_divide_error()),
+        (Some("float.c"), 106, Some("float_zero_divide_error"))
+    );
+}
+
+// float4in_internal (float.c:204-309) and float8in_internal (float.c:410-511):
+// C reports the internal function, whatever type_name the caller passed.
+#[test]
+fn float_input_errors_carry_c_locations() {
+    let f4 = |s: &str| float4in(s, None).unwrap_err();
+    let f8 = |s: &str| float8in(s, None).unwrap_err();
+    const F4: Option<&str> = Some("float4in_internal");
+    const F8: Option<&str> = Some("float8in_internal");
+    assert_eq!(loc(&f4("1e40")), (Some("float.c"), 288, F4));
+    assert_eq!(loc(&f8("1e400")), (Some("float.c"), 490, F8));
+    assert_eq!(loc(&f4("")), (Some("float.c"), 208, F4));
+    assert_eq!(loc(&f4("abc")), (Some("float.c"), 295, F4));
+    assert_eq!(loc(&f4("1.5x")), (Some("float.c"), 309, F4));
+    assert_eq!(loc(&f8("")), (Some("float.c"), 414, F8));
+    assert_eq!(loc(&f8("abc")), (Some("float.c"), 497, F8));
+    assert_eq!(loc(&f8("1.5x")), (Some("float.c"), 511, F8));
+}
+
+// Review Focus 2: a located input error stays soft under an escontext.
+#[test]
+fn float_soft_input_errors_stay_soft() {
+    let mut soft = SoftErrorContext::new(true);
+    assert_eq!(float4in("abc", Some(&mut soft)).unwrap(), 0.0);
+    assert!(soft.error_occurred());
+    let err = soft.error().expect("details_wanted saves the error");
+    assert_eq!(err.sqlstate(), ERRCODE_INVALID_TEXT_REPRESENTATION);
+    assert_eq!(err.message(), "invalid input syntax for type real: \"abc\"");
+    assert_eq!(loc(err), (Some("float.c"), 295, Some("float4in_internal")));
+}
+
 #[test]
 fn hex_floats_match_pg() {
     let cases: &[(&str, u64)] = &[

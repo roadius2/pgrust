@@ -672,10 +672,17 @@ mod tests {
             e.detail(),
             Some("Failed on request of size 4611686018427387904 in memory context \"Ivfflat kmeans temporary context\".")
         );
+        assert_eq!(loc(&e), (Some("mcxt.c"), 1167, Some("MemoryContextAllocationFailure")));
         let e = kmeans_alloc(m, 1usize << 28, 0.0f32, false).unwrap_err();
         assert_eq!(e.message(), "invalid memory alloc request size 1073741824");
+        assert_eq!(loc(&e), (Some("mcxt.c"), 1180, Some("MemoryContextSizeFailure")));
         let v = kmeans_alloc(m, 3, 7i32, false).unwrap();
         assert_eq!(&v[..], &[7, 7, 7]);
+    }
+
+    fn loc(e: &types_error::PgError) -> (Option<&str>, i32, Option<&str>) {
+        let l = e.location().expect("location");
+        (l.filename.as_deref(), l.lineno, l.funcname.as_deref())
     }
 
     // CheckCenters and CheckElements (ivfkmeans.c:490-547).
