@@ -16,7 +16,7 @@ Date: 2026-10-15 · pgrust commit: `436bd1b16f` (the server's code is the M4 fol
   - `harness_test.sh`: all passed (161 ok: the M4 follow-ups' 124 plus M5's 37; 372 s). Its own capture, a fourth fresh one, read 547,090 Generic records after the redo point (2,625 with full-page images) and 75,541 from the open transaction, and `test_ondisk_ref` passed 7/7 on it.
   - The plan runs unit tests and lints in Task 1 only, the only task that touches Rust. Task 1's run (`.superpowers/sdd/2026-10-14-pgvector-m5-ondisk/task-1-report.md`): `cargo test --profile fast-profile --locked -p main_main -p pgvector --lib -- repair_ lookup_cover shipped_scripts` gave 6 passed, `repair_prologue_qualifies_its_types` among them; `run-repair-check.sh` gave 6/6; `lint-determinism` PASS (0 violations, 41 warnings); `lint-seam-installs` PASS (0 violations, 22 allowlisted).
   - Both reference trees print nothing from `git status --porcelain --ignored`.
-- **Commits** (`5fcc2ba802..`, this report's last):
+- **Commits** (`5fcc2ba802..`, the final-review docs fix last):
 
   | Commit | Task | Change |
   |---|---|---|
@@ -28,9 +28,12 @@ Date: 2026-10-15 · pgrust commit: `436bd1b16f` (the server's code is the M4 fol
   | `913342598d` | 4, fix round | the capture and `crash_pages` fail closed |
   | `8dcb1297b5` | 5 | the reverse report |
   | `436bd1b16f` | 5, fix round | reverse failures become rows and never abort the run |
-  | this report's | 6 | `run-all.sh` gains the tier; the spec, CLAUDE.md and this report |
+  | `5db08324c7` | 6 | `run-all.sh` gains the tier; the spec, CLAUDE.md and this report |
+  | `5399fee239` | 6, fix round 1 | `run-all.sh` never reports stale on-disk rows (its gate logic); report and spec fixes |
+  | `86cc24b585` | 6, fix round 2 | this report: the reverse abort's exit-status exception |
+  | the final-review docs fix | final review | this report's commits and citations; spec and CLAUDE.md precision |
 
-- **How the run was produced.** `build-pgrust.sh` found `target/fast-profile/postgres` current: cargo finished in 1.78 s without rebuilding, and the binary is Task 2's build of `a74aad355b`, unchanged since. Then each command ran once, in this order:
+- **How the run was produced.** `build-pgrust.sh` found `target/fast-profile/postgres` current: cargo finished in 1.78 s without rebuilding, and the binary is Task 2's build of `a74aad355b`, unchanged since (its mtime, 23:57:37 on 2026-10-14, is the same before and after; `~/.cache/pgrust/m5-evidence/task6-run1/build-pgrust.txt`). Then the commands ran in this order, each once except the two `run-all.sh` modes, which step 5 reran:
   1. the stability loop (Task 6 Step 2): three `run-ondisk.sh capture --force`, each followed by `run-ondisk.sh ref clean crash v081` and `run-ondisk.sh pgrust clean crash v081`;
   2. `run-all.sh ref`, then `run-all.sh pgrust`. Their `ondisk` tier reused the loop's third capture (key `eaf2dac728f0242d`, a cache hit), so its facts are the final capture's below;
   3. `harness_test.sh`, which makes its own captures under `pgvector-work/selftest`;
@@ -268,10 +271,10 @@ If the reverse part aborts, an `aborted` row (`failed: exit <n> (see the run's o
   - `reverse.md` is written from whatever `reverse.tsv` holds, except when the abort came from a truly hung server: the parent's `server_stop` then dies again (Still open, Task 5). The script's exit status stays the forward rows' alone, with the same exception: that second `server_stop` (`run-ondisk.sh:450`) dies through `common.sh`'s `die` and exits 1 whatever the forward rows say, and since Task 6's fix round `run-all.sh` counts that exit as a gated `(run-ondisk.sh exited 1)` FAIL row (when no forward row already failed).
   - If the subject's relation list fails or comes back empty, `crash_pages` reads `failed: the subject's relation list (<path>)` and compares nothing; `crash_queries` still runs. This mirrors Task 4's capture-side guard.
   - A scratch run with an emptied relation list and an injected failure produced exactly those two rows, wrote `reverse.md`, exited 0, and left no container or server behind.
-- **Task 6's fix round: `run-all.sh` never reports stale on-disk rows.**
+- **Task 6's fix round (`5399fee239`): `run-all.sh` never reports stale on-disk rows.**
   - `run-ondisk.sh` captures and checks for `pagemask` before it clears its old results, and the brief's `run-all.sh` ignored its exit status. So a run that died early, for example on a changed capture key with Docker down, reprinted the previous run's rows and could pass.
   - `run-all.sh` now removes the tier's `summary.tsv` and `reverse.tsv` before the run, so an early death reads `(no results) FAIL`. It also keeps the exit status: a non-zero exit with no FAIL row among the rows written adds `| ondisk | (run-ondisk.sh exited N) | FAIL |`.
-  - A scratch run with stubbed tiers showed both. A stale 7-ok `summary.tsv` with a stub that wrote nothing gave 12/12 and exit 0 before the fix, and `(no results) FAIL` and exit 1 after. Two ok rows and then exit 1 gave the extra FAIL row and exit 1.
+  - A scratch run with stubbed tiers showed both (`~/.cache/pgrust/m5-evidence/fr1/stale-results-demo.txt`). A stale 7-ok `summary.tsv` with a stub that wrote nothing gave 12/12 and exit 0 before the fix, and `(no results) FAIL` and exit 1 after. Two ok rows and then exit 1 gave the extra FAIL row and exit 1.
 
 ## The fixture and the float question
 **Every fixture value keeps the distances that index scans return exact** (plan Decision 3, `sql/ondisk-rows.sql`); only IVFFlat's query-to-center distances round (below):
@@ -468,3 +471,12 @@ In both modes the subject's crash relation list has 42 lines with the same names
   - The headers of `run-ondisk.sh` and `sql/ondisk-rows.sql` still say every value makes index scans compute exact distances; IVFFlat's query-to-center distances round (The fixture and the float question). Both files feed the capture key, so the wording waits.
   - `run-ondisk.sh:487-491` removes `$out` only after `ensure_capture` and the `pagemask` check, so a direct run that dies there leaves the previous results in place. `run-all.sh` now guards against it (Review fixes beyond the plan's text).
   - `run-all.sh` silently omits the reverse section when `reverse.tsv` is missing, for example after `run-ondisk.sh` died before its reverse part.
+
+**From the final review** (follow-ups, not fixes):
+- **The capture never checks its own coverage.**
+  - `facts()` is asserted only by the self-test, on a separate capture.
+  - Nothing checks C's intended-error counts: 2 in the queries, 4 in the update. Only `test_ondisk_sql` checks them, on the local C build (`harness_test.sh:519-520`, `:540`). The final capture's C transcripts hold exactly those counts (`~/.cache/pgrust/m5-evidence/capture-compare/final/clean/expected-queries.out`, `…/v081/expected-update.out`).
+  - Nothing checks that every `generic` main fork differs between `crash/data` and `crash/replayed` after masking, which is what makes `crash_pages ok` non-vacuous.
+  - These are capture-key inputs. Do them in the next commit that changes the capture, together with Task 6's first two items above: the header wording, and `$out` cleared only after `ensure_capture`. The second has the highest priority, because the plan's stability loop reads `summary.tsv` without checking the exit status. Then rerun the stability loop once.
+- **Narrow the capture key to the capture's actual inputs,** for example by moving the capture into its own file, so that comment-only or reverse-only edits to `run-ondisk.sh` stop forcing a recapture.
+- **Generalise `run-all.sh`'s exit-status guard to every tier** (pre-existing). `run-bytecmp.sh:430` can die after earlier cases have written `ok` rows, and the review found the same die-after-rows paths in `run-iterscan.sh` and `run-diff.sh`. `run-all.sh:12-16`'s `|| true` then counts the partial rows.

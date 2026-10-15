@@ -116,7 +116,7 @@ There is an existing pgvector port (upstream 0.8.5 commit `159b79a`, brought to 
 
 Parallel index builds (M6) are **not ported**: both AMs build serially.
 
-**On-disk (M5):** a PG18 + pgvector data directory written by C in Docker (stopped cleanly, crashed mid-transaction, or made at 0.8.1 and then updated) boots in pgrust with C's answers and C's replayed pages (`run-ondisk.sh`, which needs Docker). C booting a pgrust-written directory is reported, not gated.
+**On-disk (M5):** a PG18 + pgvector data directory written by C in Docker (stopped cleanly, crashed mid-transaction, or made at 0.8.1 and then updated) boots in pgrust with C's answers and C's replayed pages (`run-ondisk.sh`, which needs Docker). (Tested on arm64 only; pgrust refuses `wal_compression = lz4|zstd` full-page images. See the Coverage limits in `docs/superpowers/reports/pgvector-m5-report.md`.) C booting a pgrust-written directory is reported, not gated.
 
 Direction and roadmap: `docs/Vector Search for pgrust Algorithm & Benchmark Survey.md`. Phase 1 spec: `docs/superpowers/specs/2026-10-04-pgvector-phase1-design.md`; plans in `docs/superpowers/plans/`.
 
