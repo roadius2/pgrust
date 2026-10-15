@@ -116,7 +116,7 @@ capture_key() {
 
 # C's answers on a copy of $1/data: the 0.8.7 image boots it, then the
 # transcripts of $2 (ondisk-queries.sql, or ondisk-update.sql for v081) and
-# of the follow-up.
+# of the follow-up, whose DML and maintenance must succeed on C.
 oracle() {
   local d="$1" q="$2" name
   name="${q#ondisk-}"
@@ -124,6 +124,9 @@ oracle() {
   dk_boot_dir "$PGV_DOCKER_IMAGE" "$d/data" || die "the 0.8.7 image did not boot $d/data"
   transcript "$q" "${DK_CONN[@]}" >"$d/expected-$name.out"
   transcript ondisk-followup.sql "${DK_CONN[@]}" >"$d/expected-followup.out"
+  if grep -q 'ERROR:' "$d/expected-followup.out"; then
+    die "C's follow-up failed; see $d/expected-followup.out"
+  fi
   dk_rm
 }
 
@@ -158,7 +161,9 @@ capture() {
   echo "autovacuum = off" >>"$k/data/postgresql.conf"
   # C's own replay of the crash, kept for crash_pages.
   dk_boot_dir "$PGV_DOCKER_IMAGE" "$k/data" || die "the 0.8.7 image did not replay $k/data"
-  dk_psql -q -f "$sql/ondisk-relfiles.sql" >"$k/relfiles.txt"
+  dk_psql -q -v ON_ERROR_STOP=1 -f "$sql/ondisk-relfiles.sql" >"$k/relfiles.txt" ||
+    die "ondisk-relfiles.sql failed on C's replay of $k/data"
+  [ -s "$k/relfiles.txt" ] || die "the relation list is empty: $k/relfiles.txt"
   dk_stop_fast || die "docker stop failed"
   dk_copy_out "$k/replayed" || die "docker cp failed"
   oracle "$k" ondisk-queries.sql
@@ -219,15 +224,20 @@ compare() {
 
 # Masked pages of every relation in $3 (name|rmgr|path, main and init forks):
 # the subject's replay under $1 against C's under $2. Prints each file that
-# differs or exists on one side only. (Every fixture relation is under 1 GB,
-# so there are no .1 segments.)
+# differs or exists on one side only. Every relation has a main fork, even at
+# zero blocks, so one missing from C's replay fails too; only an init fork
+# may be absent on both sides. (Every fixture relation is under 1 GB, so
+# there are no .1 segments.)
 compare_pages() {
   local a="$1" b="$2" name rm path fork off rc=0
   while IFS='|' read -r name rm path; do
     [ -n "$path" ] || continue
     for fork in "" _init; do
       if [ ! -e "$b/$path$fork" ]; then
-        if [ -e "$a/$path$fork" ]; then
+        if [ -z "$fork" ]; then
+          echo "$name: missing from C's replay"
+          rc=1
+        elif [ -e "$a/$path$fork" ]; then
           echo "$name$fork: only in the subject's replay"
           rc=1
         fi
