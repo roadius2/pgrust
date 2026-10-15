@@ -314,6 +314,9 @@ forward() {
 }
 
 # --- reverse: reported, never gated ---
+# A reverse failure, even one that would end the script, becomes an
+# "aborted" row; it never changes the exit status, which is the forward
+# checks' alone.
 
 rrow() {
   printf '%s\t%s\n' "$1" "$2" | tee -a "$out/reverse.tsv"
@@ -395,7 +398,9 @@ reverse_crash() {
     rrow crash_boot "failed: the subject did not replay its own crash ($d/subject.boot.log)"
     return
   fi
-  pgv_psql "$port" -f "$sql/ondisk-relfiles.sql" >"$d/relfiles.txt"
+  # A failed or empty relation list fails crash_pages (it would compare
+  # nothing); psql's errors go to relfiles.log beside it.
+  pgv_psql "$port" -f "$sql/ondisk-relfiles.sql" >"$d/relfiles.txt" 2>"$d/relfiles.log" || : >"$d/relfiles.txt"
   server_stop "$subject"
   cp -R "$d/subject" "$d/subject-replayed"
   if ! subject_start "$d/subject"; then
@@ -412,7 +417,9 @@ reverse_crash() {
   fi
   rrow crash_boot ok
   if dk_stop_fast && dk_copy_out "$d/c-replayed" && dk_start; then
-    if compare_pages "$d/subject-replayed" "$d/c-replayed" "$d/relfiles.txt" >"$d/pages.txt"; then
+    if [ ! -s "$d/relfiles.txt" ]; then
+      rrow crash_pages "failed: the subject's relation list ($d/relfiles.txt)"
+    elif compare_pages "$d/subject-replayed" "$d/c-replayed" "$d/relfiles.txt" >"$d/pages.txt"; then
       rrow crash_pages identical
     else
       rrow crash_pages "differs ($d/pages.txt)"
@@ -427,10 +434,22 @@ reverse_crash() {
 }
 
 reverse() {
+  local rc
   rm -rf "$out/reverse"
   : >"$out/reverse.tsv"
-  reverse_clean
-  reverse_crash
+  # Its own errexit scope: a die or failed command ends only the subshell,
+  # whose trap removes the container and the open transaction's psql (whose
+  # pid only the subshell knows). Not inside an if, || or &&, which would
+  # turn errexit off in it.
+  set +e
+  ( set -e; trap cleanup EXIT; reverse_clean; reverse_crash )
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    rrow aborted "failed: exit $rc (see the run's output)"
+    server_stop "$subject"
+    dk_rm
+  fi
   {
     printf '# On-disk, reverse (%s): reported, not gated\n\n' "$mode"
     printf 'The subject (%s) wrote the fixture into a fresh cluster; the pgvector 0.8.7 image booted it.\n\n' "$subject"
