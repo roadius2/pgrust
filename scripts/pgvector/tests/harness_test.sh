@@ -545,6 +545,85 @@ test_ondisk_sql() {
   "$here/../server.sh" stop ref >/dev/null 2>&1 || true
 }
 
+# A value from the self-test capture's facts.tsv.
+ondisk_fact() {
+  awk -F'\t' -v k="$1" '$1 == k { print $2 }' "$PGV_WORK/ondisk/capture/facts.tsv" 2>/dev/null
+}
+
+# The capture (capture --force, in the self-test work dir) exercises what M5
+# claims: clean and crashed directories; past the crash's redo point a WAL
+# full of GenericXLog deltas, Heap and Btree records, and the open
+# transaction's index records; 42 fixture relations and 25 scanned vector
+# indexes; a TOASTed column; the 0.8.1 -> 0.8.7 update. A second capture is
+# a cache hit.
+test_ondisk_capture() {
+  local log="$PGV_WORK/ondisk-capture.log" g f h b i
+  if ! "$here/../run-ondisk.sh" capture --force >"$log" 2>&1; then
+    fail "ondisk capture: exit 0 (see $log)"
+    return
+  fi
+  pass "ondisk capture: exit 0"
+  [ "$(ondisk_fact clean_state)/$(ondisk_fact v081_state)" = "shut down/shut down" ] &&
+    pass "ondisk capture: clean and v081 shut down" ||
+    fail "ondisk capture: clean '$(ondisk_fact clean_state)', v081 '$(ondisk_fact v081_state)'"
+  [ "$(ondisk_fact crash_state)" = "in production" ] &&
+    pass "ondisk capture: the crash copy needs recovery" ||
+    fail "ondisk capture: crash state '$(ondisk_fact crash_state)'"
+  g="$(ondisk_fact crash_generic_records)"
+  f="$(ondisk_fact crash_generic_fpi)"
+  [ "${g:-0}" -ge 100000 ] && [ "${f:-0}" -ge 1000 ] && [ $((${g:-0} - ${f:-0})) -ge 100000 ] &&
+    pass "ondisk capture: $g Generic records after the redo point, $f with full-page images" ||
+    fail "ondisk capture: $g Generic records, $f with full-page images (want >= 100000 and >= 1000)"
+  h="$(ondisk_fact crash_heap_records)"
+  b="$(ondisk_fact crash_btree_records)"
+  [ "${h:-0}" -ge 1000 ] && [ "${b:-0}" -ge 1000 ] &&
+    pass "ondisk capture: $h Heap and $b Btree records to replay" ||
+    fail "ondisk capture: $h Heap and $b Btree records (want >= 1000 each)"
+  i="$(ondisk_fact crash_inflight_generic)"
+  [ "${i:-0}" -ge 10000 ] &&
+    pass "ondisk capture: the open transaction wrote $i Generic records" ||
+    fail "ondisk capture: the open transaction wrote $i Generic records (want >= 10000)"
+  [ "$(ondisk_fact crash_relations)/$(ondisk_fact vector_indexes)" = 42/25 ] &&
+    pass "ondisk capture: 42 relations, 25 vector indexes scanned" ||
+    fail "ondisk capture: $(ondisk_fact crash_relations) relations, $(ondisk_fact vector_indexes) vector indexes (want 42, 25)"
+  [ "$(ondisk_fact wide_toasted)" = t ] && pass "ondisk capture: wide is TOASTed" || fail "ondisk capture: wide is not TOASTed"
+  [ "$(ondisk_fact v081_before) $(ondisk_fact v081_after)" = "0.8.1 0.8.7" ] &&
+    pass "ondisk capture: v081 goes from 0.8.1 to 0.8.7" ||
+    fail "ondisk capture: v081 '$(ondisk_fact v081_before)' -> '$(ondisk_fact v081_after)'"
+  if "$here/../run-ondisk.sh" capture >"$log.2" 2>&1 && ! grep -q '^capture: clean' "$log.2"; then
+    pass "ondisk capture: a second capture is a cache hit"
+  else
+    fail "ondisk capture: a second capture rebuilt or failed (see $log.2)"
+  fi
+}
+
+# Forward gate, C against C: the local clang build reproduces the gcc image's
+# answers, replayed pages and follow-up on all three directories.
+test_ondisk_ref() {
+  local n
+  if "$here/../run-ondisk.sh" ref clean crash v081 >"$PGV_WORK/ondisk-ref.log" 2>&1; then
+    pass "ondisk ref: exit 0"
+  else
+    fail "ondisk ref: exit 0 (see $PGV_WORK/ondisk-ref.log)"
+  fi
+  n="$(grep -c $'\tok$' "$PGV_WORK/ondisk/ref/summary.tsv" 2>/dev/null || true)"
+  if [ "$n" = 7 ]; then pass "ondisk ref: 7 ok"; else fail "ondisk ref: '$n' ok, want 7"; fi
+}
+
+# Negative control: deleting the rows nearest the first query right after
+# the subject boots must fail the queries row and the replayed pages.
+test_ondisk_detects_difference() {
+  local s="$PGV_WORK/ondisk/ref/summary.tsv"
+  if PGV_ONDISK_PERTURB_SQL="DELETE FROM vt WHERE v <-> '[3,1,4,1,5,9,2,6]' < 4" \
+    "$here/../run-ondisk.sh" ref clean crash >"$PGV_WORK/ondisk-neg.log" 2>&1; then
+    fail "ondisk flags a changed table"
+  elif grep -q $'^clean_queries\tFAIL' "$s" && grep -q $'^crash_pages\tFAIL' "$s"; then
+    pass "ondisk flags a changed table"
+  else
+    fail "ondisk flags a changed table: wrong failure (see $PGV_WORK/ondisk-neg.log)"
+  fi
+}
+
 # --- runner ---
 if [ "$#" -eq 0 ]; then
   # Declaration order (declare -F would sort): a test may read the results of
