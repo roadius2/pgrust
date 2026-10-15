@@ -14,6 +14,7 @@ port_for "$mode" >/dev/null
 "$here/run-bytecmp.sh" "$mode" || true
 "$here/run-iterscan.sh" "$mode" || true
 "$here/run-diff.sh" "$mode" || true
+"$here/run-ondisk.sh" "$mode" || true
 
 report="$PGV_WORK/report-$mode.md"
 total=0
@@ -21,7 +22,7 @@ passed=0
 {
   printf '# pgvector conformance: %s\n\n' "$mode"
   printf '| Tier | Test | Result |\n|---|---|---|\n'
-  for tier in regress tap bytecmp iterscan diff; do
+  for tier in regress tap bytecmp iterscan diff ondisk; do
     f="$PGV_WORK/$tier/$mode/summary.tsv"
     if [ ! -s "$f" ]; then
       printf '| %s | (no results) | FAIL |\n' "$tier"
@@ -35,6 +36,13 @@ passed=0
     done <"$f"
   done
   printf '\n**%d/%d passed**\n' "$passed" "$total"
+  # On-disk, reverse (spec §8.2): reported, never counted.
+  if [ -s "$PGV_WORK/ondisk/$mode/reverse.tsv" ]; then
+    printf '\n## Reported, not gated: on-disk reverse\n\n| Check | Result |\n|---|---|\n'
+    while IFS=$'\t' read -r name result; do
+      printf '| %s | %s |\n' "$name" "$result"
+    done <"$PGV_WORK/ondisk/$mode/reverse.tsv"
+  fi
 } >"$report"
 cat "$report"
 [ "$passed" -eq "$total" ]
