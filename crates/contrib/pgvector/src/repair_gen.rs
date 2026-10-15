@@ -177,16 +177,17 @@ const HEADER: &str = "\
 -- crates/contrib/pgvector/src/repair_gen.rs; do not edit by hand.
 DO $repair$
 DECLARE
-  v_ver text;
-  v_nsp text;
-  v_nsp_oid oid;
-  v_old_path text := pg_catalog.current_setting('search_path');
-  v_old_cmm text := pg_catalog.current_setting('client_min_messages');
+  v_ver pg_catalog.text;
+  v_nsp pg_catalog.text;
+  v_nsp_oid pg_catalog.oid;
+  v_old_path pg_catalog.text := pg_catalog.current_setting('search_path');
+  v_old_cmm pg_catalog.text := pg_catalog.current_setting('client_min_messages');
   n int := 0;
 BEGIN
-  -- The caller's search_path is in force until the search_path set_config
-  -- below, and again once the end restores it, so every function, relation
-  -- and operator used in those stretches is schema-qualified.
+  -- The caller's search_path is in force in the DECLARE block, until the
+  -- search_path set_config below, and again once the end restores it, so
+  -- every type, function, relation and operator used in those stretches is
+  -- schema-qualified.
   SELECT e.extversion, n2.nspname, n2.oid INTO v_ver, v_nsp, v_nsp_oid
     FROM pg_catalog.pg_extension e
     JOIN pg_catalog.pg_namespace n2 ON n2.oid OPERATOR(pg_catalog.=) e.extnamespace
@@ -249,4 +250,19 @@ fn repair_covers_every_upstream_object() {
         let indented: String = s.lines().map(|l| format!("    {l}\n")).collect();
         assert!(script.contains(&indented), "missing verbatim: {s}");
     }
+}
+
+// The DECLARE block runs under the caller's search_path, so every type it
+// names is schema-qualified; `int` is a keyword, not a catalog lookup.
+#[cfg(test)]
+#[test]
+fn repair_prologue_qualifies_its_types() {
+    let decl = HEADER.split("\nDECLARE\n").nth(1).unwrap().split("\nBEGIN\n").next().unwrap();
+    let mut n = 0;
+    for line in decl.lines() {
+        let ty = line.split_whitespace().nth(1).unwrap_or("").trim_end_matches(';');
+        assert!(ty == "int" || ty.starts_with("pg_catalog."), "unqualified type in `{}`", line.trim());
+        n += 1;
+    }
+    assert_eq!(n, 6, "the DECLARE block declares six variables");
 }
