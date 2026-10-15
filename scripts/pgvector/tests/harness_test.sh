@@ -494,6 +494,57 @@ test_docker_lib() {
   rm -rf "$w"
 }
 
+# The on-disk SQL on a fresh local C reference, without Docker: the fixture
+# loads; the queries scan all 25 vector indexes and fail only where they
+# mean to (the two wrong-dimension queries); the relation list has 41 rows;
+# the crash writes load; the follow-up runs without errors and its index
+# row counts are full; the update script reaches repair-verify.sql's ext row.
+test_ondisk_sql() {
+  local w="$PGV_WORK/ondisk-sql" sql="$here/../sql" port n
+  port="$(port_for ref)"
+  rm -rf "$w"
+  mkdir -p "$w"
+  if ! "$here/../server.sh" fresh ref >"$w/server.log" 2>&1; then
+    fail "ondisk sql: the ref server starts (see $w/server.log)"
+    return
+  fi
+  if (cd "$sql" && pgv_psql "$port" -f ondisk-fixture.sql) >"$w/fixture.log" 2>&1; then
+    pass "ondisk sql: the fixture loads"
+  else
+    fail "ondisk sql: the fixture loads (see $w/fixture.log)"
+  fi
+  (cd "$sql" && pgv_psql "$port" -a -v ON_ERROR_STOP=0 -f ondisk-queries.sql) >"$w/queries.out" 2>&1 || true
+  n="$(sed -n -E 's/^ *->  Index Scan using ([a-z0-9_]+) on (vt|ct|ut|wide)$/\1/p' "$w/queries.out" | sort -u | wc -l | tr -d ' ')"
+  if [ "$n" = 25 ]; then pass "ondisk sql: 25 vector indexes scanned"; else fail "ondisk sql: $n vector indexes scanned, want 25"; fi
+  n="$(grep -c 'ERROR:' "$w/queries.out" || true)"
+  if [ "$n" = 2 ] && [ "$(grep -c 'ERROR:  expected 8 dimensions, not 3' "$w/queries.out" || true)" = 2 ]; then
+    pass "ondisk sql: only the wrong-dimension queries fail"
+  else
+    fail "ondisk sql: $n errors in $w/queries.out, want the 2 wrong-dimension ones"
+  fi
+  n="$( (cd "$sql" && pgv_psql "$port" -f ondisk-relfiles.sql) | grep -c '|' || true)"
+  if [ "$n" = 41 ]; then pass "ondisk sql: 41 fixture relations"; else fail "ondisk sql: $n fixture relations, want 41"; fi
+  if pgv_psql "$port" -c CHECKPOINT >/dev/null && (cd "$sql" && pgv_psql "$port" -f ondisk-crash.sql) >"$w/crash.log" 2>&1; then
+    pass "ondisk sql: the crash writes load"
+  else
+    fail "ondisk sql: the crash writes load (see $w/crash.log)"
+  fi
+  (cd "$sql" && pgv_psql "$port" -a -v ON_ERROR_STOP=0 -f ondisk-followup.sql) >"$w/followup.out" 2>&1 || true
+  if ! grep -q 'ERROR:' "$w/followup.out" &&
+    [ "$(grep -cE '^ +10 \| +10 \| +10 \| +10 \| +10 \| +10 \| +10 \| +10 \| +5$' "$w/followup.out" || true)" = 2 ]; then
+    pass "ondisk sql: the follow-up runs, every index returns full rows"
+  else
+    fail "ondisk sql: the follow-up (see $w/followup.out)"
+  fi
+  (cd "$sql" && pgv_psql "$port" -a -v ON_ERROR_STOP=0 -f ondisk-update.sql) >"$w/update.out" 2>&1 || true
+  if [ "$(grep -c 'ERROR:' "$w/update.out" || true)" = 4 ] && grep -q '^ext|0.8.7|true$' "$w/update.out"; then
+    pass "ondisk sql: the update script runs"
+  else
+    fail "ondisk sql: the update script (see $w/update.out)"
+  fi
+  "$here/../server.sh" stop ref >/dev/null 2>&1 || true
+}
+
 # --- runner ---
 if [ "$#" -eq 0 ]; then
   # Declaration order (declare -F would sort): a test may read the results of
