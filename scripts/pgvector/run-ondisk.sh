@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# On-disk tier, forward (spec §8.2 "On-disk, forward").
+# On-disk tier (spec §8.2 "On-disk, forward" and "On-disk, reverse").
 #
 # Forward (gated). C pgvector writes three data directories in Docker:
 #   clean  the 0.8.7 image: the fixture, then a clean stop;
@@ -16,20 +16,23 @@
 # to the same pages as C's replay, compared after pagemask. Rows:
 #   clean_queries clean_followup crash_pages crash_queries crash_followup
 #   v081_update v081_followup
+# Reverse (reported, never gated): the subject writes the fixture into a
+# fresh cluster, once stopped cleanly and once crashed the same way, and the
+# 0.8.7 image boots it ($PGV_WORK/ondisk/<mode>/reverse.tsv and reverse.md).
 #
 # Every fixture value makes index scans compute exact distances
 # (sql/ondisk-rows.sql), so C's answers do not depend on its compiler's
 # vectorized, fused float sums (M2's no-emulation ruling stands).
 #
 # usage: run-ondisk.sh capture [--force]
-#        run-ondisk.sh {pgrust|ref} [clean|crash|v081 ...]
+#        run-ondisk.sh {pgrust|ref} [clean|crash|v081|reverse ...]
 #   capture: build the three directories and C's answers under
 #     $PGV_WORK/ondisk/capture. Cached by a key over sql/ondisk-*.sql,
 #     sql/repair-verify.sql, docker-lib.sh, this script and the image pins;
 #     --force rebuilds. {pgrust|ref} capture first when the key changed.
 #   pgrust: the subject is pgrust. ref: the subject is the local C reference
 #     ($PG_VEC; clang, macOS), which must always pass.
-#   With no parts, all three run. PGV_KEEP_DATA=1 keeps the subject's copies.
+#   With no parts, all four run. PGV_KEEP_DATA=1 keeps the subject's copies.
 #   PGV_ONDISK_PERTURB_SQL runs on the subject right after its first boot of
 #   each forward directory (harness self-test only).
 set -euo pipefail
@@ -43,7 +46,7 @@ DK_CONN=(-h 127.0.0.1 -p "$PGV_PORT_DOCKER")
 INFLIGHT_PID=
 
 usage() {
-  die "usage: run-ondisk.sh capture [--force] | run-ondisk.sh {pgrust|ref} [clean|crash|v081 ...]"
+  die "usage: run-ondisk.sh capture [--force] | run-ondisk.sh {pgrust|ref} [clean|crash|v081|reverse ...]"
 }
 
 cleanup() {
@@ -310,6 +313,134 @@ forward() {
   if [ "${PGV_KEEP_DATA:-}" != 1 ]; then rm -rf "$d/data"; fi
 }
 
+# --- reverse: reported, never gated ---
+
+rrow() {
+  printf '%s\t%s\n' "$1" "$2" | tee -a "$out/reverse.tsv"
+}
+
+# Row $1: "identical" when files $2 and $3 match, else the diff's path.
+rcompare() {
+  if diff -u "$2" "$3" >"$4"; then
+    rm -f "$4"
+    rrow "$1" identical
+  else
+    rrow "$1" "differs ($4)"
+  fi
+}
+
+# A fresh C-initdb cluster at $1; the rest are postgresql.conf lines.
+fresh_cluster() {
+  local data="$1"
+  shift
+  "$PG_TOOLS/bin/initdb" -D "$data" --no-locale --encoding UTF8 -U postgres -A trust >"$data.initdb.log" 2>&1 ||
+    die "initdb failed; see $data.initdb.log"
+  printf '%s\n' "$@" >>"$data/postgresql.conf"
+}
+
+reverse_clean() {
+  local d="$out/reverse/clean"
+  mkdir -p "$d"
+  fresh_cluster "$d/data" "autovacuum = off"
+  if ! subject_start "$d/data" || ! load ondisk-fixture.sql "${SUBJ_CONN[@]}" >"$d/fixture.log" 2>&1; then
+    server_stop "$subject"
+    rrow clean_boot "failed: the subject's fixture ($d)"
+    return
+  fi
+  transcript ondisk-queries.sql "${SUBJ_CONN[@]}" >"$d/subject-queries.out"
+  server_stop "$subject"
+  if ! dk_boot_dir "$PGV_DOCKER_IMAGE" "$d/data" >"$d/c-boot.log" 2>&1; then
+    rrow clean_boot "failed: C did not start ($d/c-boot.log)"
+    dk_rm
+    return
+  fi
+  rrow clean_boot ok
+  transcript ondisk-queries.sql "${DK_CONN[@]}" >"$d/c-queries.out"
+  rcompare clean_queries "$d/subject-queries.out" "$d/c-queries.out" "$d/queries.diff"
+  if dk_exec pg_amcheck --install-missing --heapallindexed -d postgres >"$d/amcheck.txt" 2>&1; then
+    rrow clean_amcheck clean
+  else
+    rrow clean_amcheck "corruption reported ($d/amcheck.txt)"
+  fi
+  rrow clean_pgrust_rows "$(dk_psql -At -c "SELECT coalesce(string_agg(proname, ' ' ORDER BY proname), 'none') FROM pg_proc WHERE proname LIKE 'pgrust%'")"
+  transcript ondisk-followup.sql "${DK_CONN[@]}" >"$d/c-followup.out"
+  rcompare clean_followup "$cap/clean/expected-followup.out" "$d/c-followup.out" "$d/followup.diff"
+  dk_rm
+  if [ "${PGV_KEEP_DATA:-}" != 1 ]; then rm -rf "$d/data"; fi
+}
+
+reverse_crash() {
+  local d="$out/reverse/crash"
+  mkdir -p "$d"
+  fresh_cluster "$d/data" "autovacuum = off" "checkpoint_timeout = 1d" "max_wal_size = 10GB"
+  if ! subject_start "$d/data" ||
+    ! load ondisk-fixture.sql "${SUBJ_CONN[@]}" >"$d/fixture.log" 2>&1 ||
+    ! pgv_psql "$port" -c CHECKPOINT >/dev/null 2>&1 ||
+    ! load ondisk-crash.sql "${SUBJ_CONN[@]}" >"$d/crash.log" 2>&1 ||
+    ! open_transaction "$d/inflight-xid" "${SUBJ_CONN[@]}" >/dev/null 2>&1; then
+    server_stop "$subject"
+    close_transaction
+    rrow crash_boot "failed: the subject's fixture ($d)"
+    return
+  fi
+  server_stop "$subject" QUIT
+  close_transaction
+  if [ "$(state "$d/data")" != "in production" ]; then
+    rrow crash_boot "failed: the subject's immediate stop left '$(state "$d/data")'"
+    return
+  fi
+  # The subject's own replay: pages after a clean stop, then the queries.
+  cp -R "$d/data" "$d/subject"
+  if ! subject_start "$d/subject"; then
+    rrow crash_boot "failed: the subject did not replay its own crash ($d/subject.boot.log)"
+    return
+  fi
+  pgv_psql "$port" -f "$sql/ondisk-relfiles.sql" >"$d/relfiles.txt"
+  server_stop "$subject"
+  cp -R "$d/subject" "$d/subject-replayed"
+  if ! subject_start "$d/subject"; then
+    rrow crash_boot "failed: the subject did not restart ($d/subject.boot.log)"
+    return
+  fi
+  transcript ondisk-queries.sql "${SUBJ_CONN[@]}" >"$d/subject-queries.out"
+  server_stop "$subject"
+  # C's replay of the same directory.
+  if ! dk_boot_dir "$PGV_DOCKER_IMAGE" "$d/data" >"$d/c-boot.log" 2>&1; then
+    rrow crash_boot "failed: C did not replay it ($d/c-boot.log)"
+    dk_rm
+    return
+  fi
+  rrow crash_boot ok
+  if dk_stop_fast && dk_copy_out "$d/c-replayed" && dk_start; then
+    if compare_pages "$d/subject-replayed" "$d/c-replayed" "$d/relfiles.txt" >"$d/pages.txt"; then
+      rrow crash_pages identical
+    else
+      rrow crash_pages "differs ($d/pages.txt)"
+    fi
+    transcript ondisk-queries.sql "${DK_CONN[@]}" >"$d/c-queries.out"
+    rcompare crash_queries "$d/subject-queries.out" "$d/c-queries.out" "$d/queries.diff"
+  else
+    rrow crash_pages "failed: C's stop, copy or restart"
+  fi
+  dk_rm
+  if [ "${PGV_KEEP_DATA:-}" != 1 ]; then rm -rf "$d/data" "$d/subject" "$d/subject-replayed" "$d/c-replayed"; fi
+}
+
+reverse() {
+  rm -rf "$out/reverse"
+  : >"$out/reverse.tsv"
+  reverse_clean
+  reverse_crash
+  {
+    printf '# On-disk, reverse (%s): reported, not gated\n\n' "$mode"
+    printf 'The subject (%s) wrote the fixture into a fresh cluster; the pgvector 0.8.7 image booted it.\n\n' "$subject"
+    printf '| Check | Result |\n|---|---|\n'
+    while IFS=$'\t' read -r name r; do
+      printf '| %s | %s |\n' "$name" "$r"
+    done <"$out/reverse.tsv"
+  } >"$out/reverse.md"
+}
+
 # --- main ---
 [ "$#" -ge 1 ] || usage
 mode="$1"
@@ -330,9 +461,9 @@ case "$mode" in
 esac
 port="$(port_for "$subject")"
 SUBJ_CONN=(-h "$PGV_WORK/sock" -p "$port")
-if [ "$#" -gt 0 ]; then parts=("$@"); else parts=(clean crash v081); fi
+if [ "$#" -gt 0 ]; then parts=("$@"); else parts=(clean crash v081 reverse); fi
 for p in "${parts[@]}"; do
-  case "$p" in clean | crash | v081) ;; *) usage ;; esac
+  case "$p" in clean | crash | v081 | reverse) ;; *) usage ;; esac
 done
 [ -x "$PAGEMASK_BIN" ] || die "missing $PAGEMASK_BIN; run scripts/pgvector/build-pgrust.sh"
 out="$PGV_WORK/ondisk/$mode"
@@ -343,9 +474,12 @@ mkdir -p "$out"
 : >"$out/summary.tsv"
 server_stop "$subject"
 for p in "${parts[@]}"; do
-  forward "$p"
+  case "$p" in
+    reverse) reverse ;;
+    *) forward "$p" ;;
+  esac
 done
 total=$(wc -l <"$out/summary.tsv" | tr -d ' ')
 passed=$(grep -c $'\tok$' "$out/summary.tsv" || true)
-echo "ondisk ($mode, subject $subject): $passed/$total checks passed; diffs in $out"
+echo "ondisk ($mode, subject $subject): $passed/$total forward checks passed; reverse: $out/reverse.md"
 [ "$passed" -eq "$total" ]

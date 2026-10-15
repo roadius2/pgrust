@@ -624,6 +624,36 @@ test_ondisk_detects_difference() {
   fi
 }
 
+# Reverse, C against C: the gcc image boots what the local clang build wrote,
+# stopped cleanly and crashed, with the same answers and replayed pages;
+# pg_amcheck is clean and there are no pgrust-only rows.
+test_ondisk_reverse_ref() {
+  local r="$PGV_WORK/ondisk/ref/reverse.tsv" want
+  if "$here/../run-ondisk.sh" ref reverse >"$PGV_WORK/ondisk-reverse.log" 2>&1; then
+    pass "ondisk reverse ref: exit 0"
+  else
+    fail "ondisk reverse ref: exit 0 (see $PGV_WORK/ondisk-reverse.log)"
+  fi
+  want="clean_boot ok
+clean_queries identical
+clean_amcheck clean
+clean_pgrust_rows none
+clean_followup identical
+crash_boot ok
+crash_pages identical
+crash_queries identical"
+  if [ "$(tr '\t' ' ' <"$r" 2>/dev/null)" = "$want" ]; then
+    pass "ondisk reverse ref: all eight checks identical"
+  else
+    fail "ondisk reverse ref: $r is not all identical"
+  fi
+  if [ -s "$PGV_WORK/ondisk/ref/reverse.md" ]; then
+    pass "ondisk reverse ref: reverse.md written"
+  else
+    fail "ondisk reverse ref: no reverse.md"
+  fi
+}
+
 # --- runner ---
 if [ "$#" -eq 0 ]; then
   # Declaration order (declare -F would sort): a test may read the results of
