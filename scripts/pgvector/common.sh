@@ -30,6 +30,9 @@ PGV_PORT_REF=55492
 PGV_PORT_DOCKER=55493
 PGV_PORT_SEEDED=55494
 PGV_DOCKER_IMAGE="pgvector/pgvector:0.8.7-pg18@sha256:2358fcba361ed2233a5ed81b5fe4ca779ccb304120ce531a3bf51c0ed7e2bc11"
+# The on-disk tier's 0.8.1 fixture (PostgreSQL 18.2): ALTER EXTENSION vector
+# UPDATE from the first version that supports PG18 (spec §3).
+PGV_DOCKER_IMAGE_081="pgvector/pgvector:0.8.1-pg18@sha256:508c5290cda481d4f5f846446a26e9c1b804766828a394a5861de1b348a18b4c"
 
 die() {
   echo "error: $*" >&2
@@ -152,8 +155,10 @@ server_start() {
   assert_identity "$mode" "$port"
 }
 
+# $2: the signal, INT (fast shutdown, the default) or QUIT (immediate
+# shutdown: no checkpoint, so the next start replays WAL).
 server_stop() {
-  local mode="$1" pidfile="$PGV_WORK/$1.pid" pid i
+  local mode="$1" sig="${2:-INT}" pidfile="$PGV_WORK/$1.pid" pid i
   [ -f "$pidfile" ] || return 0
   pid="$(cat "$pidfile")"
   # Signal only a postgres binary: after a crash or reboot the pid may be reused.
@@ -165,7 +170,7 @@ server_stop() {
       ;;
   esac
   if kill -0 "$pid" 2>/dev/null; then
-    kill -INT "$pid"
+    kill -"$sig" "$pid"
     for i in $(seq 1 60); do
       kill -0 "$pid" 2>/dev/null || break
       sleep 0.5

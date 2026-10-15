@@ -4,10 +4,12 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 # Self-tests run in their own work dir so they never replace real results or
-# stop real harness servers (only the Docker container name is shared).
+# stop real harness servers (only the Docker containers and port 55493 are
+# shared).
 PGV_REAL_WORK="${PGV_WORK:-$HOME/.cache/pgrust/pgvector-work}"
 export PGV_WORK="$PGV_REAL_WORK/selftest"
 . "$here/../common.sh"
+. "$here/../docker-lib.sh"
 # Tests write logs beside their work dirs ("$PGV_WORK/<name>.log").
 mkdir -p "$PGV_WORK"
 
@@ -409,6 +411,87 @@ test_diff_detects_difference() {
   else
     fail "diff flags a missing function: wrong failure (see $w.log)"
   fi
+}
+
+# Database cluster state of data directory $1, from pg_controldata.
+cluster_state() {
+  "$PG_TOOLS/bin/pg_controldata" "$1" 2>/dev/null | sed -n 's/^Database cluster state: *//p'
+}
+
+# server_stop's QUIT: an immediate stop leaves a cluster that needs recovery.
+test_server_stop_immediate() {
+  local st
+  if ! "$here/../server.sh" fresh ref >/dev/null 2>&1; then
+    fail "immediate stop: the ref server starts"
+    return
+  fi
+  server_stop ref QUIT
+  st="$(cluster_state "$PGV_WORK/data/ref")"
+  if [ "$st" = "in production" ]; then pass "immediate stop leaves 'in production'"; else fail "immediate stop left '$st'"; fi
+  if [ ! -f "$PGV_WORK/ref.pid" ]; then pass "immediate stop removes the pidfile"; else fail "immediate stop kept the pidfile"; fi
+}
+
+# docker-lib.sh: both images start; a clean and an immediate stop copy out a
+# shut-down and an in-production cluster; the 0.8.7 image boots a host copy
+# without writing it, keeps its own copy across a restart, and replays a
+# crashed copy; nothing is left behind.
+test_docker_lib() {
+  local w="$PGV_WORK/docker-lib" before after v ctl
+  before="$(docker volume ls -q -f dangling=true | wc -l | tr -d ' ')"
+  rm -rf "$w"
+  mkdir -p "$w"
+  if ! dk_start_new "$PGV_DOCKER_IMAGE_081" -c autovacuum=off >"$w.log" 2>&1; then
+    fail "docker-lib: the 0.8.1 image starts (see $w.log)"
+    dk_rm
+    return
+  fi
+  pass "docker-lib: the 0.8.1 image starts"
+  v="$(dk_psql -Atq -c "CREATE EXTENSION vector" -c "CREATE TABLE t AS SELECT '[1,2]'::vector AS v" \
+    -c "SELECT extversion FROM pg_extension WHERE extname = 'vector'" 2>&1 || true)"
+  if [ "$v" = 0.8.1 ]; then pass "docker-lib: vector 0.8.1"; else fail "docker-lib: extversion '$v'"; fi
+  if dk_stop_fast && dk_copy_out "$w/clean" >>"$w.log" 2>&1; then
+    pass "docker-lib: clean stop and copy out"
+  else
+    fail "docker-lib: clean stop and copy out (see $w.log)"
+  fi
+  v="$(cluster_state "$w/clean")"
+  if [ "$v" = "shut down" ]; then pass "docker-lib: the copy is shut down"; else fail "docker-lib: the copy is '$v'"; fi
+  ctl="$("$PG_TOOLS/bin/pg_controldata" "$w/clean")"
+  if ! dk_boot_dir "$PGV_DOCKER_IMAGE" "$w/clean" >>"$w.log" 2>&1; then
+    fail "docker-lib: the 0.8.7 image boots the copy (see $w.log)"
+    dk_rm
+    return
+  fi
+  pass "docker-lib: the 0.8.7 image boots the copy"
+  dk_psql -qc "INSERT INTO t VALUES ('[3,4]')" >/dev/null
+  if dk_stop_fast && dk_start >>"$w.log" 2>&1 && [ "$(dk_psql -Atc 'SELECT count(*) FROM t' 2>&1)" = 2 ]; then
+    pass "docker-lib: a restart keeps the container's copy"
+  else
+    fail "docker-lib: a restart keeps the container's copy (see $w.log)"
+  fi
+  dk_psql -qc "INSERT INTO t VALUES ('[5,6]')" >/dev/null
+  if dk_stop_immediate && dk_copy_out "$w/crash" >>"$w.log" 2>&1; then
+    pass "docker-lib: immediate stop and copy out"
+  else
+    fail "docker-lib: immediate stop and copy out (see $w.log)"
+  fi
+  v="$(cluster_state "$w/crash")"
+  if [ "$v" = "in production" ]; then pass "docker-lib: the crashed copy needs recovery"; else fail "docker-lib: the crashed copy is '$v'"; fi
+  if [ "$("$PG_TOOLS/bin/pg_controldata" "$w/clean")" = "$ctl" ]; then
+    pass "docker-lib: the host directory is untouched"
+  else
+    fail "docker-lib: the host directory changed"
+  fi
+  if dk_boot_dir "$PGV_DOCKER_IMAGE" "$w/crash" >>"$w.log" 2>&1 && [ "$(dk_psql -Atc 'SELECT count(*) FROM t' 2>&1)" = 3 ]; then
+    pass "docker-lib: the crashed copy replays"
+  else
+    fail "docker-lib: the crashed copy replays (see $w.log)"
+  fi
+  dk_rm
+  if [ -z "$(docker ps -aq -f "name=^${DK_NAME}\$")" ]; then pass "docker-lib: container removed"; else fail "docker-lib: $DK_NAME left behind"; fi
+  after="$(docker volume ls -q -f dangling=true | wc -l | tr -d ' ')"
+  if [ "$after" -le "$before" ]; then pass "docker-lib: no leaked volume"; else fail "docker-lib: leaked $((after - before)) anonymous volume(s)"; fi
+  rm -rf "$w"
 }
 
 # --- runner ---
