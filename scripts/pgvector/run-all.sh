@@ -14,7 +14,10 @@ port_for "$mode" >/dev/null
 "$here/run-bytecmp.sh" "$mode" || true
 "$here/run-iterscan.sh" "$mode" || true
 "$here/run-diff.sh" "$mode" || true
-"$here/run-ondisk.sh" "$mode" || true
+# run-ondisk.sh can die before it clears its old results, so drop them first and keep its status.
+rm -f "$PGV_WORK/ondisk/$mode/summary.tsv" "$PGV_WORK/ondisk/$mode/reverse.tsv"
+ondisk_rc=0
+"$here/run-ondisk.sh" "$mode" || ondisk_rc=$?
 
 report="$PGV_WORK/report-$mode.md"
 total=0
@@ -34,6 +37,11 @@ passed=0
       [ "$result" = ok ] && passed=$((passed + 1))
       printf '| %s | %s | %s |\n' "$tier" "$name" "$result"
     done <"$f"
+    # A run that died after writing only passing rows must still fail.
+    if [ "$tier" = ondisk ] && [ "$ondisk_rc" -ne 0 ] && ! grep -q $'\tFAIL' "$f"; then
+      printf '| %s | (run-ondisk.sh exited %d) | FAIL |\n' "$tier" "$ondisk_rc"
+      total=$((total + 1))
+    fi
   done
   printf '\n**%d/%d passed**\n' "$passed" "$total"
   # On-disk, reverse (spec §8.2): reported, never counted.

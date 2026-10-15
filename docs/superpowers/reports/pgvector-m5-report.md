@@ -7,7 +7,7 @@ Date: 2026-10-15 · pgrust commit: `436bd1b16f` (the server's code is the M4 fol
 - **pgrust:** 129/137 (regress 14/14, TAP 40/48, bytecmp 28/28, iterscan 19/19, diff 21/21, ondisk 7/7).
   - The M4 follow-ups were 122/130 (C 130/130). M5 adds the seven `ondisk` rows, and all seven pass on pgrust. No other tier's rows changed.
   - The 8 failures are the same parallel builds (M6) as before: TAP `003`, `012`, `020`, `024`, `028`, `032`, `035` and `045` (Remaining failures).
-- **The on-disk forward gate passes.** All seven rows are `ok` in both modes: `clean_queries`, `clean_followup`, `crash_pages`, `crash_queries`, `crash_followup`, `v081_update` and `v081_followup`. pgrust booted three PostgreSQL 18 + pgvector directories written by C in Docker: one stopped cleanly, one crashed with a transaction still open, and one made by pgvector 0.8.1 and then updated. It gave C's answers on each, approximate HNSW and IVFFlat results and their tie order included, and after the crash it replayed all 42 fixture relations to C's pages.
+- **The on-disk forward gate passes.** All seven rows are `ok` in both modes: `clean_queries`, `clean_followup`, `crash_pages`, `crash_queries`, `crash_followup`, `v081_update` and `v081_followup`. pgrust booted three PostgreSQL 18 + pgvector directories written by C in Docker: one stopped cleanly, one crashed with a transaction still open, and one made by pgvector 0.8.1 and then updated. It gave C's answers on each, approximate HNSW and IVFFlat results and their tie order included, and after the crash it replayed all 42 relations the gate compares (the fixture's 41 and `crash_marker`) to C's pages.
 - **Stability:** the forward gate passed 7/7 for `ref` and for `pgrust` on each of three fresh captures, each with new HNSW graphs and new k-means centers (six `7/7` lines; Stability).
 - **The reverse report** (C booting what the subject wrote; reported, not gated): every row is `ok`, `identical` or `clean` in both modes. `clean_pgrust_rows` is `none` for `ref` and lists three pgrust-only `pg_proc` rows for pgrust. C replayed pgrust's crash WAL to the same pages as pgrust's own replay, and `pg_amcheck` reported nothing.
 - **Spec §9's M5 exit criteria hold:** "Forward gate passes (clean, crash, 0.8.1 upgrade); reverse report produced." The forward rows are above. `reverse.md` is written in both modes, and `run-all.sh` now prints it under "Reported, not gated".
@@ -34,9 +34,14 @@ Date: 2026-10-15 · pgrust commit: `436bd1b16f` (the server's code is the M4 fol
   1. the stability loop (Task 6 Step 2): three `run-ondisk.sh capture --force`, each followed by `run-ondisk.sh ref clean crash v081` and `run-ondisk.sh pgrust clean crash v081`;
   2. `run-all.sh ref`, then `run-all.sh pgrust`. Their `ondisk` tier reused the loop's third capture (key `eaf2dac728f0242d`, a cache hit), so its facts are the final capture's below;
   3. `harness_test.sh`, which makes its own captures under `pgvector-work/selftest`;
-  4. the reference-tree check.
+  4. the reference-tree check;
+  5. after the task review, `run-all.sh ref` and then `run-all.sh pgrust` again, with the fix round's `run-all.sh` (Review fixes beyond the plan's text) and the same capture. Both reports are byte-identical to the first runs' (`cmp`).
 
-  Timings: `run-all.sh ref` 349 s and `run-all.sh pgrust` 485 s, each including the `ondisk` tier's reverse part; `harness_test.sh` 372 s. The table below is `run-all.sh pgrust`'s report.
+  Timings of the fix-round runs: `run-all.sh ref` 348 s and `run-all.sh pgrust` 488 s, each including the `ondisk` tier's reverse part. `harness_test.sh` took 372 s. The table below is `run-all.sh pgrust`'s report.
+- **Evidence** is copied under `~/.cache/pgrust/m5-evidence/`:
+  - `fr1/`: the fix-round gate runs, with each run's log, `report-{ref,pgrust}.md`, every tier's `summary.tsv`, `reverse.tsv` and `reverse.md`, pgrust's TAP prove logs and C's TAP `045` log;
+  - `task6-run1/`: the first gate runs (the same files), the stability loop's script, output, logs and facts, and the self-test log;
+  - `capture-compare/`: C's transcripts and the facts of the final capture and of the self-test run's capture (Stability).
 
 ## pgrust results
 | Tier | Test | Result |
@@ -182,7 +187,7 @@ Date: 2026-10-15 · pgrust commit: `436bd1b16f` (the server's code is the M4 fol
 **129/137 passed**
 
 ## Remaining failures
-Every remaining failure is a parallel build (M6): the same 8 tests and the same assertions as in M4 and the M4 follow-ups. I checked each against this run's TAP output (`tap/pgrust/prove/<test>.log`). The 8 tests fail 37 assertions. In every failure the captured stderr shows pgrust's `DEBUG:  building index "<index>" on table "tst" serially`, and every other assertion passes, including the recall checks after each "parallel" build.
+Every remaining failure is a parallel build (M6): the same 8 tests and the same assertions as in M4 and the M4 follow-ups. I checked each against both runs' TAP output (`tap/pgrust/prove/<test>.log`, copied to `~/.cache/pgrust/m5-evidence/{task6-run1,fr1}/pgrust/tap-prove/`). The 8 tests fail 37 assertions. In every failure the captured stderr shows pgrust's `DEBUG:  building index "<index>" on table "tst" serially`, and every other assertion passes, including the recall checks after each "parallel" build.
 
 | Test | Failed | Lines (one per opclass) |
 |---|---|---|
@@ -196,14 +201,14 @@ Every remaining failure is a parallel build (M6): the same 8 tests and the same 
 | `045_hnsw_low_memory_build` | 2 of 3 | 26, 27 |
 
 - 36 of the 37 failing lines are `like($stderr, qr/using \d+ parallel workers/)`.
-- `045`'s line 27 expects `hnsw graph no longer fits into maintenance_work_mem after 0 tuples`. C's log for this run (`tap/ref/log/045_hnsw_low_memory_build/regress_log_045_hnsw_low_memory_build`) shows `using 1 parallel workers` and then that NOTICE, so the message comes from C's parallel build.
+- `045`'s line 27 expects `hnsw graph no longer fits into maintenance_work_mem after 0 tuples`. C's log in both runs (`tap/ref/log/045_hnsw_low_memory_build/regress_log_045_hnsw_low_memory_build`, copied to `~/.cache/pgrust/m5-evidence/{task6-run1,fr1}/ref/`) shows `using 1 parallel workers` and then that NOTICE, so the message comes from C's parallel build.
 
 ## What M5 built
 **Files** (Tasks 1–6):
 - `scripts/pgvector/common.sh`: the 0.8.1 image pin (`PGV_DOCKER_IMAGE_081`), and `server_stop <mode> [INT|QUIT]`, whose QUIT is an immediate stop that leaves a cluster needing recovery.
 - `scripts/pgvector/docker-lib.sh` (new): Docker helpers for one container, `pgrust-pgvector-ondisk` on port 55493. `dk_start_new` runs an image's own initdb, `dk_boot_dir` boots a host directory through a read-only mount that the container copies on its first start (so the host copy is never written), and there are clean and immediate stops and a copy-out.
 - `scripts/pgvector/run-ondisk.sh` (new): the capture, the forward gate (seven rows) and the reverse report (eight rows).
-- `scripts/pgvector/sql/ondisk-rows.sql`: the row generator. Every value keeps index-scan distances exact (below).
+- `scripts/pgvector/sql/ondisk-rows.sql`: the row generator. Every value keeps the distances that index scans return exact; only IVFFlat's query-to-center distances round (below).
 - `scripts/pgvector/sql/ondisk-fixture.sql`: four tables (`vt`, `ct`, the unlogged `ut` and the TOASTed `wide`), 25 vector indexes, deletes and `VACUUM ANALYZE`.
 - `scripts/pgvector/sql/ondisk-crash.sql`: the crash's committed writes after its `CHECKPOINT`: inserts into every index, deletes, `VACUUM`, more inserts.
 - `scripts/pgvector/sql/ondisk-inflight.sql`: the transaction left open, whose rows (ids 4001–4200) reach every table and index before it sleeps.
@@ -212,12 +217,12 @@ Every remaining failure is a parallel build (M6): the same 8 tests and the same 
 - `scripts/pgvector/sql/ondisk-update.sql`: the queries on the 0.8.1 catalog with the 0.8.7 library, `ALTER EXTENSION vector UPDATE`, `repair-verify.sql`'s catalog dump (version, members and comments, function definitions, amop, amproc, opclasses), then the queries again.
 - `scripts/pgvector/sql/ondisk-relfiles.sql`: `name|rmgr|path` of every relation the fixture owns (its tables, their TOAST tables and the indexes of both), for the page comparison.
 - `scripts/pgvector/tests/harness_test.sh`: seven new self-tests with 37 checks: `test_server_stop_immediate` (2), `test_docker_lib` (12), `test_ondisk_sql` (7), `test_ondisk_capture` (10), `test_ondisk_ref` (2), `test_ondisk_detects_difference` (1) and `test_ondisk_reverse_ref` (3).
-- `scripts/pgvector/run-all.sh`: the `ondisk` tier, and a "Reported, not gated: on-disk reverse" section after the total, which the reverse rows never enter.
+- `scripts/pgvector/run-all.sh`: the `ondisk` tier, and a "Reported, not gated: on-disk reverse" section after the total, which the reverse rows never enter. Since Task 6's fix round it clears the tier's old results first and fails the tier when `run-ondisk.sh` exits non-zero without a FAIL row.
 - `crates/contrib/pgvector/src/repair_gen.rs` and `crates/contrib/pgvector/repair/pgrust-trimmed-0.8.5.sql`: Task 1 (Follow-ups closed).
 
 **The capture** (`run-ondisk.sh capture`): C pgvector writes three directories in Docker.
 - **clean:** the 0.8.7 image runs its own initdb (`--no-locale --encoding=UTF8`) with autovacuum off, loads the fixture, records the queries' transcript, and stops cleanly.
-- **crash:** the same, with `checkpoint_timeout = 1d` and `max_wal_size = 10GB`. After the fixture comes a `CHECKPOINT`, then `ondisk-crash.sql`. Then `ondisk-inflight.sql` starts in the background, and the capture waits until its transaction sleeps with its rows written and records its xid. One more transaction (`CREATE TABLE crash_marker`) commits, which flushes WAL past every record of the open one. Then `pg_ctl stop -m immediate`. The copy must read `in production`.
+- **crash:** the 0.8.7 image's own initdb with autovacuum off, plus `checkpoint_timeout = 1d` and `max_wal_size = 10GB`; no transcript is recorded before the stop. After the fixture comes a `CHECKPOINT`, then `ondisk-crash.sql`. Then `ondisk-inflight.sql` starts in the background, and the capture waits until its transaction sleeps with its rows written and records its xid. One more transaction (`CREATE TABLE crash_marker`) commits, which flushes WAL past every record of the open one. Then `pg_ctl stop -m immediate`. The copy must read `in production`.
 - **v081:** the 0.8.1 image (PostgreSQL 18.2) loads the fixture and stops cleanly.
 - The capture is cached under `$PGV_WORK/ondisk/capture`, keyed by a hash over the image pins, `sql/ondisk-*.sql`, `sql/repair-verify.sql`, `docker-lib.sh` and `run-ondisk.sh`; `--force` rebuilds it. A capture is 449 MB, and the forward rows need no Docker once it exists.
 
@@ -260,12 +265,16 @@ If the reverse part aborts, an `aborted` row (`failed: exit <n> (see the run's o
   - The capture dies if C's own follow-up transcript holds an `ERROR:` line. Spec §8.2's pass rule says "follow-up DML and maintenance succeed", and before, a C error that the subject mirrored passed the row.
 - **Task 5's fix round (`436bd1b16f`): reverse failures become rows.**
   - The reverse part runs in its own errexit scope (`set +e; ( set -e; trap cleanup EXIT; reverse_clean; reverse_crash ); rc=$?; set -e`). Any failure, a `die` included, ends only that subshell, whose trap removes the container and the open transaction's psql. The parent then appends `aborted` = `failed: exit <rc> (see the run's output)`, stops the subject and removes the container.
-  - `reverse.md` is always written, from whatever `reverse.tsv` holds. The script's exit status stays the forward rows' alone.
+  - `reverse.md` is written from whatever `reverse.tsv` holds, except when the abort came from a truly hung server: the parent's `server_stop` then dies again (Still open, Task 5). The script's exit status stays the forward rows' alone.
   - If the subject's relation list fails or comes back empty, `crash_pages` reads `failed: the subject's relation list (<path>)` and compares nothing; `crash_queries` still runs. This mirrors Task 4's capture-side guard.
   - A scratch run with an emptied relation list and an injected failure produced exactly those two rows, wrote `reverse.md`, exited 0, and left no container or server behind.
+- **Task 6's fix round: `run-all.sh` never reports stale on-disk rows.**
+  - `run-ondisk.sh` captures and checks for `pagemask` before it clears its old results, and the brief's `run-all.sh` ignored its exit status. So a run that died early, for example on a changed capture key with Docker down, reprinted the previous run's rows and could pass.
+  - `run-all.sh` now removes the tier's `summary.tsv` and `reverse.tsv` before the run, so an early death reads `(no results) FAIL`. It also keeps the exit status: a non-zero exit with no FAIL row among the rows written adds `| ondisk | (run-ondisk.sh exited N) | FAIL |`.
+  - A scratch run with stubbed tiers showed both. A stale 7-ok `summary.tsv` with a stub that wrote nothing gave 12/12 and exit 0 before the fix, and `(no results) FAIL` and exit 1 after. Two ok rows and then exit 1 gave the extra FAIL row and exit 1.
 
 ## The fixture and the float question
-**Every fixture value makes index scans compute exact distances** (plan Decision 3, `sql/ondisk-rows.sql`):
+**Every fixture value keeps the distances that index scans return exact** (plan Decision 3, `sql/ondisk-rows.sql`); only IVFFlat's query-to-center distances round (below):
 - `v`, `h`, `s` (vector, halfvec, sparsevec): small integers, so L2, inner-product and L1 sums stay below 2²⁴ and every partial sum is an exactly representable integer.
 - `vc`, `hc`, `sc`, `gc`, `ghc` (the cosine columns): 16 entries of ±1, so every norm is 4 and every normalized entry is ±0.25.
 - `b`, `cb` (bit): Hamming and Jaccard are counts.
@@ -280,7 +289,7 @@ So the order and fusing of C's vectorized sums cannot change a result, and M2's 
 **IVFFlat center distances are the one rounded comparison.**
 - Centers are k-means means, and the spherical k-means of the inner-product and cosine opclasses also normalizes them, so a query's distance to a center rounds. The subject computes that distance itself from C's stored centers, so a near-tie between two centers could send it to a different list than C. The row distances, the ones that are returned and ordered, stay exact. `ct_cb_ham`'s centers are bits, so its center distances are exact too.
 - **L2 (`ct_g_l2`, `ct_gh_l2`):** the clusters are far apart (multiples of 50 per dimension) and every point lies within −1..2 of its cluster's base, so the probes are not near-ties (the plan's argument; Task 3's review found the L2 centers well separated).
-- **Inner product (`ct_g_ip`, `ct_gh_ip`): the argument does not hold** (Task 3 review). These indexes cluster by angle (spherical k-means: support procs 3, `vector_spherical_distance`, and 4, `vector_norm`), and the `i % 10 = 0` cluster sits at the origin, where direction is arbitrary. So their probe choices (`ondisk-queries.sql:85`, `:91` and `:101`) have no designed margin.
+- **Inner product (`ct_g_ip`, `ct_gh_ip`, `ut_u_ip`): the argument does not hold** (Task 3 review). These indexes cluster by angle (spherical k-means: support procs 3, `vector_spherical_distance`, and 4, `vector_norm`). `ct`'s `i % 10 = 0` cluster sits at the origin, where direction is arbitrary, and `ut`'s small-integer points (`lists = 4`) were never designed as clusters. So their probe choices (`ondisk-queries.sql:85`, `:91`, `:97` and `:101`) have no designed margin.
 - **The evidence for the inner-product probes, and for the cosine ones, is the measurement:** three fresh captures, each with new k-means centers, passed 7/7 on pgrust and on `ref`, at `probes = 1` and at `probes = 3`.
 
 ## What the capture exercised
@@ -330,8 +339,8 @@ run 3 ref: 7/7
 run 3 pgrust: 7/7
 ```
 
-- Each iteration took 3 minutes 19 s to 3 minutes 25 s: the capture 94–100 s, then `ref` and `pgrust` together 105 s. The whole loop took 10 minutes 4 seconds (01:19:17 to 01:29:21). Logs are in `~/.cache/pgrust/m5-stability-{1,2,3}.log`.
-- **The captures differ, so the gate does not rest on one graph.** The final capture against the self-test capture that Task 5 left (`pgvector-work/selftest/ondisk/capture`, the same key; compared before this task's self-test run replaced it) differs in 145 lines of C's clean query transcript, 150 of the crash transcript and 286 of the v081 update transcript. The differences are tie order among equal distances, different rows at the same distance (for example L1 at the default `hnsw.ef_search`), and different rows at different distances (the IVFFlat inner-product queries, whose lists depend on the centers, and HNSW at `hnsw.ef_search = 10`). The three follow-up transcripts are identical, as their comparison rule expects. pgrust reproduced each capture's own answers exactly.
+- Each iteration took 3 minutes 19 s to 3 minutes 25 s: the capture 94–100 s, then `ref` and `pgrust` together 105 s. The whole loop took 10 minutes 4 seconds (01:19:17 to 01:29:21). Logs are in `~/.cache/pgrust/m5-stability-{1,2,3}.log`, and the loop's script, output, logs and facts are copied to `~/.cache/pgrust/m5-evidence/task6-run1/stability/`.
+- **The captures differ, so the gate does not rest on one graph.** I compared C's transcripts in the final capture (copied to `~/.cache/pgrust/m5-evidence/capture-compare/final/`) with those in the capture that this task's self-test run made (copied to `…/capture-compare/selftest/`; same key, `eaf2dac728f0242d`). `diff final selftest | grep -c '^<'` counts 146 changed lines in the clean query transcript, 134 in the crash transcript and 226 in the v081 update transcript. The differences are tie order among equal distances, different rows at the same distance (for example L1 at the default `hnsw.ef_search`), and different rows at different distances (the IVFFlat inner-product queries, whose lists depend on the centers, and HNSW at `hnsw.ef_search = 10`). The three follow-up transcripts are identical, as their comparison rule expects. pgrust reproduced each capture's own answers exactly.
 
 ## Reverse
 **`pgrust`** (`report-pgrust.md`, "Reported, not gated"; `ondisk/pgrust/reverse.md` has the same rows):
@@ -429,7 +438,7 @@ In both modes the subject's crash relation list has 42 lines with the same names
   - `docker-lib.sh:57-62` and `:77-86`: a failed `docker run` can leave a Created container; callers run `dk_rm`, but the function could do it itself.
   - `test_docker_lib`'s `dk_stop_fast` stderr is not redirected to the test log.
   - `test_docker_lib`'s "host directory untouched" compares `pg_controldata` only; checking that the host's `pg_hba.conf` lacks the trust line would test copy-not-mount directly.
-  - `harness_test.sh:5-7`: the isolation comment says only Docker and port 55493 are shared, but `port_for`'s fixed ports (55491, 55492, 55494) are shared too. Plan-mandated text.
+  - `harness_test.sh:6-8`: the isolation comment says only Docker and port 55493 are shared, but `port_for`'s fixed ports (55491, 55492, 55494) are shared too. Plan-mandated text.
 - Task 3 (4):
   - The inner-product IVFFlat indexes cluster by angle, so the well-separated argument holds for L2 only (The fixture and the float question). Plan-mandated premise; the stability run measured it.
   - `harness_test.sh:535`: "every index returns full rows" overstates: the follow-up counts 9 of 25 indexes, and `ut_u_ip` is never scanned after the follow-up's inserts (Coverage limits). Plan-mandated wording.
@@ -455,3 +464,7 @@ In both modes the subject's crash relation list has 42 lines with the same names
   - No negative self-test for reverse (`PGV_ONDISK_PERTURB_SQL` is forward-only).
   - `run-ondisk.sh:450`: after an abort, the parent's bare `server_stop "$subject"` dies again if the abort was a truly hung server (server_stop's 30 s limit), exiting 1 without `reverse.md`; `( server_stop "$subject" ) || true` would harden it. The ruling prescribed the bare call.
   - An aborted reverse keeps about 976 MB of data copies under `$out/reverse/crash` until the next run.
+- Task 6 (3):
+  - The headers of `run-ondisk.sh` and `sql/ondisk-rows.sql` still say every value makes index scans compute exact distances; IVFFlat's query-to-center distances round (The fixture and the float question). Both files feed the capture key, so the wording waits.
+  - `run-ondisk.sh:487-491` removes `$out` only after `ensure_capture` and the `pagemask` check, so a direct run that dies there leaves the previous results in place. `run-all.sh` now guards against it (Review fixes beyond the plan's text).
+  - `run-all.sh` silently omits the reverse section when `reverse.tsv` is missing, for example after `run-ondisk.sh` died before its reverse part.
