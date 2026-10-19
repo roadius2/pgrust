@@ -14,7 +14,7 @@ Date: 2026-10-15 · pgrust commit: `436bd1b16f` (the server's code is the M4 fol
 - **One parked M4 follow-up is closed:** the repair prologue's `DECLARE` types are qualified (Task 1; Follow-ups closed).
 - **Gate also green:**
   - `harness_test.sh`: all passed (161 ok: the M4 follow-ups' 124 plus M5's 37; 372 s). Its own capture, a fourth fresh one, read 547,090 Generic records after the redo point (2,625 with full-page images) and 75,541 from the open transaction, and `test_ondisk_ref` passed 7/7 on it.
-  - The plan runs unit tests and lints in Task 1 only, the only task that touches Rust. Task 1's run (`.superpowers/sdd/2026-10-14-pgvector-m5-ondisk/task-1-report.md`): `cargo test --profile fast-profile --locked -p main_main -p pgvector --lib -- repair_ lookup_cover shipped_scripts` gave 6 passed, `repair_prologue_qualifies_its_types` among them; `run-repair-check.sh` gave 6/6; `lint-determinism` PASS (0 violations, 41 warnings); `lint-seam-installs` PASS (0 violations, 22 allowlisted).
+  - The plan runs unit tests and lints in Task 1 only, the only task that touches Rust. Task 1's run (`~/.cache/pgrust/m5-evidence/sdd-reports/task-1-report.md`; the in-repo copy was deleted at cleanup): `cargo test --profile fast-profile --locked -p main_main -p pgvector --lib -- repair_ lookup_cover shipped_scripts` gave 6 passed, `repair_prologue_qualifies_its_types` among them; `run-repair-check.sh` gave 6/6; `lint-determinism` PASS (0 violations, 41 warnings); `lint-seam-installs` PASS (0 violations, 22 allowlisted).
   - Both reference trees print nothing from `git status --porcelain --ignored`.
 - **Commits** (`5fcc2ba802..`, the final-review docs fix last):
 
@@ -42,8 +42,8 @@ Date: 2026-10-15 · pgrust commit: `436bd1b16f` (the server's code is the M4 fol
 
   Timings of the fix-round runs: `run-all.sh ref` 348 s and `run-all.sh pgrust` 488 s, each including the `ondisk` tier's reverse part. `harness_test.sh` took 372 s. The table below is `run-all.sh pgrust`'s report.
 - **Evidence** is copied under `~/.cache/pgrust/m5-evidence/`:
-  - `fr1/`: the fix-round gate runs, with each run's log, `report-{ref,pgrust}.md`, every tier's `summary.tsv`, `reverse.tsv` and `reverse.md`, pgrust's TAP prove logs and C's TAP `045` log;
-  - `task6-run1/`: the first gate runs (the same files), the stability loop's script, output, logs and facts, and the self-test log;
+  - `fr1/`: the fix-round gate runs, with each run's log, `report-{ref,pgrust}.md`, every tier's `summary.tsv`, `reverse.tsv` and `reverse.md`, pgrust's TAP prove logs and C's TAP `045` log, and `stale-results-demo.txt` (Review fixes beyond the plan's text);
+  - `task6-run1/`: the first gate runs (the same files), the stability loop's script, output, logs and facts, the self-test log, and `build-pgrust.txt` (How the run was produced);
   - `capture-compare/`: C's transcripts and the facts of the final capture and of the self-test run's capture (Stability).
 
 ## pgrust results
@@ -479,4 +479,4 @@ In both modes the subject's crash relation list has 42 lines with the same names
   - Nothing checks that every `generic` main fork differs between `crash/data` and `crash/replayed` after masking, which is what makes `crash_pages ok` non-vacuous.
   - These are capture-key inputs. Do them in the next commit that changes the capture, together with Task 6's first two items above: the header wording, and `$out` cleared only after `ensure_capture`. The second has the highest priority, because the plan's stability loop reads `summary.tsv` without checking the exit status. Then rerun the stability loop once.
 - **Narrow the capture key to the capture's actual inputs,** for example by moving the capture into its own file, so that comment-only or reverse-only edits to `run-ondisk.sh` stop forcing a recapture.
-- **Generalise `run-all.sh`'s exit-status guard to every tier** (pre-existing). `run-bytecmp.sh:430` can die after earlier cases have written `ok` rows, and the review found the same die-after-rows paths in `run-iterscan.sh` and `run-diff.sh`. `run-all.sh:12-16`'s `|| true` then counts the partial rows.
+- **Generalise `run-all.sh`'s exit-status guard to every tier** (pre-existing). `run-bytecmp.sh:430` can die after earlier cases have written `ok` rows, and `run-all.sh:12-16`'s `|| true` then counts the partial rows. (`run-iterscan.sh` and `run-diff.sh` have no such path: every `die` in them comes before they truncate `summary.tsv`. `run-bytecmp.sh:416` and `run-diff.sh:28` can instead die before they remove `$out`, leaving the previous results.)
