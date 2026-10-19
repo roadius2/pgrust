@@ -1,7 +1,10 @@
 -- Rows :lo..:hi of every on-disk fixture table (run-ondisk.sh). Included by
 -- ondisk-fixture.sql, ondisk-crash.sql, ondisk-inflight.sql and
--- ondisk-followup.sql with \set lo / \set hi. Every value makes index scans
--- compute exact distances, whatever the summation order or FMA:
+-- ondisk-followup.sql with \set lo / \set hi. Every value keeps the
+-- distances that index scans return exact, whatever the summation order or
+-- FMA (only IVFFlat's distances from a query to its k-means centers round;
+-- docs/superpowers/reports/pgvector-m5-report.md, "The fixture and the
+-- float question"):
 --   v, h, s: small integers (L2, inner product and L1 sums stay below 2^24);
 --   vc, hc, sc, gc, ghc: 16 entries of +-1, so every norm is 4 and every
 --     normalized entry is +-0.25 (cosine opclasses);

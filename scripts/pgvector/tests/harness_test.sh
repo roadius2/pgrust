@@ -677,6 +677,17 @@ test_stale_results() {
   rm -rf "$w"
   stale_results_check bytecmp PAGEMASK_BIN
   stale_results_check diff DIFFRUNNER_BIN
+  stale_results_check ondisk PAGEMASK_BIN
+  # An argument error comes before the clear: a typo touches nothing.
+  mkdir -p "$w/ondisk/ref"
+  printf 'old\tok\n' >"$w/ondisk/ref/summary.tsv"
+  if PGV_WORK="$w" "$here/../run-ondisk.sh" ref nosuchpart >"$w/usage.log" 2>&1; then
+    fail "stale results: run-ondisk.sh accepts a bad part"
+  elif [ -s "$w/ondisk/ref/summary.tsv" ]; then
+    pass "stale results: a usage error leaves the old results alone"
+  else
+    fail "stale results: a usage error removed the old results"
+  fi
   rm -rf "$w"
 }
 
@@ -845,6 +856,103 @@ test_docker_lib_failures() {
     fail "docker-lib: dk_stop_immediate without a container (exit $rc)"
   else
     pass "docker-lib: dk_stop_immediate fails fast without a container"
+  fi
+  rm -rf "$w"
+}
+
+# capture_key of the scripts under $1 (scripts/pgvector or a copy).
+ondisk_key() {
+  (
+    # shellcheck source=/dev/null
+    . "$1/common.sh"
+    # shellcheck source=/dev/null
+    . "$1/docker-lib.sh"
+    # shellcheck source=/dev/null
+    . "$1/ondisk-capture.sh"
+    capture_key
+  )
+}
+
+# ensure_capture 0 of the scripts under $1 on the capture at $2, with capture
+# itself replaced: prints "rebuilt" or "reused".
+ondisk_ensure() {
+  (
+    # shellcheck source=/dev/null
+    . "$1/common.sh"
+    # shellcheck source=/dev/null
+    . "$1/docker-lib.sh"
+    # shellcheck source=/dev/null
+    . "$1/ondisk-capture.sh"
+    # shellcheck disable=SC2034 # ensure_capture reads it
+    cap="$2"
+    # shellcheck disable=SC2329 # ensure_capture calls it
+    capture() { echo rebuilt; }
+    r="$(ensure_capture 0)"
+    echo "${r:-reused}"
+  )
+}
+
+# The capture key covers the capture's inputs and nothing else: a comment in
+# ondisk-capture.sh, docker-lib.sh or an on-disk SQL file changes it, and so
+# does another psql version; a comment in run-ondisk.sh does not.
+test_ondisk_capture_key() {
+  local w="$PGV_WORK/ondisk-key" src k f c
+  src="$(cd "$here/.." && pwd)"
+  rm -rf "$w"
+  mkdir -p "$w"
+  cp -R "$src" "$w/pgvector"
+  k="$(ondisk_key "$src" 2>"$w.log" || true)"
+  if [ -n "$k" ] && [ "$(ondisk_key "$w/pgvector" 2>>"$w.log" || true)" = "$k" ]; then
+    pass "ondisk key: a copy of the scripts has the same key"
+  else
+    fail "ondisk key: no key, or a copy's differs (see $w.log)"
+    return
+  fi
+  echo '# a comment' >>"$w/pgvector/run-ondisk.sh"
+  if [ "$(ondisk_key "$w/pgvector")" = "$k" ]; then
+    pass "ondisk key: a comment in run-ondisk.sh keeps the key"
+  else
+    fail "ondisk key: a comment in run-ondisk.sh changes the key"
+  fi
+  for f in ondisk-capture.sh docker-lib.sh sql/ondisk-rows.sql sql/repair-verify.sql; do
+    case "$f" in *.sql) c='-- a comment' ;; *) c='# a comment' ;; esac
+    echo "$c" >>"$w/pgvector/$f"
+    if [ "$(ondisk_key "$w/pgvector")" != "$k" ]; then
+      pass "ondisk key: a comment in $f changes the key"
+    else
+      fail "ondisk key: a comment in $f keeps the key"
+    fi
+    cp "$src/$f" "$w/pgvector/$f"
+  done
+  # Both sides' transcripts come from $PG_TOOLS's psql, so another psql
+  # version must not reuse a capture.
+  mkdir -p "$w/pgref/pg/bin"
+  printf '#!/bin/sh\necho "psql (PostgreSQL) 18.7"\n' >"$w/pgref/pg/bin/psql"
+  chmod +x "$w/pgref/pg/bin/psql"
+  if [ "$(PGREF="$w/pgref" ondisk_key "$w/pgvector")" != "$k" ]; then
+    pass "ondisk key: another psql version changes the key"
+  else
+    fail "ondisk key: another psql version keeps the key"
+  fi
+  # ensure_capture rebuilds when the key file is missing (an interrupted or
+  # failed capture writes none) or stale, and reuses a matching one.
+  mkdir -p "$w/capture"
+  if [ "$(ondisk_ensure "$w/pgvector" "$w/capture")" = rebuilt ]; then
+    pass "ondisk key: a capture without a key is rebuilt"
+  else
+    fail "ondisk key: a capture without a key is reused"
+  fi
+  echo 0000000000000000 >"$w/capture/key"
+  if [ "$(ondisk_ensure "$w/pgvector" "$w/capture")" = rebuilt ]; then
+    pass "ondisk key: a capture with a stale key is rebuilt"
+  else
+    fail "ondisk key: a capture with a stale key is reused"
+  fi
+  echo "$k" >"$w/capture/key"
+  if [ "$(ondisk_ensure "$w/pgvector" "$w/capture")" = reused ]; then
+    pass "ondisk key: a capture with the current key is reused"
+  else
+    fail "ondisk key: a capture with the current key is rebuilt"
   fi
   rm -rf "$w"
 }
