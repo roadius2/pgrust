@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Run every pgvector conformance tier built so far and print a pass/fail report.
 # usage: run-all.sh {pgrust|ref}
+# Each tier's old summary.tsv is removed before it runs, so a tier that dies
+# before writing one reports "(no results)". A tier that exits non-zero
+# after writing only ok rows (it died partway) gets a FAIL row of its own.
+# PGV_TIER_DIR (harness self-test only) runs the run-<tier>.sh scripts from
+# another directory.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 . "$here/common.sh"
@@ -9,15 +14,15 @@ here="$(cd "$(dirname "$0")" && pwd)"
 mode="$1"
 port_for "$mode" >/dev/null
 
-"$here/run-regress.sh" "$mode" || true
-"$here/run-tap.sh" "$mode" || true
-"$here/run-bytecmp.sh" "$mode" || true
-"$here/run-iterscan.sh" "$mode" || true
-"$here/run-diff.sh" "$mode" || true
-# run-ondisk.sh can die before it clears its old results, so drop them first and keep its status.
-rm -f "$PGV_WORK/ondisk/$mode/summary.tsv" "$PGV_WORK/ondisk/$mode/reverse.tsv"
-ondisk_rc=0
-"$here/run-ondisk.sh" "$mode" || ondisk_rc=$?
+tiers=(regress tap bytecmp iterscan diff ondisk)
+rcs=()
+for tier in "${tiers[@]}"; do
+  rm -f "$PGV_WORK/$tier/$mode/summary.tsv"
+  if [ "$tier" = ondisk ]; then rm -f "$PGV_WORK/ondisk/$mode/reverse.tsv"; fi
+  rc=0
+  "${PGV_TIER_DIR:-$here}/run-$tier.sh" "$mode" || rc=$?
+  rcs+=("$rc")
+done
 
 report="$PGV_WORK/report-$mode.md"
 total=0
@@ -25,31 +30,40 @@ passed=0
 {
   printf '# pgvector conformance: %s\n\n' "$mode"
   printf '| Tier | Test | Result |\n|---|---|---|\n'
-  for tier in regress tap bytecmp iterscan diff ondisk; do
+  i=0
+  for tier in "${tiers[@]}"; do
+    rc="${rcs[$i]}"
+    i=$((i + 1))
     f="$PGV_WORK/$tier/$mode/summary.tsv"
-    if [ ! -s "$f" ]; then
-      printf '| %s | (no results) | FAIL |\n' "$tier"
-      total=$((total + 1))
-      continue
+    rows=0
+    ok=0
+    if [ -s "$f" ]; then
+      while IFS=$'\t' read -r name result; do
+        rows=$((rows + 1))
+        [ "$result" = ok ] && ok=$((ok + 1))
+        printf '| %s | %s | %s |\n' "$tier" "$name" "$result"
+      done <"$f"
     fi
-    while IFS=$'\t' read -r name result; do
+    total=$((total + rows))
+    passed=$((passed + ok))
+    if [ "$rows" -eq 0 ]; then
+      printf '| %s | (no results; run-%s.sh exited %d) | FAIL |\n' "$tier" "$tier" "$rc"
       total=$((total + 1))
-      [ "$result" = ok ] && passed=$((passed + 1))
-      printf '| %s | %s | %s |\n' "$tier" "$name" "$result"
-    done <"$f"
-    # A run that died after writing only passing rows must still fail.
-    if [ "$tier" = ondisk ] && [ "$ondisk_rc" -ne 0 ] && ! grep -q $'\tFAIL' "$f"; then
-      printf '| %s | (run-ondisk.sh exited %d) | FAIL |\n' "$tier" "$ondisk_rc"
+    elif [ "$rc" -ne 0 ] && [ "$ok" -eq "$rows" ]; then
+      printf '| %s | (run-%s.sh exited %d) | FAIL |\n' "$tier" "$tier" "$rc"
       total=$((total + 1))
     fi
   done
   printf '\n**%d/%d passed**\n' "$passed" "$total"
   # On-disk, reverse (spec §8.2): reported, never counted.
+  printf '\n## Reported, not gated: on-disk reverse\n\n'
   if [ -s "$PGV_WORK/ondisk/$mode/reverse.tsv" ]; then
-    printf '\n## Reported, not gated: on-disk reverse\n\n| Check | Result |\n|---|---|\n'
+    printf '| Check | Result |\n|---|---|\n'
     while IFS=$'\t' read -r name result; do
       printf '| %s | %s |\n' "$name" "$result"
     done <"$PGV_WORK/ondisk/$mode/reverse.tsv"
+  else
+    printf '(no results: run-ondisk.sh wrote no reverse.tsv; see its output)\n'
   fi
 } >"$report"
 cat "$report"

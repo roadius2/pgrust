@@ -25,9 +25,9 @@ case "$mode" in
   ref) subject=seeded ;;
   *) die "unknown mode '$mode' (expected pgrust or ref)" ;;
 esac
-[ -x "$DIFFRUNNER_BIN" ] || die "missing $DIFFRUNNER_BIN; run scripts/pgvector/build-pgrust.sh"
 out="$PGV_WORK/diff/$mode"
 rm -rf "$out"
+[ -x "$DIFFRUNNER_BIN" ] || die "missing $DIFFRUNNER_BIN; run scripts/pgvector/build-pgrust.sh"
 mkdir -p "$out"
 
 PGV_LISTEN=127.0.0.1

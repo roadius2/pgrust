@@ -413,9 +413,9 @@ else
 fi
 for c in "${cases[@]}"; do case_sql "$c" >/dev/null; done
 
-[ -x "$PAGEMASK_BIN" ] || die "missing $PAGEMASK_BIN; run scripts/pgvector/build-pgrust.sh"
 out="$PGV_WORK/bytecmp/$mode"
 rm -rf "$out"
+[ -x "$PAGEMASK_BIN" ] || die "missing $PAGEMASK_BIN; run scripts/pgvector/build-pgrust.sh"
 mkdir -p "$out/diff"
 trap 'server_stop seeded; server_stop "$subject"' EXIT
 

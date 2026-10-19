@@ -654,6 +654,108 @@ crash_queries identical"
   fi
 }
 
+# Every tier clears its old results before anything that can fail after
+# its argument checks. With its binary missing, a direct run must exit
+# non-zero and leave no summary.tsv behind: a stale all-ok file reads as a
+# pass to anything that reads it without the exit status. $1 tier; $2 the
+# binary's variable, pointed at nothing.
+stale_results_check() {
+  local w="$PGV_WORK/stale"
+  mkdir -p "$w/$1/ref"
+  printf 'old\tok\n' >"$w/$1/ref/summary.tsv"
+  if env PGV_WORK="$w" "$2=/nonexistent" "$here/../run-$1.sh" ref >"$w/$1.log" 2>&1; then
+    fail "stale results: run-$1.sh exits 0 without $2"
+  elif [ -e "$w/$1/ref/summary.tsv" ]; then
+    fail "stale results: run-$1.sh left its old summary.tsv (see $w/$1.log)"
+  else
+    pass "stale results: run-$1.sh clears its old results before it dies"
+  fi
+}
+
+test_stale_results() {
+  local w="$PGV_WORK/stale"
+  rm -rf "$w"
+  stale_results_check bytecmp PAGEMASK_BIN
+  stale_results_check diff DIFFRUNNER_BIN
+  rm -rf "$w"
+}
+
+# A stub tier for test_run_all_exit_status: $1/run-$2.sh writes the rows $4
+# (space-separated name:result pairs; "" writes no summary.tsv) and exits $3.
+stub_tier() {
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -eu'
+    if [ -n "$4" ]; then
+      echo "mkdir -p \"\$PGV_WORK/$2/\$1\""
+      printf '%s\n' "for r in $4; do printf '%s\\t%s\\n' \"\${r%%:*}\" \"\${r#*:}\"; done >\"\$PGV_WORK/$2/\$1/summary.tsv\""
+    fi
+    echo "exit $3"
+  } >"$1/run-$2.sh"
+  chmod +x "$1/run-$2.sh"
+}
+
+# run-all.sh counts every tier's exit status: a tier that died after writing
+# only ok rows fails, a tier that wrote nothing reports "(no results)" even
+# over an old summary.tsv or with exit 0, a tier with a FAIL row gets no
+# extra row, and a missing reverse.tsv is reported. Stub tiers
+# (PGV_TIER_DIR): no server runs.
+test_run_all_exit_status() {
+  local w="$PGV_WORK/run-all" r t
+  r="$w/report-ref.md"
+  # Without the knob, run-all.sh would run the real tiers.
+  if ! grep -q PGV_TIER_DIR "$here/../run-all.sh"; then
+    fail "run-all: no PGV_TIER_DIR knob"
+    return
+  fi
+  rm -rf "$w"
+  mkdir -p "$w/bin" "$w/bytecmp/ref"
+  stub_tier "$w/bin" regress 1 "a:ok b:ok"
+  stub_tier "$w/bin" tap 1 "t:FAIL"
+  stub_tier "$w/bin" bytecmp 1 ""
+  printf 'old\tok\n' >"$w/bytecmp/ref/summary.tsv"
+  stub_tier "$w/bin" iterscan 0 ""
+  stub_tier "$w/bin" diff 0 "d:ok"
+  stub_tier "$w/bin" ondisk 0 "o:ok"
+  if PGV_WORK="$w" PGV_TIER_DIR="$w/bin" "$here/../run-all.sh" ref >"$w.log" 2>&1; then
+    fail "run-all: exits 0 with failing tiers"
+  else
+    pass "run-all: exits non-zero with failing tiers"
+  fi
+  if grep -qxF '| regress | (run-regress.sh exited 1) | FAIL |' "$r"; then
+    pass "run-all: a tier that died after ok rows fails"
+  else
+    fail "run-all: no exit-status row for regress (see $r)"
+  fi
+  if grep -qxF '| bytecmp | (no results; run-bytecmp.sh exited 1) | FAIL |' "$r" && ! grep -qF '| bytecmp | old |' "$r"; then
+    pass "run-all: a tier with no results fails, its old rows dropped"
+  else
+    fail "run-all: bytecmp's rows (see $r)"
+  fi
+  if ! grep -qF '| tap | (run-tap.sh' "$r"; then
+    pass "run-all: a tier with a FAIL row gets no extra row"
+  else
+    fail "run-all: an extra row for tap (see $r)"
+  fi
+  if grep -qxF '| iterscan | (no results; run-iterscan.sh exited 0) | FAIL |' "$r"; then
+    pass "run-all: a tier that exits 0 with no rows fails"
+  else
+    fail "run-all: iterscan's empty run (see $r)"
+  fi
+  if grep -qxF '**4/8 passed**' "$r"; then pass "run-all: 4/8 passed"; else fail "run-all: the totals (see $r)"; fi
+  if grep -qF '(no results: run-ondisk.sh wrote no reverse.tsv' "$r"; then
+    pass "run-all: a missing reverse.tsv is reported"
+  else
+    fail "run-all: the reverse section (see $r)"
+  fi
+  for t in regress tap bytecmp iterscan diff ondisk; do stub_tier "$w/bin" "$t" 0 "x:ok"; done
+  if PGV_WORK="$w" PGV_TIER_DIR="$w/bin" "$here/../run-all.sh" ref >"$w.log.2" 2>&1 && grep -qxF '**6/6 passed**' "$r"; then
+    pass "run-all: all-ok tiers pass"
+  else
+    fail "run-all: all-ok tiers (see $w.log.2)"
+  fi
+}
+
 # --- runner ---
 if [ "$#" -eq 0 ]; then
   # Declaration order (declare -F would sort): a test may read the results of
