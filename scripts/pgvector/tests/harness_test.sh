@@ -756,6 +756,99 @@ test_run_all_exit_status() {
   fi
 }
 
+# Run "$@" in the background and kill it after $1 seconds; exit 124 then.
+within() {
+  local secs="$1" pid rc=0
+  shift
+  "$@" &
+  pid=$!
+  for _ in $(seq 1 $((secs * 2))); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.5
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return 124
+  fi
+  wait "$pid" || rc=$?
+  return "$rc"
+}
+
+# docker-lib.sh fails instead of hanging or leaking: a docker run that fails
+# (its port held) leaves no Created container behind, from dk_start_new and
+# dk_boot_dir alike; dk_stop_immediate refuses at once when DK_DATA is empty
+# (it used to wait forever on the running container) and fails fast when
+# there is no container.
+test_docker_lib_failures() {
+  local w="$PGV_WORK/docker-lib-failures" holder rc
+  rm -rf "$w"
+  mkdir -p "$w/fake"
+  : >"$w.log"
+  echo 18 >"$w/fake/PG_VERSION"
+  # Hold the port, so docker run creates the container and then fails to
+  # start it. ReuseAddr: an earlier test's connections through the port may
+  # still be in TIME_WAIT, which blocks a plain bind (not Docker's, which the
+  # held port still refuses). The holder touches $w/held once it listens.
+  perl -MIO::Socket::INET -e '
+    my $s = IO::Socket::INET->new(LocalAddr => "127.0.0.1", LocalPort => $ARGV[0], Listen => 1, ReuseAddr => 1)
+      or die "bind: $!\n";
+    open(my $f, ">", $ARGV[1]) or die "$ARGV[1]: $!\n";
+    close $f;
+    sleep 120' "$PGV_PORT_DOCKER" "$w/held" 2>>"$w.log" &
+  holder=$!
+  for _ in $(seq 1 30); do
+    [ ! -e "$w/held" ] || break
+    sleep 0.5
+  done
+  if [ ! -e "$w/held" ]; then
+    fail "docker-lib: could not hold port $PGV_PORT_DOCKER (see $w.log)"
+    kill "$holder" 2>/dev/null || true
+    return
+  fi
+  if dk_start_new "$PGV_DOCKER_IMAGE" >>"$w.log" 2>&1; then
+    fail "docker-lib: dk_start_new succeeds on a held port"
+  elif [ -z "$(docker ps -aq -f "name=^${DK_NAME}\$")" ]; then
+    pass "docker-lib: a failed dk_start_new leaves no container"
+  else
+    fail "docker-lib: a failed dk_start_new left $DK_NAME behind"
+  fi
+  if dk_boot_dir "$PGV_DOCKER_IMAGE" "$w/fake" >>"$w.log" 2>&1; then
+    fail "docker-lib: dk_boot_dir succeeds on a held port"
+  elif [ -z "$(docker ps -aq -f "name=^${DK_NAME}\$")" ]; then
+    pass "docker-lib: a failed dk_boot_dir leaves no container"
+  else
+    fail "docker-lib: a failed dk_boot_dir left $DK_NAME behind"
+  fi
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  dk_rm
+  if dk_start_new "$PGV_DOCKER_IMAGE" >>"$w.log" 2>&1; then
+    rc=0
+    DK_DATA='' within 10 dk_stop_immediate >>"$w.log" 2>&1 || rc=$?
+    if [ "$rc" = 124 ]; then
+      fail "docker-lib: dk_stop_immediate hangs with DK_DATA empty"
+    elif [ "$rc" = 0 ]; then
+      fail "docker-lib: dk_stop_immediate returns 0 with DK_DATA empty"
+    elif [ "$(docker inspect -f '{{.State.Running}}' "$DK_NAME" 2>/dev/null)" = true ]; then
+      pass "docker-lib: dk_stop_immediate refuses at once with DK_DATA empty"
+    else
+      fail "docker-lib: dk_stop_immediate with DK_DATA empty stopped the container"
+    fi
+  else
+    fail "docker-lib: the 0.8.7 image starts (see $w.log)"
+  fi
+  dk_rm
+  rc=0
+  DK_NAME=pgrust-pgvector-ondisk-absent within 10 dk_stop_immediate >>"$w.log" 2>&1 || rc=$?
+  if [ "$rc" = 124 ] || [ "$rc" = 0 ]; then
+    fail "docker-lib: dk_stop_immediate without a container (exit $rc)"
+  else
+    pass "docker-lib: dk_stop_immediate fails fast without a container"
+  fi
+  rm -rf "$w"
+}
+
 # --- runner ---
 if [ "$#" -eq 0 ]; then
   # Declaration order (declare -F would sort): a test may read the results of

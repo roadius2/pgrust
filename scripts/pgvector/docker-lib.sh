@@ -35,8 +35,7 @@ dk_psql() {
 }
 
 dk_wait_ready() {
-  local i
-  for i in $(seq 1 240); do
+  for _ in $(seq 1 240); do
     if "$PG_TOOLS/bin/pg_isready" -q -h 127.0.0.1 -p "$PGV_PORT_DOCKER" &&
       dk_psql -Atc 'SELECT 1' >/dev/null 2>&1; then
       return 0
@@ -58,6 +57,7 @@ dk_start_new() {
     -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_INITDB_ARGS="--no-locale --encoding=UTF8" \
     "$image" postgres "$@" >/dev/null; then
     echo "docker run $image failed (is port $PGV_PORT_DOCKER free? scripts/pgvector/docker-ref.sh down)" >&2
+    dk_rm
     return 1
   fi
   DK_DATA=/var/lib/postgresql/18/docker
@@ -82,6 +82,7 @@ dk_boot_dir() {
       fi
       exec gosu postgres postgres -D /pgdata -c listen_addresses="*" "$@"' bash "$@" >/dev/null; then
     echo "docker run $image on $dir failed (is port $PGV_PORT_DOCKER free? scripts/pgvector/docker-ref.sh down)" >&2
+    dk_rm
     return 1
   fi
   DK_DATA=/pgdata
@@ -102,10 +103,25 @@ dk_stop_fast() {
 # replays WAL from the last checkpoint. The postmaster is the container's
 # PID 1, so the container ends the moment it exits and takes this exec with
 # it: pg_ctl's own exit status means nothing, and the caller checks the
-# copied directory's state instead.
+# copied directory's state instead. Fails, rather than waits forever, when
+# no container was started, there is none, or it is still running 60 s on.
 dk_stop_immediate() {
+  local running
+  if [ -z "$DK_DATA" ]; then
+    echo "dk_stop_immediate: no container was started (DK_DATA is empty)" >&2
+    return 1
+  fi
   docker exec -u postgres "$DK_NAME" pg_ctl stop -m immediate -D "$DK_DATA" >/dev/null 2>&1 || true
-  docker wait "$DK_NAME" >/dev/null
+  for _ in $(seq 1 120); do
+    if ! running="$(docker inspect -f '{{.State.Running}}' "$DK_NAME" 2>/dev/null)"; then
+      echo "dk_stop_immediate: no container $DK_NAME" >&2
+      return 1
+    fi
+    [ "$running" = true ] || return 0
+    sleep 0.5
+  done
+  echo "dk_stop_immediate: $DK_NAME still running 60 s after pg_ctl stop -m immediate" >&2
+  return 1
 }
 
 # Copy the stopped container's data directory to $1 (replacing it).
