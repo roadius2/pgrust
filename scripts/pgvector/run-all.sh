@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Run every pgvector conformance tier built so far and print a pass/fail report.
 # usage: run-all.sh {pgrust|ref}
-# Each tier's old summary.tsv is removed before it runs, so a tier that dies
-# before writing one reports "(no results)". A tier that exits non-zero
+# The old report, every tier's old summary.tsv and ondisk's old reverse.tsv
+# are removed before the first tier runs, so a run killed partway (Ctrl-C, a
+# timeout) leaves no previous verdict behind, and a tier that dies before
+# writing a summary.tsv reports "(no results)". A tier that exits non-zero
 # after writing only ok rows (it died partway) gets a FAIL row of its own.
 # PGV_TIER_DIR (harness self-test only) runs the run-<tier>.sh scripts from
 # another directory.
@@ -15,10 +17,12 @@ mode="$1"
 port_for "$mode" >/dev/null
 
 tiers=(regress tap bytecmp iterscan diff ondisk)
-rcs=()
+rm -f "$PGV_WORK/report-$mode.md" "$PGV_WORK/ondisk/$mode/reverse.tsv"
 for tier in "${tiers[@]}"; do
   rm -f "$PGV_WORK/$tier/$mode/summary.tsv"
-  if [ "$tier" = ondisk ]; then rm -f "$PGV_WORK/ondisk/$mode/reverse.tsv"; fi
+done
+rcs=()
+for tier in "${tiers[@]}"; do
   rc=0
   "${PGV_TIER_DIR:-$here}/run-$tier.sh" "$mode" || rc=$?
   rcs+=("$rc")

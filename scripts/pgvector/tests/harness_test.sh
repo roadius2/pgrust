@@ -655,9 +655,9 @@ crash_queries identical"
 }
 
 # Every tier clears its old results before anything that can fail after
-# its argument checks. With its binary missing, a direct run must exit
-# non-zero and leave no summary.tsv behind: a stale all-ok file reads as a
-# pass to anything that reads it without the exit status. $1 tier; $2 the
+# its argument checks. With its binary missing, a direct run must die at its
+# binary check and leave no summary.tsv behind: a stale all-ok file reads as
+# a pass to anything that reads it without the exit status. $1 tier; $2 the
 # binary's variable, pointed at nothing.
 stale_results_check() {
   local w="$PGV_WORK/stale"
@@ -667,6 +667,8 @@ stale_results_check() {
     fail "stale results: run-$1.sh exits 0 without $2"
   elif [ -e "$w/$1/ref/summary.tsv" ]; then
     fail "stale results: run-$1.sh left its old summary.tsv (see $w/$1.log)"
+  elif ! grep -qF 'missing /nonexistent' "$w/$1.log"; then
+    fail "stale results: run-$1.sh died, but not at its $2 check (see $w/$1.log)"
   else
     pass "stale results: run-$1.sh clears its old results before it dies"
   fi
@@ -678,15 +680,36 @@ test_stale_results() {
   stale_results_check bytecmp PAGEMASK_BIN
   stale_results_check diff DIFFRUNNER_BIN
   stale_results_check ondisk PAGEMASK_BIN
-  # An argument error comes before the clear: a typo touches nothing.
+  # An argument error comes before the clear: a typo touches nothing. No
+  # pagemask, so a part check that let it through could not start a capture.
   mkdir -p "$w/ondisk/ref"
   printf 'old\tok\n' >"$w/ondisk/ref/summary.tsv"
-  if PGV_WORK="$w" "$here/../run-ondisk.sh" ref nosuchpart >"$w/usage.log" 2>&1; then
+  if PGV_WORK="$w" PAGEMASK_BIN=/nonexistent "$here/../run-ondisk.sh" ref nosuchpart >"$w/usage.log" 2>&1; then
     fail "stale results: run-ondisk.sh accepts a bad part"
+  elif ! grep -qF 'usage:' "$w/usage.log"; then
+    fail "stale results: run-ondisk.sh died on a bad part, but not with usage: (see $w/usage.log)"
   elif [ -s "$w/ondisk/ref/summary.tsv" ]; then
     pass "stale results: a usage error leaves the old results alone"
   else
     fail "stale results: a usage error removed the old results"
+  fi
+  # So does one in capture mode: it must not reach the trap that removes the
+  # shared container. A fake docker, first on PATH, records every call.
+  mkdir -p "$w/fakebin"
+  {
+    echo '#!/bin/sh'
+    echo "echo \"\$*\" >>\"$w/docker-calls\""
+  } >"$w/fakebin/docker"
+  chmod +x "$w/fakebin/docker"
+  if PATH="$w/fakebin:$PATH" PGV_WORK="$w" PAGEMASK_BIN=/nonexistent \
+    "$here/../run-ondisk.sh" capture --bogus >"$w/capture-usage.log" 2>&1; then
+    fail "stale results: run-ondisk.sh capture accepts --bogus"
+  elif ! grep -qF 'usage:' "$w/capture-usage.log"; then
+    fail "stale results: run-ondisk.sh capture --bogus died, but not with usage: (see $w/capture-usage.log)"
+  elif [ -e "$w/docker-calls" ]; then
+    fail "stale results: a capture usage error ran docker $(head -1 "$w/docker-calls")"
+  else
+    pass "stale results: a capture usage error touches nothing"
   fi
   rm -rf "$w"
 }
@@ -709,10 +732,11 @@ stub_tier() {
 # run-all.sh counts every tier's exit status: a tier that died after writing
 # only ok rows fails, a tier that wrote nothing reports "(no results)" even
 # over an old summary.tsv or with exit 0, a tier with a FAIL row gets no
-# extra row, and a missing reverse.tsv is reported. Stub tiers
-# (PGV_TIER_DIR): no server runs.
+# extra row, and a missing reverse.tsv is reported. A run killed partway
+# leaves no old report and no old summary.tsv. Stub tiers (PGV_TIER_DIR):
+# no server runs.
 test_run_all_exit_status() {
-  local w="$PGV_WORK/run-all" r t
+  local w="$PGV_WORK/run-all" r t rc
   r="$w/report-ref.md"
   # Without the knob, run-all.sh would run the real tiers.
   if ! grep -q PGV_TIER_DIR "$here/../run-all.sh"; then
@@ -764,6 +788,26 @@ test_run_all_exit_status() {
     pass "run-all: all-ok tiers pass"
   else
     fail "run-all: all-ok tiers (see $w.log.2)"
+  fi
+  # A run killed partway (Ctrl-C, a timeout) keeps none of the all-ok run's
+  # verdicts: no report, and no summary.tsv for the tiers it never reached.
+  {
+    echo '#!/usr/bin/env bash'
+    echo "kill \"\$PPID\""
+    echo 'exit 1'
+  } >"$w/bin/run-bytecmp.sh"
+  rc=0
+  # The braces keep bash's "Terminated" notice out of this script's output.
+  { PGV_WORK="$w" PGV_TIER_DIR="$w/bin" "$here/../run-all.sh" ref >"$w.log.3" 2>&1; } 2>/dev/null || rc=$?
+  if [ "$rc" -ne 0 ] && [ ! -e "$r" ]; then
+    pass "run-all: an interrupted run leaves no old report"
+  else
+    fail "run-all: an interrupted run (exit $rc) left $r"
+  fi
+  if [ ! -e "$w/iterscan/ref/summary.tsv" ] && [ ! -e "$w/diff/ref/summary.tsv" ] && [ ! -e "$w/ondisk/ref/summary.tsv" ]; then
+    pass "run-all: an interrupted run leaves no old summary.tsv"
+  else
+    fail "run-all: an interrupted run left old summary.tsv files (see $w)"
   fi
 }
 
@@ -851,9 +895,11 @@ test_docker_lib_failures() {
   fi
   dk_rm
   rc=0
-  DK_NAME=pgrust-pgvector-ondisk-absent within 10 dk_stop_immediate >>"$w.log" 2>&1 || rc=$?
+  DK_DATA=/pgdata DK_NAME=pgrust-pgvector-ondisk-absent within 10 dk_stop_immediate >>"$w.log" 2>&1 || rc=$?
   if [ "$rc" = 124 ] || [ "$rc" = 0 ]; then
     fail "docker-lib: dk_stop_immediate without a container (exit $rc)"
+  elif ! grep -qF 'no container pgrust-pgvector-ondisk-absent' "$w.log"; then
+    fail "docker-lib: dk_stop_immediate without a container failed, but not for that (see $w.log)"
   else
     pass "docker-lib: dk_stop_immediate fails fast without a container"
   fi
@@ -1024,10 +1070,12 @@ test_ondisk_capture_check() {
   echo old >"$nopm/ondisk/capture/key"
   if PGV_WORK="$nopm" PAGEMASK_BIN=/nonexistent "$here/../run-ondisk.sh" capture --force >"$nopm.log" 2>&1; then
     fail "ondisk capture check: capture --force succeeds without pagemask"
-  elif [ "$(cat "$nopm/ondisk/capture/key" 2>/dev/null)" = old ]; then
-    pass "ondisk capture check: a capture without pagemask keeps the cached one"
-  else
+  elif [ "$(cat "$nopm/ondisk/capture/key" 2>/dev/null)" != old ]; then
     fail "ondisk capture check: a capture without pagemask deleted the cached one (see $nopm.log)"
+  elif ! grep -qF 'missing /nonexistent' "$nopm.log"; then
+    fail "ondisk capture check: a capture without pagemask failed, but not at its pagemask check (see $nopm.log)"
+  else
+    pass "ondisk capture check: a capture without pagemask keeps the cached one"
   fi
   rm -rf "$nopm"
 }

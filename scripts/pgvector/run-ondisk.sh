@@ -308,10 +308,16 @@ mode="$1"
 shift
 case "$mode" in
   capture)
-    trap cleanup EXIT
+    # The trap only in the valid arms: a usage error touches nothing.
     case "$#:${1:-}" in
-      0:) ensure_capture 0 ;;
-      1:--force) ensure_capture 1 ;;
+      0:)
+        trap cleanup EXIT
+        ensure_capture 0
+        ;;
+      1:--force)
+        trap cleanup EXIT
+        ensure_capture 1
+        ;;
       *) usage ;;
     esac
     echo "capture: $cap"
