@@ -957,6 +957,81 @@ test_ondisk_capture_key() {
   rm -rf "$w"
 }
 
+# A copy of the self-test capture at $1: its files copied (so a test can
+# edit them), its data directories linked.
+ondisk_capture_copy() {
+  local src="$PGV_WORK/ondisk/capture" f
+  rm -rf "$1"
+  mkdir -p "$1/clean" "$1/crash" "$1/v081"
+  cp "$src/facts.tsv" "$1/"
+  for f in "$src"/clean/* "$src"/crash/* "$src"/v081/*; do
+    if [ -d "$f" ]; then ln -s "$f" "$1/${f#"$src"/}"; else cp "$f" "$1/${f#"$src"/}"; fi
+  done
+}
+
+# capture_check on the capture at $1, which must die with message $3; $2
+# names the case.
+ondisk_check_fails() {
+  if (
+    . "$here/../ondisk-capture.sh"
+    cap="$1"
+    capture_check
+  ) >"$1.out" 2>&1; then
+    fail "ondisk capture check: passes with $2"
+  elif grep -qF "$3" "$1.out"; then
+    pass "ondisk capture check: dies with $2"
+  else
+    fail "ondisk capture check: dies with $2, but not for that (see $1.out)"
+  fi
+}
+
+# The capture checks its own coverage (capture_check): it passes on the
+# self-test capture (test_ondisk_capture's) and dies on copies with a fact
+# wrong, an unintended error in C's answers, or a crash whose replay changed
+# nothing. A capture that cannot check itself (no pagemask) fails before it
+# deletes the cached one.
+test_ondisk_capture_check() {
+  local w="$PGV_WORK/ondisk-check" nopm="$PGV_WORK/ondisk-check-nopm"
+  if [ ! -f "$PGV_WORK/ondisk/capture/key" ]; then
+    fail "ondisk capture check: no self-test capture (run test_ondisk_capture first)"
+    return
+  fi
+  ondisk_capture_copy "$w"
+  if (
+    . "$here/../ondisk-capture.sh"
+    cap="$w"
+    capture_check
+  ) >"$w.out" 2>&1; then
+    pass "ondisk capture check: passes on the capture"
+  else
+    # No capture_check (yet): stop here, before a capture --force below
+    # could start a real capture.
+    fail "ondisk capture check: fails on the capture (see $w.out)"
+    return
+  fi
+  awk -F'\t' -v OFS='\t' '$1 == "crash_state" { $2 = "shut down" } { print }' "$w/facts.tsv" >"$w/facts.new"
+  mv "$w/facts.new" "$w/facts.tsv"
+  ondisk_check_fails "$w" "a clean crash" "capture check: crash_state is 'shut down', want 'in production'"
+  ondisk_capture_copy "$w"
+  echo 'psql:ondisk-queries.sql:1: ERROR:  relation "nope" does not exist' >>"$w/crash/expected-queries.out"
+  ondisk_check_fails "$w" "an unintended error" "has 3 errors, 2 of them wrong-dimension"
+  ondisk_capture_copy "$w"
+  rm "$w/crash/replayed"
+  ln -s "$PGV_WORK/ondisk/capture/crash/data" "$w/crash/replayed"
+  ondisk_check_fails "$w" "an unreplayed crash" "unchanged, so crash_pages would not test its replay"
+  rm -rf "$w" "$w.out" "$nopm"
+  mkdir -p "$nopm/ondisk/capture"
+  echo old >"$nopm/ondisk/capture/key"
+  if PGV_WORK="$nopm" PAGEMASK_BIN=/nonexistent "$here/../run-ondisk.sh" capture --force >"$nopm.log" 2>&1; then
+    fail "ondisk capture check: capture --force succeeds without pagemask"
+  elif [ "$(cat "$nopm/ondisk/capture/key" 2>/dev/null)" = old ]; then
+    pass "ondisk capture check: a capture without pagemask keeps the cached one"
+  else
+    fail "ondisk capture check: a capture without pagemask deleted the cached one (see $nopm.log)"
+  fi
+  rm -rf "$nopm"
+}
+
 # --- runner ---
 if [ "$#" -eq 0 ]; then
   # Declaration order (declare -F would sort): a test may read the results of

@@ -69,9 +69,13 @@ open_transaction() {
   "$PG_TOOLS/bin/psql" -X -q -v ON_ERROR_STOP=1 "$@" -U postgres -d postgres -c "CREATE TABLE crash_marker AS SELECT 1 AS x"
 }
 
-# Reap the open transaction's psql once its server is gone.
+# Reap the open transaction's psql once its server is gone. Kill it first:
+# a client whose socket Docker's proxy keeps open would never exit.
 close_transaction() {
-  wait "$INFLIGHT_PID" 2>/dev/null || true
+  if [ -n "$INFLIGHT_PID" ]; then
+    kill "$INFLIGHT_PID" 2>/dev/null || true
+    wait "$INFLIGHT_PID" 2>/dev/null || true
+  fi
   INFLIGHT_PID=
 }
 
@@ -85,7 +89,9 @@ capture_key() {
 
 # C's answers on a copy of $1/data: the 0.8.7 image boots it, then the
 # transcripts of $2 (ondisk-queries.sql, or ondisk-update.sql for v081) and
-# of the follow-up, whose DML and maintenance must succeed on C.
+# of the follow-up, whose DML and maintenance must succeed on C: no error,
+# and a transcript at all (psql reports a failed connection as
+# "psql: error:").
 oracle() {
   local d="$1" q="$2" name
   name="${q#ondisk-}"
@@ -93,7 +99,7 @@ oracle() {
   dk_boot_dir "$PGV_DOCKER_IMAGE" "$d/data" || die "the 0.8.7 image did not boot $d/data"
   transcript "$q" "${DK_CONN[@]}" >"$d/expected-$name.out"
   transcript ondisk-followup.sql "${DK_CONN[@]}" >"$d/expected-followup.out"
-  if grep -q 'ERROR:' "$d/expected-followup.out"; then
+  if [ ! -s "$d/expected-followup.out" ] || grep -qE 'ERROR:|FATAL:|^psql: error:' "$d/expected-followup.out"; then
     die "C's follow-up failed; see $d/expected-followup.out"
   fi
   dk_rm
@@ -102,6 +108,7 @@ oracle() {
 capture() {
   local c="$cap/clean" k="$cap/crash" v="$cap/v081"
   dk_require
+  [ -x "$PAGEMASK_BIN" ] || die "missing $PAGEMASK_BIN; run scripts/pgvector/build-pgrust.sh"
   rm -rf "$cap"
   mkdir -p "$c" "$k" "$v"
 
@@ -146,6 +153,7 @@ capture() {
   oracle "$v" ondisk-update.sql
 
   facts
+  capture_check
   capture_key >"$cap/key"
 }
 
@@ -169,6 +177,53 @@ facts() {
     printf 'v081_before\t%s\n' "$(awk '/^SELECT extversion FROM pg_extension/ { getline; getline; getline; print $1; exit }' "$cap/v081/expected-update.out")"
     printf 'v081_after\t%s\n' "$(sed -n 's/^ext|\([^|]*\)|.*/\1/p' "$cap/v081/expected-update.out")"
   } >"$cap/facts.tsv"
+}
+
+# A value from the capture's facts.tsv.
+cap_fact() {
+  awk -F'\t' -v k="$1" '$1 == k { print $2 }' "$cap/facts.tsv"
+}
+
+# Die unless the capture exercised what the gate claims. Without this, a
+# capture that missed the crash, an index, the TOAST table or the update
+# would still let every forward row pass. capture writes the key only after
+# it, so a capture that fails here is rebuilt next time.
+capture_check() {
+  local f got n name kind path
+  # The facts: the directories' states, every relation and vector index,
+  # the TOASTed column, the open transaction and the update.
+  for f in "clean_state=shut down" "v081_state=shut down" "crash_state=in production" \
+    crash_relations=42 vector_indexes=25 wide_toasted=t v081_before=0.8.1 v081_after=0.8.7; do
+    got="$(cap_fact "${f%%=*}")"
+    [ "$got" = "${f#*=}" ] || die "capture check: ${f%%=*} is '$got', want '${f#*=}' ($cap/facts.tsv)"
+  done
+  got="$(cap_fact crash_inflight_generic)"
+  [ "${got:-0}" -gt 0 ] || die "capture check: the open transaction wrote no Generic records ($cap/facts.tsv)"
+  # C's intended errors, every one a wrong-dimension query: two in the
+  # queries, four in the update (which runs the queries twice).
+  for f in clean/expected-queries.out=2 crash/expected-queries.out=2 v081/expected-update.out=4; do
+    got="$(grep -c 'ERROR:' "$cap/${f%%=*}" || true)"
+    n="$(grep -c 'ERROR:  expected 8 dimensions, not 3$' "$cap/${f%%=*}" || true)"
+    [ "$got/$n" = "${f#*=}/${f#*=}" ] ||
+      die "capture check: $cap/${f%%=*} has $got errors, $n of them wrong-dimension; want ${f#*=}, all wrong-dimension"
+  done
+  # crash_pages means something only where replay changed the pages: every
+  # vector index's main fork must differ, after pagemask, between the
+  # crashed directory and C's replay of it.
+  n=0
+  while IFS='|' read -r name kind path; do
+    [ "$kind" = generic ] || continue
+    n=$((n + 1))
+    if ! "$PAGEMASK_BIN" generic "$cap/crash/data/$path" "$cap/check-data.masked" ||
+      ! "$PAGEMASK_BIN" generic "$cap/crash/replayed/$path" "$cap/check-replayed.masked"; then
+      die "capture check: pagemask failed on $name ($path)"
+    fi
+    if cmp -s "$cap/check-data.masked" "$cap/check-replayed.masked"; then
+      die "capture check: replay left $name unchanged, so crash_pages would not test its replay"
+    fi
+  done <"$cap/crash/relfiles.txt"
+  rm -f "$cap/check-data.masked" "$cap/check-replayed.masked"
+  [ "$n" -eq 25 ] || die "capture check: $n vector indexes in $cap/crash/relfiles.txt, want 25"
 }
 
 ensure_capture() {
