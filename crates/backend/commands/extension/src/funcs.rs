@@ -214,11 +214,13 @@ pub fn fc_pg_extension_config_dump(
 }
 
 // pg_get_loaded_modules (extension.c:2974-3018). No-dlopen carve: modules are
-// builtin registry entries. module_name is the entry's name; version is the
-// one the library registered for PG_MODULE_MAGIC_EXT's .version (pgvector's
-// 0.8.7, vector.c:49), else PG_VERSION, which every other shipped module's
-// PG_MODULE_MAGIC_EXT carries. file_name is the basename of the filename the
-// library was opened under (:3007-3011).
+// builtin registry entries. module_name is the PG_MODULE_MAGIC_EXT name
+// (dfmgr's magic_module_name); a plain PG_MODULE_MAGIC module has neither
+// name nor version. version is the one the library registered for .version
+// (pgvector's 0.8.7, vector.c:49; looked up by module name, which equals the
+// library name for every library that registers one), else PG_VERSION.
+// file_name is the basename of the filename the library was opened under
+// (:3007-3011).
 pub fn fc_pg_get_loaded_modules(
     flinfo: Option<&mut FmgrInfo>,
     fcinfo: &mut Fcinfo,
