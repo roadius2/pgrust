@@ -222,7 +222,7 @@ pub(crate) fn cast_array_elems<'m>(
             .with_location(site.file, site.ndim_line, site.func)
             .into());
     }
-    if arrayfuncs::arr_hasnull(arr) && arrayfuncs::array_contains_nulls(arr) {
+    if arrayfuncs::arr_hasnull(arr) && arrayfuncs::array_contains_nulls(arr)? {
         return Err(PgError::error("array must not contain nulls")
             .with_sqlstate(ERRCODE_NULL_VALUE_NOT_ALLOWED)
             .with_location(site.file, site.nulls_line, site.func)

@@ -83,6 +83,7 @@ fn boot_am_fixture() {
     insert_am_row(td, BTREE_AM_OID, "btree", F_BTHANDLER, b'i');
     insert_am_row(td, 2, "heap", 3, b't');
     insert_am_row(td, 777, "broken", InvalidOid, b'i');
+    insert_am_row(td, 9403, "bt_alias", F_BTHANDLER, b'i');
     catcache::testing::insert_negative(
         AMOID,
         &[
@@ -114,6 +115,7 @@ fn install_proname_stub() {
             n.namestrcpy(name);
             n
         }
+        syscache_seams::lookup_pg_proc_secdef::set(|_| Ok(None));
         syscache_seams::pg_proc_proname::set(|funcid| {
             Ok(match funcid {
                 5000 => Some(named("blhandler")),
@@ -121,14 +123,15 @@ fn install_proname_stub() {
                 5002 => Some(named("fpb4_bt_handler")),
                 5003 => Some(named("fpb4_int4pl")),
                 5004 => Some(named("ivfflathandler")),
+                5005 => Some(named("blhandler")),
                 _ => None,
             })
         });
-        // 5002/5003: CREATE FUNCTION ... LANGUAGE internal aliases (prolang 12);
+        // 5002/5003/5005: CREATE FUNCTION ... LANGUAGE internal aliases (prolang 12);
         // fmgr_info dispatches them by prosrc (fmgr.c:236-247 fmgr_lookupByName).
         syscache_seams::lookup_pg_proc_fmgr::set(|funcid| {
             Ok(match funcid {
-                5002 | 5003 => Some(syscache_seams::PgProcFmgrShape {
+                5002 | 5003 | 5005 => Some(syscache_seams::PgProcFmgrShape {
                     prolang: 12,
                     prorettype: 325,
                     pronargs: 1,
@@ -146,6 +149,7 @@ fn install_proname_stub() {
             Ok(match funcid {
                 5002 => Some(mcx::PgString::from_str_in("bthandler", cx)?),
                 5003 => Some(mcx::PgString::from_str_in("int4pl", cx)?),
+                5005 => Some(mcx::PgString::from_str_in("bthandler", cx)?),
                 _ => None,
             })
         });
@@ -185,6 +189,9 @@ fn handler_dispatch_is_the_closed_set() {
     // An internal alias of bthandler IS the btree handler (what C's
     // OidFunctionCall0 on it returns); an internal alias of int4pl is not.
     assert_eq!(GetIndexAmRoutine(5002).unwrap(), IndexAmKind::Btree);
+    // An internal alias of bthandler that happens to be NAMED blhandler is
+    // still bthandler: fmgr dispatches by prosrc, not proname.
+    assert_eq!(GetIndexAmRoutine(5005).unwrap(), IndexAmKind::Btree);
     let e = GetIndexAmRoutine(5003).unwrap_err();
     assert_eq!(
         e.message,
@@ -279,6 +286,35 @@ fn translate_out_of_range_needs_the_am_row() {
     );
     let e = IndexAmTranslateCompareType(COMPARE_NE, BTREE_AM_OID, InvalidOid, false).unwrap_err();
     assert_eq!(e.message, "could not translate compare type 6 for index AM 403");
+}
+
+// CREATE ACCESS METHOD bt_alias TYPE INDEX HANDLER bthandler: the handler's
+// bttranslatestrategy / bttranslatecmptype do not look at the AM oid, so the
+// alias translates exactly like BTREE_AM_OID (the shortcut skipped it).
+#[test]
+fn translate_btree_alias_am_matches_builtin() {
+    boot_am_fixture();
+
+    for s in 1..=BTMaxStrategyNumber {
+        assert_eq!(
+            IndexAmTranslateStrategy(s, 9403, InvalidOid, false).unwrap(),
+            s as CompareType
+        );
+    }
+    for c in COMPARE_LT..=COMPARE_GT {
+        assert_eq!(
+            IndexAmTranslateCompareType(c, 9403, InvalidOid, false).unwrap(),
+            c as StrategyNumber
+        );
+    }
+    assert_eq!(
+        IndexAmTranslateStrategy(6, 9403, InvalidOid, true).unwrap(),
+        COMPARE_INVALID
+    );
+    assert_eq!(
+        IndexAmTranslateCompareType(COMPARE_NE, 9403, InvalidOid, true).unwrap(),
+        InvalidStrategy
+    );
 }
 
 // CLAOID always misses: the fixture models a database whose pg_opclass has no

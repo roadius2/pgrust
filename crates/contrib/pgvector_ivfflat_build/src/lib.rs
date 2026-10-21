@@ -135,7 +135,7 @@ fn sample_rows<'mcx>(
     // reservoir_init_selection_state seeds from pg_prng_uint32
     // (sampling.c:139).
     bs.rstate = Some(sampling::reservoir_init_selection_state(
-        pg_prng::global_prng(|p| p.next_u32()) as u64,
+        pg_prng::global_prng(|p| p.next_u32()),
         targsamples as u32,
     ));
 
