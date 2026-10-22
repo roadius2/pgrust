@@ -19,6 +19,8 @@ use types_rel::Relation;
 use types_storage::bufpage::PageMut;
 use types_tuple::itemptr::ItemPointerData;
 
+mod parallel_build;
+
 pub struct IndexBuildResult {
     pub heap_tuples: f64,
     pub index_tuples: f64,
@@ -508,15 +510,34 @@ fn build_index<'mcx>(
         PROGRESS_HNSW_PHASE_LOAD,
     );
 
-    // Add tuples to graph
+    // Add tuples to graph: calculate parallel workers, attempt to launch a
+    // parallel build when required, else scan serially (hnswbuild.c:1099-1115).
     let mut indtuples = 0.0;
+    let mut built_in_parallel = false;
     if let (Some(heap), Some(index_info)) = (bs.heap, index_info) {
-        bs.reltuples = serial_scan(&mut bs, mcx, heap, index_info)?;
-        indtuples = graph.indtuples();
+        let parallel_workers = parallel_build::compute_parallel_workers(heap, index)?;
+        let built = if parallel_workers > 0 {
+            parallel_build::build_graph_parallel(&bs, mcx, heap, index_info.ii_Concurrent, parallel_workers)?
+        } else {
+            None
+        };
+        match built {
+            Some((reltuples, n)) => {
+                bs.reltuples = reltuples;
+                indtuples = n;
+                built_in_parallel = true;
+            }
+            None => {
+                bs.reltuples = serial_scan(&mut bs, mcx, heap, index_info)?;
+                indtuples = graph.indtuples();
+            }
+        }
     }
 
-    // Flush pages
-    graph.flush_if_needed(|g| flush_pages(&bs, g))?;
+    // Flush pages (a parallel build flushed its shared graph already)
+    if !built_in_parallel {
+        graph.flush_if_needed(|g| flush_pages(&bs, g))?;
+    }
 
     // Write WAL for initialization fork since GenericXLog functions do not
     if relation_needs_wal(index) || fork_num == ForkNumber::INIT_FORKNUM {
