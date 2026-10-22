@@ -1105,6 +1105,30 @@ SQL
   fi
 }
 
+# The build-time report, C against C at a toy size: every row is timed, and a
+# forced worker count launches that many workers on both servers.
+test_buildtime_ref() {
+  local log="$PGV_WORK/buildtime-ref.log" f="$PGV_WORK/buildtime/ref/summary.tsv"
+  if PGV_BUILDTIME_ROWS=20000 PGV_BUILDTIME_DIM=8 PGV_BUILDTIME_WORKERS="0 2" \
+    "$here/../run-buildtime.sh" ref >"$log" 2>&1; then
+    pass "buildtime ref: exit 0"
+  else
+    fail "buildtime ref: exit 0 (see $log)"
+  fi
+  if [ "$(wc -l <"$f" 2>/dev/null | tr -d ' ')" = 4 ] &&
+    awk -F'\t' '$3 !~ /^[0-9.]+$/ || $5 !~ /^[0-9.]+$/ { bad = 1 } END { exit bad }' "$f"; then
+    pass "buildtime ref: 4 timed rows"
+  else
+    fail "buildtime ref: 4 timed rows (see $f)"
+  fi
+  if awk -F'\t' '$2 == 2 && ($4 != 2 || $6 != 2) { bad = 1 }
+      $2 == 0 && ($4 != 0 || $6 != 0) { bad = 1 } END { exit bad }' "$f"; then
+    pass "buildtime ref: workers launched as forced"
+  else
+    fail "buildtime ref: workers launched as forced (see $f)"
+  fi
+}
+
 # --- runner ---
 if [ "$#" -eq 0 ]; then
   # Declaration order (declare -F would sort): a test may read the results of
