@@ -38,6 +38,9 @@ pub const HNSW_HEAPTIDS: usize = 10;
 pub const HNSW_UPDATE_ENTRY_GREATER: i32 = 1;
 pub const HNSW_UPDATE_ENTRY_ALWAYS: i32 = 2;
 
+/// PROGRESS_HNSW_PHASE_LOAD (hnsw.h:76): BuildGraph's subphase (hnswbuild.c:1096).
+pub const PROGRESS_HNSW_PHASE_LOAD: i64 = 2;
+
 pub const HNSW_ITERATIVE_SCAN_OFF: i32 = 0;
 pub const HNSW_ITERATIVE_SCAN_RELAXED: i32 = 1;
 pub const HNSW_ITERATIVE_SCAN_STRICT: i32 = 2;

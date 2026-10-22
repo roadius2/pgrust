@@ -14049,6 +14049,7 @@ dependencies = [
 name = "pgvector_hnsw_build"
 version = "0.0.0"
 dependencies = [
+ "backend_progress",
  "bufmgr",
  "bufmgr_seams",
  "datum",
@@ -14059,6 +14060,7 @@ dependencies = [
  "mcx",
  "pgvector",
  "pgvector_hnsw",
+ "pgvector_hnsw_graph",
  "postgres_seams",
  "types_core",
  "types_error",

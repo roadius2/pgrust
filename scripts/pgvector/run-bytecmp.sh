@@ -41,8 +41,8 @@ set -euo pipefail
 # ruler, so all pairwise distances differ. *_grid and dups have many equal
 # distances, which exercises C's pairingheap tie order.
 # insert_grid, the tie-heavy on-disk insert case, is opt-in (see its arm).
-CASES="l2_golomb l1_golomb m4_golomb wide_golomb unlogged_golomb insert_golomb l2_grid ip_grid dups big_golomb halfvec_l2_grid halfvec_cosine_grid sparsevec_l2_grid sparsevec_l2_frac sparsevec_cosine_grid insert_sparsevec_cosine wide_sparsevec bit_hamming bit_jaccard bq_expression ivf_l2_groups ivf_big ivf_halfvec_groups ivf_bit_hamming ivf_insert ivf_unlogged ivf_vacuum ivf_wide"
-# Opt-in only (known divergences, run by name): spill cosine insert_grid
+CASES="l2_golomb l1_golomb m4_golomb wide_golomb unlogged_golomb insert_golomb l2_grid ip_grid dups big_golomb spill halfvec_l2_grid halfvec_cosine_grid sparsevec_l2_grid sparsevec_l2_frac sparsevec_cosine_grid insert_sparsevec_cosine wide_sparsevec bit_hamming bit_jaccard bq_expression ivf_l2_groups ivf_big ivf_halfvec_groups ivf_bit_hamming ivf_insert ivf_unlogged ivf_vacuum ivf_wide"
+# Opt-in only (known divergences, run by name): cosine insert_grid
 
 GOLOMB1009='ARRAY[2*1009*k + (k*k) % 1009, 0, 0]::vector'
 GRID='ARRAY[i % 17, (i * 7) % 23, (i * 13) % 31]::vector'
@@ -302,12 +302,16 @@ CREATE INDEX $1_idx ON $1 USING ivfflat (v vector_l2_ops) WITH (lists = 5);
 SQL
       ;;
     spill)
-      # Known divergence: C flushes when its Generation context has allocated
-      # maintenance_work_mem (1436 tuples here); pgrust estimates (1840).
+      # Spills at maintenance_work_mem = 1MB: C's Generation context fills its
+      # 1 MB keeper block after 1436 elements (pgvector_hnsw_build's
+      # serial_flush_point_matches_c_at_one_megabyte), and the other 567 rows
+      # go through on-disk inserts. The Golomb ruler (p = 2003, every value
+      # below 2^24) keeps those inserts free of distance ties, whose order C's
+      # pointer tie-break makes irreproducible (insert_grid).
       cat <<SQL
 SET maintenance_work_mem = '1MB';
 CREATE TABLE $1 (id int, v vector(3));
-INSERT INTO $1 SELECT i, $GRID FROM generate_series(1, 6000) i;
+INSERT INTO $1 SELECT k, ARRAY[2*2003*k + (k*k) % 2003, 0, 0]::vector FROM (SELECT (i * 37) % 2003 AS k FROM generate_series(0, 2002) i) s;
 CREATE INDEX $1_idx ON $1 USING hnsw (v vector_l2_ops);
 SQL
       ;;
@@ -320,7 +324,7 @@ INSERT INTO $1 SELECT i, ARRAY[1 + i % 17, 1 + (i * 7) % 23, 1 + (i * 13) % 31]:
 CREATE INDEX $1_idx ON $1 USING hnsw (v vector_cosine_ops);
 SQL
       ;;
-    *) die "unknown case '$1' (default cases: $CASES; opt-in: spill cosine insert_grid)" ;;
+    *) die "unknown case '$1' (default cases: $CASES; opt-in: cosine insert_grid)" ;;
   esac
   echo "SELECT 'rel|idx|' || pg_relation_filepath('$1_idx');"
 }

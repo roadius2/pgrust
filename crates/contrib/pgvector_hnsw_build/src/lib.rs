@@ -1,14 +1,17 @@
-//! pgvector 0.8.7 hnswbuild.c, serial rendering: in-memory graph phase in a
-//! bump arena (u32 element handles mirror C's graphCtx pointer sharing), flush
-//! to disk at maintenance_work_mem, then per-tuple on-disk inserts.
+//! pgvector 0.8.7 hnswbuild.c. The in-memory graph phase runs on
+//! pgvector_hnsw_graph (InsertTuple and InsertTupleInMemory, with C's lock
+//! protocol and C's memory accounting); the graph is flushed to disk when it
+//! no longer fits maintenance_work_mem, and later tuples are inserted on
+//! disk. parallel_build.rs runs the same insert path in launched workers.
 
 use bufmgr::{LockBuffer, MarkBufferDirty, UnlockReleaseBuffer, BUFFER_LOCK_EXCLUSIVE, BUFFER_LOCK_UNLOCK};
 use datum::Datum;
 use execindexing::IndexInfo;
-use mcx::{Mcx, PgVec};
+use mcx::Mcx;
 use pgvector_hnsw::insert::{form_index_value, insert_tuple_on_disk, random_level, seed_random};
 use pgvector_hnsw::layout::*;
 use pgvector_hnsw::utils::*;
+use pgvector_hnsw_graph::{Accounting, Element, Graph, GraphError, InsertError, InsertParams, Inserted};
 use types_core::{BlockNumber, Buffer, ForkNumber};
 use types_error::{PgError, PgResult, ERRCODE_FEATURE_NOT_SUPPORTED, ERRCODE_INVALID_PARAMETER_VALUE, ERRCODE_PROGRAM_LIMIT_EXCEEDED, NOTICE};
 use types_hnsw::*;
@@ -21,48 +24,9 @@ pub struct IndexBuildResult {
     pub index_tuples: f64,
 }
 
-struct MemCandidate {
-    element: u32,
-    distance: f32,
-    closer: bool,
-}
-
-struct MemNeighborArray {
-    items: Vec<MemCandidate>,
-    closer_set: bool,
-}
-
-struct MemElement<'g> {
-    heaptids: [ItemPointerData; HNSW_HEAPTIDS],
-    heaptids_len: u8,
-    level: u8,
-    version: u8,
-    value: PgVec<'g, u8>,
-    neighbors: Vec<MemNeighborArray>,
-    // On-disk location assigned by CreateGraphPages.
-    blkno: BlockNumber,
-    offno: u16,
-    neighbor_page: BlockNumber,
-    neighbor_offno: u16,
-}
-
-struct Graph<'g> {
-    mcx: Mcx<'g>,
-    // Element arena; ids are indices. Duplicates stay allocated here (as in
-    // C's graphCtx) but are only reachable through `head` if non-duplicate.
-    elems: Vec<MemElement<'g>>,
-    // C's graph->head insertion list: AddElementInMemory links only
-    // non-duplicate elements, and the flush walks this list. C prepends and
-    // iterates head-first; we push and iterate in reverse (newest-first).
-    head: Vec<u32>,
-    entry_point: Option<u32>,
-    memory_used: usize,
-    memory_total: usize,
-    flushed: bool,
-    indtuples: f64,
-}
-
-struct BuildState<'a, 'g, 'mcx> {
+// HnswBuildState (hnsw.h:311-347): one participant's state. `graph` is the
+// build's own (serial) or the shared one (parallel_build.rs).
+struct BuildState<'a, 'mcx> {
     heap: Option<&'a Relation<'mcx>>,
     index: &'a Relation<'mcx>,
     fork_num: ForkNumber,
@@ -73,432 +37,29 @@ struct BuildState<'a, 'g, 'mcx> {
     ml: f64,
     max_level: i32,
     support: HnswSupport,
-    graph: Graph<'g>,
+    graph: &'a Graph,
     reltuples: f64,
 }
 
-fn mem_candidate_clone(c: &MemCandidate) -> MemCandidate {
-    MemCandidate { element: c.element, distance: c.distance, closer: c.closer }
+// An element's on-disk location, assigned by CreateGraphPages.
+#[derive(Clone, Copy)]
+struct Placement {
+    blkno: BlockNumber,
+    offno: u16,
+    neighbor_page: BlockNumber,
+    neighbor_offno: u16,
 }
 
-fn get_distance_mem(
-    graph: &Graph<'_>,
-    support: &mut HnswSupport,
-    q: Datum,
-    e: u32,
-) -> PgResult<f64> {
-    let v = Datum::from_usize(graph.elems[e as usize].value.as_ptr() as usize);
-    get_distance(support, q, v)
-}
-
-// HnswSearchLayer, in-memory form.
-#[allow(clippy::too_many_arguments)]
-fn search_layer_mem(
-    graph: &Graph<'_>,
-    support: &mut HnswSupport,
-    q: Datum,
-    ep: Vec<(u32, f64)>,
-    ef: i32,
-    lc: i32,
-    _m: i32,
-) -> PgResult<Vec<(u32, f64)>> {
-    let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    let mut c_heap = nearest_candidate_heap();
-    let mut w_heap = furthest_candidate_heap();
-    let mut wlen: i32 = 0;
-
-    for (e, d) in ep.iter() {
-        visited.insert(*e);
-        c_heap.add((*d, *e));
-        w_heap.add((*d, *e));
-        wlen += 1;
-    }
-
-    while let Some((c_dist, c_elem)) = c_heap.remove_first() {
-        let (f_dist, _) = *w_heap.first().expect("W nonempty");
-        if c_dist > f_dist {
-            break;
-        }
-        let layer_idx = (graph.elems[c_elem as usize].level as i32 - lc) as usize;
-        let neighbor_ids: Vec<u32> = graph.elems[c_elem as usize].neighbors[layer_idx]
-            .items
-            .iter()
-            .map(|hc| hc.element)
-            .collect();
-
-        for e in neighbor_ids {
-            if !visited.insert(e) {
-                continue;
-            }
-            let always_add = wlen < ef;
-            let (f_dist, _) = *w_heap.first().expect("W nonempty");
-            let e_distance = get_distance_mem(graph, support, q, e)?;
-            if !(e_distance < f_dist || always_add) {
-                continue;
-            }
-            if (graph.elems[e as usize].level as i32) < lc {
-                continue;
-            }
-            c_heap.add((e_distance, e));
-            w_heap.add((e_distance, e));
-            wlen += 1;
-            if wlen > ef {
-                w_heap.remove_first();
-            }
-        }
-    }
-
-    let mut w: Vec<(u32, f64)> = Vec::new();
-    while let Some((d, e)) = w_heap.remove_first() {
-        w.push((e, d));
-    }
-    Ok(w)
-}
-
-// CheckElementCloser (in-memory).
-fn check_element_closer_mem(
-    graph: &Graph<'_>,
-    support: &mut HnswSupport,
-    e: &MemCandidate,
-    r: &[MemCandidate],
-) -> PgResult<bool> {
-    let e_value = Datum::from_usize(graph.elems[e.element as usize].value.as_ptr() as usize);
-    for ri in r {
-        let ri_value =
-            Datum::from_usize(graph.elems[ri.element as usize].value.as_ptr() as usize);
-        let distance = get_distance(support, e_value, ri_value)? as f32;
-        if distance <= e.distance {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-// SelectNeighbors (in-memory). C's candidate list holds pointers into the
-// caller's neighbor array, so e->closer updates land in that array; we take
-// `c` mutably and write the computed closer flags back by origin index.
-// Tie order: C's in-memory serial build also breaks equal distances by raw
-// element pointer (base == NULL, hnswutils.c:1007-1011), but every element
-// comes from one Generation context (HnswMemoryContextAlloc, hnswbuild.c:650),
-// so addresses rise with insertion order within a 1 MB block; element ids
-// reproduce that order.
-#[allow(clippy::too_many_arguments)]
-fn select_neighbors_mem(
-    graph: &Graph<'_>,
-    support: &mut HnswSupport,
-    c: &mut [MemCandidate],
-    lm: i32,
-    closer_set: &mut bool,
-    new_candidate: Option<usize>,
-    pruned: Option<&mut Option<MemCandidate>>,
-    sort_candidates: bool,
-    out: &mut Vec<MemCandidate>,
-) -> PgResult<()> {
-    out.clear();
-    if c.len() as i32 <= lm {
-        out.extend(c.iter().map(mem_candidate_clone));
-        return Ok(());
-    }
-
-    let mut w: Vec<MemCandidate> = c.iter().map(mem_candidate_clone).collect();
-    let mut w_is_new: Vec<bool> = vec![false; w.len()];
-    // Origin index into `c` for closer-flag write-back.
-    let mut w_src: Vec<usize> = (0..w.len()).collect();
-    if let Some(nc) = new_candidate {
-        w_is_new[nc] = true;
-    }
-    if sort_candidates {
-        let mut order: Vec<usize> = (0..w.len()).collect();
-        order.sort_by(|&a, &b| {
-            w[b].distance
-                .partial_cmp(&w[a].distance)
-                .unwrap_or(core::cmp::Ordering::Equal)
-                .then_with(|| w[b].element.cmp(&w[a].element))
-        });
-        let neww: Vec<MemCandidate> = order.iter().map(|&i| mem_candidate_clone(&w[i])).collect();
-        let newn: Vec<bool> = order.iter().map(|&i| w_is_new[i]).collect();
-        let news: Vec<usize> = order.iter().map(|&i| w_src[i]).collect();
-        w = neww;
-        w_is_new = newn;
-        w_src = news;
-    }
-
-    let must_calculate = !*closer_set;
-    let mut wd: Vec<MemCandidate> = Vec::with_capacity(w.len());
-    let mut added: Vec<MemCandidate> = Vec::new();
-    let mut removed_any = false;
-
-    while !w.is_empty() && (out.len() as i32) < lm {
-        let mut e = w.pop().expect("nonempty");
-        let e_is_new = w_is_new.pop().expect("nonempty");
-        let e_src = w_src.pop().expect("nonempty");
-
-        if must_calculate {
-            e.closer = check_element_closer_mem(graph, support, &e, out)?;
-        } else if !added.is_empty() {
-            if e.closer {
-                e.closer = check_element_closer_mem(graph, support, &e, &added)?;
-                if !e.closer {
-                    removed_any = true;
-                }
-            } else if removed_any {
-                e.closer = check_element_closer_mem(graph, support, &e, out)?;
-                if e.closer {
-                    added.push(mem_candidate_clone(&e));
-                }
-            }
-        } else if e_is_new {
-            e.closer = check_element_closer_mem(graph, support, &e, out)?;
-            if e.closer {
-                added.push(mem_candidate_clone(&e));
-            }
-        }
-
-        // C writes e->closer through the shared pointer; mirror into `c`.
-        c[e_src].closer = e.closer;
-
-        if e.closer {
-            out.push(e);
-        } else {
-            wd.push(e);
-        }
-    }
-
-    *closer_set = sort_candidates;
-
-    let mut wdoff = 0usize;
-    while wdoff < wd.len() && (out.len() as i32) < lm {
-        out.push(mem_candidate_clone(&wd[wdoff]));
-        wdoff += 1;
-    }
-    if let Some(p) = pruned {
-        *p = if wdoff < wd.len() {
-            Some(mem_candidate_clone(&wd[wdoff]))
-        } else {
-            w.first().map(mem_candidate_clone)
-        };
-    }
-    Ok(())
-}
-
-// HnswFindElementNeighbors (in-memory).
-fn find_element_neighbors_mem(
-    bs: &mut BuildState<'_, '_, '_>,
-    element: u32,
-    entry_point: Option<u32>,
-) -> PgResult<()> {
-    let level = bs.graph.elems[element as usize].level as i32;
-    let q = Datum::from_usize(bs.graph.elems[element as usize].value.as_ptr() as usize);
-    let Some(entry_point) = entry_point else { return Ok(()) };
-
-    let mut support = bs.support.clone();
-    let entry_level = bs.graph.elems[entry_point as usize].level as i32;
-    let ep_dist = get_distance_mem(&bs.graph, &mut support, q, entry_point)?;
-    let mut ep: Vec<(u32, f64)> = vec![(entry_point, ep_dist)];
-
-    let mut lc = entry_level;
-    while lc >= level + 1 {
-        ep = search_layer_mem(&bs.graph, &mut support, q, ep, 1, lc, bs.m)?;
-        lc -= 1;
-    }
-
-    let level = level.min(entry_level);
-    let mut lc = level;
-    loop {
-        let lm = hnsw_get_layer_m(bs.m, lc);
-        let w = search_layer_mem(
-            &bs.graph,
-            &mut support,
-            q,
-            ep.clone(),
-            bs.ef_construction,
-            lc,
-            bs.m,
-        )?;
-
-        let mut lw: Vec<MemCandidate> = w
-            .iter()
-            .map(|(e, d)| MemCandidate { element: *e, distance: *d as f32, closer: false })
-            .collect();
-
-        let layer_idx = (bs.graph.elems[element as usize].level as i32 - lc) as usize;
-        let mut closer_set = bs.graph.elems[element as usize].neighbors[layer_idx].closer_set;
-        let mut selected: Vec<MemCandidate> = Vec::new();
-        select_neighbors_mem(
-            &bs.graph,
-            &mut support,
-            &mut lw,
-            lm,
-            &mut closer_set,
-            None,
-            None,
-            false,
-            &mut selected,
-        )?;
-        {
-            let na = &mut bs.graph.elems[element as usize].neighbors[layer_idx];
-            na.items = selected;
-            na.closer_set = closer_set;
-        }
-
-        ep = w;
-        if lc == 0 {
-            break;
-        }
-        lc -= 1;
-    }
-    bs.support = support;
-    Ok(())
-}
-
-// HnswUpdateConnection (in-memory): link `new_element` into `neighbors`.
-// C's SelectNeighbors candidate list aliases neighbors->items, so the closer
-// flags it computes persist in the array (and the replacement newHc carries
-// its computed flag); mirror both write-backs here.
-fn update_connection_mem(
-    graph: &Graph<'_>,
-    support: &mut HnswSupport,
-    neighbors: &mut Vec<MemCandidate>,
-    closer_set: &mut bool,
-    new_element: u32,
-    distance: f32,
-    lm: i32,
-) -> PgResult<()> {
-    let new_hc = MemCandidate { element: new_element, distance, closer: false };
-    if (neighbors.len() as i32) < lm {
-        neighbors.push(new_hc);
-        return Ok(());
-    }
-
-    // Shrink connections.
-    let mut c: Vec<MemCandidate> = neighbors.iter().map(mem_candidate_clone).collect();
-    c.push(new_hc);
-    let new_idx = c.len() - 1;
-    let mut pruned: Option<MemCandidate> = None;
-    let mut selected: Vec<MemCandidate> = Vec::new();
-    select_neighbors_mem(
-        graph,
-        support,
-        &mut c,
-        lm,
-        closer_set,
-        Some(new_idx),
-        Some(&mut pruned),
-        true,
-        &mut selected,
-    )?;
-    // Closer flags computed in place land in the neighbor array even on the
-    // pruned==NULL early return (c[0..len] is index-aligned with neighbors).
-    for (slot, cand) in neighbors.iter_mut().zip(c.iter()) {
-        slot.closer = cand.closer;
-    }
-    // Should not happen (C returns without linking).
-    let Some(pruned) = pruned else { return Ok(()) };
-    for slot in neighbors.iter_mut() {
-        if slot.element == pruned.element {
-            *slot = mem_candidate_clone(&c[new_idx]);
-            break;
-        }
-    }
-    Ok(())
-}
-
-// UpdateNeighborsInMemory.
-fn update_neighbors_mem(bs: &mut BuildState<'_, '_, '_>, e: u32) -> PgResult<()> {
-    let level = bs.graph.elems[e as usize].level as i32;
-    let mut support = bs.support.clone();
-    for lc in (0..=level).rev() {
-        let lm = hnsw_get_layer_m(bs.m, lc);
-        let layer_idx = (level - lc) as usize;
-        let items: Vec<MemCandidate> = bs.graph.elems[e as usize].neighbors[layer_idx]
-            .items
-            .iter()
-            .map(mem_candidate_clone)
-            .collect();
-        for hc in items {
-            let n_level = bs.graph.elems[hc.element as usize].level as i32;
-            let n_layer_idx = (n_level - lc) as usize;
-            let mut neighbors: Vec<MemCandidate> = bs.graph.elems[hc.element as usize].neighbors
-                [n_layer_idx]
-                .items
-                .iter()
-                .map(mem_candidate_clone)
-                .collect();
-            let mut closer_set =
-                bs.graph.elems[hc.element as usize].neighbors[n_layer_idx].closer_set;
-
-            update_connection_mem(
-                &bs.graph,
-                &mut support,
-                &mut neighbors,
-                &mut closer_set,
-                e,
-                hc.distance,
-                lm,
-            )?;
-
-            let na = &mut bs.graph.elems[hc.element as usize].neighbors[n_layer_idx];
-            na.items = neighbors;
-            na.closer_set = closer_set;
-        }
-    }
-    bs.support = support;
-    Ok(())
-}
-
-// FindDuplicateInMemory + AddDuplicateInMemory.
-fn find_duplicate_mem(bs: &mut BuildState<'_, '_, '_>, element: u32) -> PgResult<bool> {
-    let level = bs.graph.elems[element as usize].level as i32;
-    let layer0 = level as usize;
-    let neighbor_ids: Vec<u32> = bs.graph.elems[element as usize].neighbors[layer0]
-        .items
-        .iter()
-        .map(|hc| hc.element)
-        .collect();
-    for dup in neighbor_ids {
-        let equal = {
-            let a = &bs.graph.elems[element as usize].value;
-            let b = &bs.graph.elems[dup as usize].value;
-            a.as_slice() == b.as_slice()
-        };
-        if !equal {
-            return Ok(false);
-        }
-        if (bs.graph.elems[dup as usize].heaptids_len as usize) < HNSW_HEAPTIDS {
-            let tid = bs.graph.elems[element as usize].heaptids[0];
-            let d = &mut bs.graph.elems[dup as usize];
-            let n = d.heaptids_len as usize;
-            d.heaptids[n] = tid;
-            d.heaptids_len += 1;
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-// InsertTupleInMemory + UpdateGraphInMemory.
-fn insert_tuple_in_memory(bs: &mut BuildState<'_, '_, '_>, element: u32) -> PgResult<()> {
-    let entry_point = bs.graph.entry_point;
-    find_element_neighbors_mem(bs, element, entry_point)?;
-    if find_duplicate_mem(bs, element)? {
-        return Ok(());
-    }
-    // AddElementInMemory: only non-duplicates join the flush list.
-    bs.graph.head.push(element);
-    update_neighbors_mem(bs, element)?;
-    let promote = match entry_point {
-        None => true,
-        Some(ep) => bs.graph.elems[element as usize].level > bs.graph.elems[ep as usize].level,
-    };
-    if promote {
-        bs.graph.entry_point = Some(element);
-    }
-    Ok(())
-}
+const UNPLACED: Placement = Placement {
+    blkno: INVALID_BLOCK,
+    offno: INVALID_OFFSET,
+    neighbor_page: INVALID_BLOCK,
+    neighbor_offno: INVALID_OFFSET,
+};
 
 // ---- flush to disk ----
 
-fn create_meta_page(bs: &BuildState<'_, '_, '_>) -> PgResult<()> {
+fn create_meta_page(bs: &BuildState<'_, '_>) -> PgResult<()> {
     let buf = new_buffer(bs.index, bs.fork_num)?;
     init_page(buf);
     let meta = MetaPage {
@@ -541,52 +102,6 @@ fn build_append_page(
     Ok(())
 }
 
-fn serialize_element_tuple(buf: &mut Vec<u8>, e: &MemElement<'_>) {
-    let size = element_tuple_size(e.value.len());
-    buf.clear();
-    buf.resize(size, 0);
-    buf[0] = HNSW_ELEMENT_TUPLE_TYPE;
-    buf[1] = e.level;
-    buf[2] = 0;
-    buf[3] = e.version;
-    for i in 0..HNSW_HEAPTIDS {
-        let b = if i < e.heaptids_len as usize {
-            ipd_to_bytes(&e.heaptids[i])
-        } else {
-            itemptr_encode(INVALID_BLOCK, INVALID_OFFSET)
-        };
-        buf[4 + i * 6..4 + i * 6 + 6].copy_from_slice(&b);
-    }
-    buf[4 + HNSW_HEAPTIDS * 6..4 + HNSW_HEAPTIDS * 6 + 6]
-        .copy_from_slice(&itemptr_encode(e.neighbor_page, e.neighbor_offno));
-    buf[ELEMENT_DATA_OFFSET..ELEMENT_DATA_OFFSET + e.value.len()].copy_from_slice(&e.value);
-}
-
-fn serialize_neighbor_tuple(buf: &mut Vec<u8>, graph: &Graph<'_>, e: &MemElement<'_>, m: i32) {
-    let size = neighbor_tuple_size(e.level, m);
-    buf.clear();
-    buf.resize(size, 0);
-    buf[0] = HNSW_NEIGHBOR_TUPLE_TYPE;
-    buf[1] = e.version;
-    let mut idx = 0usize;
-    for lc in (0..=e.level as i32).rev() {
-        let na = &e.neighbors[(e.level as i32 - lc) as usize];
-        let lm = hnsw_get_layer_m(m, lc);
-        for i in 0..lm as usize {
-            let b = if i < na.items.len() {
-                let ne = &graph.elems[na.items[i].element as usize];
-                itemptr_encode(ne.blkno, ne.offno)
-            } else {
-                itemptr_encode(INVALID_BLOCK, INVALID_OFFSET)
-            };
-            buf[NEIGHBOR_TIDS_OFFSET + idx * 6..NEIGHBOR_TIDS_OFFSET + idx * 6 + 6]
-                .copy_from_slice(&b);
-            idx += 1;
-        }
-    }
-    buf[2..4].copy_from_slice(&(idx as u16).to_ne_bytes());
-}
-
 fn page_add(
     index: &Relation<'_>,
     buf: Buffer,
@@ -607,25 +122,71 @@ fn page_add(
     Ok(())
 }
 
-// CreateGraphPages: iterate newest-first (C list-prepend order).
-fn create_graph_pages(bs: &mut BuildState<'_, '_, '_>) -> PgResult<()> {
+fn serialize_element_tuple(buf: &mut Vec<u8>, e: &Element, p: Placement) {
+    let value = e.value();
+    let links = e.links();
+    let size = element_tuple_size(value.len());
+    buf.clear();
+    buf.resize(size, 0);
+    buf[0] = HNSW_ELEMENT_TUPLE_TYPE;
+    buf[1] = e.level;
+    buf[2] = 0;
+    // Start at one to make it easier to find issues (HnswInitElement, hnswutils.c:262)
+    buf[3] = 1;
+    for i in 0..HNSW_HEAPTIDS {
+        let b = if i < links.heaptids_len as usize {
+            links.heaptids[i]
+        } else {
+            itemptr_encode(INVALID_BLOCK, INVALID_OFFSET)
+        };
+        buf[4 + i * 6..4 + i * 6 + 6].copy_from_slice(&b);
+    }
+    buf[4 + HNSW_HEAPTIDS * 6..4 + HNSW_HEAPTIDS * 6 + 6]
+        .copy_from_slice(&itemptr_encode(p.neighbor_page, p.neighbor_offno));
+    buf[ELEMENT_DATA_OFFSET..ELEMENT_DATA_OFFSET + value.len()].copy_from_slice(value);
+}
+
+fn serialize_neighbor_tuple(buf: &mut Vec<u8>, e: &Element, placements: &[Placement], m: i32) {
+    let size = neighbor_tuple_size(e.level, m);
+    buf.clear();
+    buf.resize(size, 0);
+    buf[0] = HNSW_NEIGHBOR_TUPLE_TYPE;
+    // The element's version
+    buf[1] = 1;
+    let links = e.links();
+    let mut idx = 0usize;
+    for lc in (0..=e.level as i32).rev() {
+        let na = &links.neighbors[(e.level as i32 - lc) as usize];
+        let lm = hnsw_get_layer_m(m, lc);
+        for i in 0..lm as usize {
+            let b = if i < na.items.len() {
+                let p = placements[na.items[i].element as usize];
+                itemptr_encode(p.blkno, p.offno)
+            } else {
+                itemptr_encode(INVALID_BLOCK, INVALID_OFFSET)
+            };
+            buf[NEIGHBOR_TIDS_OFFSET + idx * 6..NEIGHBOR_TIDS_OFFSET + idx * 6 + 6].copy_from_slice(&b);
+            idx += 1;
+        }
+    }
+    buf[2..4].copy_from_slice(&(idx as u16).to_ne_bytes());
+}
+
+// CreateGraphPages (hnswbuild.c:150-248): graph->head, newest first
+// (duplicates merged away are not on it).
+fn create_graph_pages(bs: &BuildState<'_, '_>, graph: &Graph) -> PgResult<Vec<Placement>> {
     let max_size = HNSW_MAX_SIZE;
+    let mut placements = vec![UNPLACED; graph.element_count() as usize];
     let mut etup: Vec<u8> = Vec::new();
     let mut ntup_placeholder: Vec<u8> = Vec::new();
 
     let mut buf = new_buffer(bs.index, bs.fork_num)?;
     init_page(buf);
 
-    // C iterates graph->head (non-duplicates only), newest-first.
-    let order: Vec<usize> = bs.graph.head.iter().rev().map(|&e| e as usize).collect();
-    for i in order {
-        let (etup_size, ntup_size) = {
-            let e = &bs.graph.elems[i];
-            (
-                element_tuple_size(e.value.len()),
-                neighbor_tuple_size(e.level, bs.m),
-            )
-        };
+    for id in graph.head_newest_first() {
+        let e = graph.element(id);
+        let etup_size = element_tuple_size(e.value().len());
+        let ntup_size = neighbor_tuple_size(e.level, bs.m);
         let combined_size = etup_size + ntup_size + SIZE_OF_ITEM_ID;
         if etup_size > HNSW_TUPLE_ALLOC_SIZE {
             return Err(PgError::error("index tuple too large")
@@ -642,30 +203,23 @@ fn create_graph_pages(bs: &mut BuildState<'_, '_, '_>) -> PgResult<()> {
             build_append_page(bs.index, &mut buf, bs.fork_num)?;
         }
 
-        {
+        let placement = {
             // SAFETY: lock held.
             let pr = unsafe {
-                types_storage::bufpage::PageRef::from_raw(
-                    bufmgr_seams::buffer_get_page::call(buf),
-                )
+                types_storage::bufpage::PageRef::from_raw(bufmgr_seams::buffer_get_page::call(buf))
             };
             let blkno = bufmgr::BufferGetBlockNumber(buf);
             let offno = pr.max_offset_number() + 1;
-            let e = &mut bs.graph.elems[i];
-            e.blkno = blkno;
-            e.offno = offno;
             if combined_size <= max_size {
-                e.neighbor_page = blkno;
-                e.neighbor_offno = offno + 1;
+                Placement { blkno, offno, neighbor_page: blkno, neighbor_offno: offno + 1 }
             } else {
-                e.neighbor_page = blkno + 1;
-                e.neighbor_offno = 1;
+                Placement { blkno, offno, neighbor_page: blkno + 1, neighbor_offno: 1 }
             }
-        }
+        };
+        placements[id as usize] = placement;
 
-        serialize_element_tuple(&mut etup, &bs.graph.elems[i]);
-        let e_offno = bs.graph.elems[i].offno;
-        page_add(bs.index, buf, &etup, e_offno)?;
+        serialize_element_tuple(&mut etup, e, placement);
+        page_add(bs.index, buf, &etup, placement.offno)?;
 
         // SAFETY: lock held.
         let free = unsafe {
@@ -678,62 +232,43 @@ fn create_graph_pages(bs: &mut BuildState<'_, '_, '_>) -> PgResult<()> {
         ntup_placeholder.clear();
         ntup_placeholder.resize(ntup_size, 0);
         ntup_placeholder[0] = HNSW_NEIGHBOR_TUPLE_TYPE;
-        let n_offno = bs.graph.elems[i].neighbor_offno;
-        page_add(bs.index, buf, &ntup_placeholder, n_offno)?;
+        page_add(bs.index, buf, &ntup_placeholder, placement.neighbor_offno)?;
     }
 
     let insert_page = bufmgr::BufferGetBlockNumber(buf);
     MarkBufferDirty(buf)?;
     UnlockReleaseBuffer(buf)?;
 
-    let entry = bs.graph.entry_point.map(|ep| {
-        let e = &bs.graph.elems[ep as usize];
-        (e.blkno, e.offno, e.level as i16)
+    let entry = graph.entry_point().map(|ep| {
+        let p = placements[ep as usize];
+        (p.blkno, p.offno, graph.element(ep).level as i16)
     });
-    update_meta_page(
-        bs.index,
-        HNSW_UPDATE_ENTRY_ALWAYS,
-        entry,
-        insert_page,
-        bs.fork_num,
-        true,
-    )
+    update_meta_page(bs.index, HNSW_UPDATE_ENTRY_ALWAYS, entry, insert_page, bs.fork_num, true)?;
+    Ok(placements)
 }
 
-// WriteNeighborTuples.
-fn write_neighbor_tuples(bs: &mut BuildState<'_, '_, '_>) -> PgResult<()> {
+// WriteNeighborTuples (hnswbuild.c:253-298).
+fn write_neighbor_tuples(bs: &BuildState<'_, '_>, graph: &Graph, placements: &[Placement]) -> PgResult<()> {
     let mut ntup: Vec<u8> = Vec::new();
     // Same head-list walk as create_graph_pages: duplicates have no tuples.
-    let order: Vec<usize> = bs.graph.head.iter().rev().map(|&e| e as usize).collect();
-    for i in order {
+    for id in graph.head_newest_first() {
         postgres_seams::check_for_interrupts::call()?;
-        let (neighbor_page, neighbor_offno, ntup_size) = {
-            let e = &bs.graph.elems[i];
-            (
-                e.neighbor_page,
-                e.neighbor_offno,
-                neighbor_tuple_size(e.level, bs.m),
-            )
-        };
-        serialize_neighbor_tuple(&mut ntup, &bs.graph, &bs.graph.elems[i], bs.m);
+        let e = graph.element(id);
+        let p = placements[id as usize];
+        let ntup_size = neighbor_tuple_size(e.level, bs.m);
+        serialize_neighbor_tuple(&mut ntup, e, placements, bs.m);
         let buf = bufmgr::ReadBufferExtended(
             bs.index,
             bs.fork_num,
-            neighbor_page,
+            p.neighbor_page,
             types_storage::storage::ReadBufferMode::Normal,
             None,
         )?;
         LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE)?;
         // SAFETY: exclusive lock held.
-        let mut pm = unsafe {
-            PageMut::from_raw(bufmgr_seams::buffer_get_page::call(buf))
-        };
-        if !pm.index_tuple_overwrite(neighbor_offno, &ntup[..ntup_size]) {
-            return Err(PgError::error(format!(
-                "failed to add index item to \"{}\"",
-                bs.index.name()
-            ))
-            .into());
+        let mut pm = unsafe { PageMut::from_raw(bufmgr_seams::buffer_get_page::call(buf)) };
+        if !pm.index_tuple_overwrite(p.neighbor_offno, &ntup[..ntup_size]) {
+            return Err(PgError::error(format!("failed to add index item to \"{}\"", bs.index.name())).into());
         }
         MarkBufferDirty(buf)?;
         UnlockReleaseBuffer(buf)?;
@@ -741,21 +276,27 @@ fn write_neighbor_tuples(bs: &mut BuildState<'_, '_, '_>) -> PgResult<()> {
     Ok(())
 }
 
-fn flush_pages(bs: &mut BuildState<'_, '_, '_>) -> PgResult<()> {
+// FlushPages (hnswbuild.c:303-316), called with the graph's flush lock held
+// exclusively; the graph sets `flushed`.
+fn flush_pages(bs: &BuildState<'_, '_>, graph: &Graph) -> PgResult<()> {
     create_meta_page(bs)?;
-    create_graph_pages(bs)?;
-    write_neighbor_tuples(bs)?;
-    bs.graph.flushed = true;
-    // C resets graphCtx; the arena is dropped with the build state.
-    bs.graph.elems.clear();
-    bs.graph.head.clear();
-    bs.graph.entry_point = None;
-    Ok(())
+    let placements = create_graph_pages(bs, graph)?;
+    write_neighbor_tuples(bs, graph, &placements)
 }
 
-// InsertTuple (build path).
+// HnswSharedMemoryAlloc's errors (hnswbuild.c:671-676).
+fn graph_error(e: GraphError) -> Box<PgError> {
+    let (message, line) = match e {
+        GraphError::AllocationTooLarge => ("hnsw allocation too large", 672),
+        GraphError::OutOfMemory => ("hnsw allocator out of memory", 676),
+    };
+    PgError::error(message).with_location("hnswbuild.c", line, "HnswSharedMemoryAlloc").into()
+}
+
+// InsertTuple (hnswbuild.c:485-580): form and check the value, then the
+// graph's in-memory insert, or the on-disk insert once the graph is flushed.
 fn insert_tuple(
-    bs: &mut BuildState<'_, '_, '_>,
+    bs: &mut BuildState<'_, '_>,
     values: &[Datum],
     isnull: &[bool],
     heaptid: &ItemPointerData,
@@ -764,95 +305,76 @@ fn insert_tuple(
         return Ok(false);
     }
     let tmp = mcx::MemoryContext::new_bump("Hnsw build temporary context");
-    let tmcx = tmp.mcx();
     let mut support = bs.support.clone();
-    let Some(img) = form_index_value(tmcx, values[0], bs.type_info, &mut support)? else {
+
+    // Form index value
+    let Some(img) = form_index_value(tmp.mcx(), values[0], bs.type_info, &mut support)? else {
         bs.support = support;
         return Ok(false);
     };
-    bs.support = support;
 
-    // Check dimensions match index (hnswbuild.c:503-504): the column typmod.
-    hnsw_check_dim(
-        bs.dimensions,
-        bs.type_info,
-        bs.support.collation,
-        Datum::from_usize(img.as_ptr() as usize),
-    )?;
+    // Check dimensions match index
+    hnsw_check_dim(bs.dimensions, bs.type_info, support.collation, Datum::from_usize(img.as_ptr() as usize))?;
 
-    if bs.graph.flushed {
-        let mut support = bs.support.clone();
-        let r = insert_tuple_on_disk(bs.index, bs.type_info, &mut support, &img, heaptid, true);
-        bs.support = support;
-        return r.map(|_| true);
-    }
-
-    // C checks memoryUsed (+ zero serial margin) against memoryTotal BEFORE
-    // HnswInitElement draws the level, so the PRNG stream is not consumed by
-    // a tuple that diverts to the on-disk path at the flush transition.
-    if bs.graph.memory_used >= bs.graph.memory_total {
-        if !bs.graph.flushed {
+    let state: &BuildState<'_, '_> = bs;
+    let params = InsertParams { m: state.m, ef_construction: state.ef_construction };
+    let inserted = state.graph.insert(
+        &img,
+        ipd_to_bytes(heaptid),
+        &params,
+        || random_level(state.ml, state.max_level),
+        &mut |a: &[u8], b: &[u8]| {
+            get_distance(&mut support, Datum::from_usize(a.as_ptr() as usize), Datum::from_usize(b.as_ptr() as usize))
+        },
+        |graph| {
             elog::ereport(NOTICE)
                 .errmsg(format!(
                     "hnsw graph no longer fits into maintenance_work_mem after {} tuples",
-                    bs.graph.indtuples as i64
+                    graph.indtuples() as i64
                 ))
                 .errdetail("Building will take significantly more time.".to_string())
                 .errhint("Increase maintenance_work_mem to speed up builds.".to_string())
-                .finish(types_error::ErrorLocation::new(file!(), line!() as i32, "InsertTuple"))?;
-            flush_pages(bs)?;
+                .finish(types_error::ErrorLocation::new("hnswbuild.c", 545, "InsertTuple"))?;
+            flush_pages(state, graph)
+        },
+    );
+    let r = match inserted {
+        Ok(Inserted::InMemory) => Ok(true),
+        Ok(Inserted::OnDisk) => {
+            insert_tuple_on_disk(state.index, state.type_info, &mut support, &img, heaptid, true).map(|_| true)
         }
-        let mut support = bs.support.clone();
-        let r = insert_tuple_on_disk(bs.index, bs.type_info, &mut support, &img, heaptid, true);
-        bs.support = support;
-        return r.map(|_| true);
-    }
-
-    // Memory accounting mirrors HnswMemoryContextAlloc: element struct +
-    // neighbor arrays + value image, approximated by allocation sizes.
-    let level = random_level(bs.ml, bs.max_level);
-    let mut neighbors_bytes = 0usize;
-    for lc in 0..=level as i32 {
-        neighbors_bytes +=
-            hnsw_get_layer_m(bs.m, lc) as usize * core::mem::size_of::<MemCandidate>() + 16;
-    }
-    let elem_bytes = core::mem::size_of::<MemElement<'_>>() + neighbors_bytes + img.len();
-    bs.graph.memory_used += elem_bytes;
-
-    let gmcx = bs.graph.mcx;
-    let mut value: PgVec<'_, u8> = mcx::vec_with_capacity_in_infallible(gmcx, img.len());
-    let _ = mcx::vec_append_bytes(&mut value, &img);
-
-    let mut neighbors: Vec<MemNeighborArray> = Vec::with_capacity(level as usize + 1);
-    for _ in 0..=level as i32 {
-        neighbors.push(MemNeighborArray { items: Vec::new(), closer_set: false });
-    }
-    let mut heaptids = [ItemPointerData::invalid(); HNSW_HEAPTIDS];
-    heaptids[0] = *heaptid;
-    bs.graph.elems.push(MemElement {
-        heaptids,
-        heaptids_len: 1,
-        level,
-        version: 1,
-        value,
-        neighbors,
-        blkno: INVALID_BLOCK,
-        offno: INVALID_OFFSET,
-        neighbor_page: INVALID_BLOCK,
-        neighbor_offno: INVALID_OFFSET,
-    });
-    let element = (bs.graph.elems.len() - 1) as u32;
-
-    insert_tuple_in_memory(bs, element)?;
-    Ok(true)
+        Err(InsertError::Callback(e)) => Err(e),
+        Err(InsertError::Graph(e)) => Err(graph_error(e)),
+    };
+    bs.support = support;
+    r
 }
 
-fn init_build_state<'a, 'g, 'mcx>(
+// BuildCallback (hnswbuild.c:585-612).
+fn build_callback(
+    bs: &mut BuildState<'_, '_>,
+    values: &[Datum],
+    isnull: &[bool],
+    tid: &ItemPointerData,
+) -> PgResult<()> {
+    // Insert tuple (nulls are skipped there)
+    if insert_tuple(bs, values, isnull, tid)? {
+        // Update progress
+        let indtuples = bs.graph.add_indtuple();
+        backend_progress::pgstat_progress_update_param(
+            backend_progress::progress::PROGRESS_CREATEIDX_TUPLES_DONE,
+            indtuples as i64,
+        );
+    }
+    Ok(())
+}
+
+fn init_build_state<'a, 'mcx>(
     heap: Option<&'a Relation<'mcx>>,
     index: &'a Relation<'mcx>,
     fork_num: ForkNumber,
-    gmcx: Mcx<'g>,
-) -> PgResult<BuildState<'a, 'g, 'mcx>> {
+    graph: &'a Graph,
+) -> PgResult<BuildState<'a, 'mcx>> {
     // InitBuildState (hnswbuild.c:686-745).
     let type_info = hnsw_get_type_info(index)?;
     let m = hnsw_get_m(index);
@@ -903,16 +425,7 @@ fn init_build_state<'a, 'g, 'mcx>(
         ml: hnsw_get_ml(m),
         max_level: hnsw_get_max_level(m),
         support,
-        graph: Graph {
-            mcx: gmcx,
-            elems: Vec::new(),
-            head: Vec::new(),
-            entry_point: None,
-            memory_used: 0,
-            memory_total: init_small::globals::maintenance_work_mem() as usize * 1024,
-            flushed: false,
-            indtuples: 0.0,
-        },
+        graph,
         reltuples: 0.0,
     })
 }
@@ -941,6 +454,37 @@ fn parse_build_seed(value: Option<String>) -> Option<u64> {
     value.and_then(|v| v.trim().parse::<u64>().ok())
 }
 
+// The serial scan: table_index_build_scan with BuildCallback
+// (hnswbuild.c:1111-1113).
+fn serial_scan<'mcx>(
+    bs: &mut BuildState<'_, 'mcx>,
+    mcx: Mcx<'mcx>,
+    heap: &Relation<'mcx>,
+    index_info: &mut IndexInfo<'mcx>,
+) -> PgResult<f64> {
+    let index = bs.index;
+    let mut inner_err: Option<Box<PgError>> = None;
+    let reltuples = execindexing::table_index_build_scan(
+        mcx,
+        heap,
+        index,
+        index_info,
+        true,
+        /* progress */ true,
+        |_index_rel, tid, values, isnull, _alive| {
+            build_callback(bs, values, isnull, tid).map_err(|e| {
+                inner_err = Some(e);
+                PgError::error("hnsw build insert failed").into()
+            })
+        },
+    );
+    match reltuples {
+        Ok(n) => Ok(n),
+        Err(e) => Err(inner_err.unwrap_or(e)),
+    }
+}
+
+// BuildIndex (hnswbuild.c:1131-1146) and BuildGraph (hnswbuild.c:1092-1125).
 fn build_index<'mcx>(
     mcx: Mcx<'mcx>,
     heap: Option<&Relation<'mcx>>,
@@ -948,61 +492,39 @@ fn build_index<'mcx>(
     index_info: Option<&mut IndexInfo<'mcx>>,
     fork_num: ForkNumber,
 ) -> PgResult<IndexBuildResult> {
-    // BuildIndex (hnswbuild.c:1134-1136): SeedRandom before InitBuildState.
+    // SeedRandom before InitBuildState (hnswbuild.c:1134-1136).
     if let Some(seed) = hnsw_build_seed() {
         seed_random(seed);
     }
-    let graph_ctx = mcx::MemoryContext::new_bump("Hnsw build graph context");
-    let gmcx = graph_ctx.mcx();
-    let mut bs = init_build_state(heap, index, fork_num, gmcx)?;
+    // InitBuildState's graph: memoryTotal = maintenance_work_mem * 1024
+    // (hnswbuild.c:727).
+    let graph = Graph::new(Accounting::serial(
+        (init_small::globals::maintenance_work_mem().max(0) as usize).saturating_mul(1024),
+    ));
+    let mut bs = init_build_state(heap, index, fork_num, &graph)?;
 
+    backend_progress::pgstat_progress_update_param(
+        backend_progress::progress::PROGRESS_CREATEIDX_SUBPHASE,
+        PROGRESS_HNSW_PHASE_LOAD,
+    );
+
+    // Add tuples to graph
+    let mut indtuples = 0.0;
     if let (Some(heap), Some(index_info)) = (bs.heap, index_info) {
-        let mut inner_err: Option<Box<PgError>> = None;
-        // BuildState is threaded via raw pointer: the callback is FnMut and
-        // borrows would alias bs.
-        let bs_ptr: *mut BuildState<'_, '_, 'mcx> = &mut bs;
-        let reltuples = execindexing::table_index_build_scan(
-            mcx,
-            heap,
-            index,
-            index_info,
-            true,
-            /* progress */ true,
-            |_index_rel, tid, values, isnull, _alive| {
-                // SAFETY: single-threaded serial build; bs outlives the scan.
-                let bs = unsafe { &mut *bs_ptr };
-                match insert_tuple(bs, values, isnull, tid) {
-                    Ok(true) => {
-                        bs.graph.indtuples += 1.0;
-                        Ok(())
-                    }
-                    Ok(false) => Ok(()),
-                    Err(e) => {
-                        inner_err = Some(e);
-                        Err(PgError::error("hnsw build insert failed").into())
-                    }
-                }
-            },
-        );
-        match reltuples {
-            Ok(n) => bs.reltuples = n,
-            Err(e) => return Err(inner_err.unwrap_or(e)),
-        }
+        bs.reltuples = serial_scan(&mut bs, mcx, heap, index_info)?;
+        indtuples = graph.indtuples();
     }
 
-    if !bs.graph.flushed {
-        flush_pages(&mut bs)?;
-    }
+    // Flush pages
+    graph.flush_if_needed(|g| flush_pages(&bs, g))?;
 
+    // Write WAL for initialization fork since GenericXLog functions do not
     if relation_needs_wal(index) || fork_num == ForkNumber::INIT_FORKNUM {
         let nblocks = bufmgr::RelationGetNumberOfBlocksInFork(index, fork_num)?;
         xloginsert::log_newpage_range(index, fork_num, 0, nblocks, true)?;
     }
 
-    Ok(IndexBuildResult {
-        heap_tuples: bs.reltuples,
-        index_tuples: bs.graph.indtuples,
-    })
+    Ok(IndexBuildResult { heap_tuples: bs.reltuples, index_tuples: indtuples })
 }
 
 pub fn hnswbuild<'mcx>(
@@ -1034,104 +556,23 @@ mod tests {
         assert_eq!(parse_build_seed(Some("abc".to_string())), None);
     }
 
-    // C HnswUpdateConnection mutates neighbors->items[i].closer through the
-    // shared candidate-list pointers; these tests pin that the in-memory port
-    // writes the computed closer flags (and the flagged newHc) back into the
-    // neighbor array instead of leaving stale flags for later pruning.
-
-    fn support() -> HnswSupport {
-        HnswSupport {
-            procinfo: types_fmgr::FmgrInfo::new(
-                pgvector::funcs::fc_vector_l2_squared_distance,
-                1,
-                2,
-                true,
-                false,
-            ),
-            normprocinfo: None,
-            collation: 0,
-        }
-    }
-
-    fn graph_1d<'g>(mcx: Mcx<'g>, xs: &[f32]) -> Graph<'g> {
-        let mut elems = Vec::new();
-        for &x in xs {
-            let mut b = pgvector::vec::VecBuilder::new(mcx, 1).unwrap();
-            b.set(0, x);
-            elems.push(MemElement {
-                heaptids: [ItemPointerData::invalid(); HNSW_HEAPTIDS],
-                heaptids_len: 0,
-                level: 0,
-                version: 1,
-                value: b.image(),
-                neighbors: Vec::new(),
-                blkno: INVALID_BLOCK,
-                offno: INVALID_OFFSET,
-                neighbor_page: INVALID_BLOCK,
-                neighbor_offno: INVALID_OFFSET,
-            });
-        }
-        Graph {
-            mcx,
-            elems,
-            head: Vec::new(),
-            entry_point: None,
-            memory_used: 0,
-            memory_total: usize::MAX,
-            flushed: false,
-            indtuples: 0.0,
-        }
-    }
-
-    // New candidate survives selection: the pruned slot is replaced by the
-    // newHc carrying its computed closer=true, and the surviving original
-    // neighbor's recomputed closer=true is written back.
+    // C's seeded build (-DHNSW_MEMORY's SeedRandom(42), hnswbuild.c:1134-1136)
+    // of bytecmp's `spill` rows (vector(3), 20-byte values, m = 16) at
+    // maintenance_work_mem = 1MB prints "hnsw graph no longer fits into
+    // maintenance_work_mem after 1436 tuples". The serial accounting must
+    // flush at the same tuple, testing before each tuple's level draw as C
+    // does (hnswbuild.c:533, 552-556).
     #[test]
-    fn update_connection_writes_back_closer_flags_on_replace() {
-        let owner = mcx::MemoryContext::new_bump("test");
-        let mcx = owner.mcx();
-        // element 0 at 1.0, element 1 at 1.1, element 2 (new) at -1.05;
-        // owner is conceptually at 0.0, distances squared below.
-        let graph = graph_1d(mcx, &[1.0, 1.1, -1.05]);
-        let mut sp = support();
-        // Stale flags deliberately wrong (false); C recomputes in place.
-        let mut neighbors = vec![
-            MemCandidate { element: 0, distance: 1.0, closer: false },
-            MemCandidate { element: 1, distance: 1.21, closer: false },
-        ];
-        let mut closer_set = false;
-        update_connection_mem(&graph, &mut sp, &mut neighbors, &mut closer_set, 2, 1.1025, 2)
-            .unwrap();
-        assert!(closer_set, "sortCandidates=true sets closerSet");
-        // Selection keeps 0 (closer) and new 2 (closer vs {0}: d(2,0)^2=4.2 > 1.1025);
-        // 1 is never popped (r fills first), pruned = leftover 1 → replaced by newHc.
-        let flags: Vec<(u32, bool)> =
-            neighbors.iter().map(|n| (n.element, n.closer)).collect();
-        assert_eq!(flags, vec![(0, true), (2, true)]);
-    }
-
-    // New candidate is itself pruned (kept-neighbor case): no replacement,
-    // but the surviving array must carry the freshly computed flags —
-    // including a false flag for the not-closer neighbor (wd-kept).
-    #[test]
-    fn update_connection_writes_back_closer_flags_without_replace() {
-        let owner = mcx::MemoryContext::new_bump("test");
-        let mcx = owner.mcx();
-        // 0 at 1.0, 1 at 1.1, new 2 at 1.2: 1 and 2 are both not-closer to 0;
-        // wd-fill keeps 1, prunes the new candidate 2.
-        let graph = graph_1d(mcx, &[1.0, 1.1, 1.2]);
-        let mut sp = support();
-        // Stale flags deliberately wrong (true).
-        let mut neighbors = vec![
-            MemCandidate { element: 0, distance: 1.0, closer: true },
-            MemCandidate { element: 1, distance: 1.21, closer: true },
-        ];
-        let mut closer_set = false;
-        update_connection_mem(&graph, &mut sp, &mut neighbors, &mut closer_set, 2, 1.44, 2)
-            .unwrap();
-        assert!(closer_set);
-        let flags: Vec<(u32, bool)> =
-            neighbors.iter().map(|n| (n.element, n.closer)).collect();
-        assert_eq!(flags, vec![(0, true), (1, false)]);
+    fn serial_flush_point_matches_c_at_one_megabyte() {
+        seed_random(42);
+        let m = 16;
+        let (ml, max_level) = (hnsw_get_ml(m), hnsw_get_max_level(m));
+        let mut accounting = pgvector_hnsw_graph::Accounting::serial(1024 * 1024);
+        let mut tuples = 0;
+        while !accounting.is_full() {
+            accounting.charge_element(random_level(ml, max_level), m, 20).unwrap();
+            tuples += 1;
+        }
+        assert_eq!(tuples, 1436);
     }
 }

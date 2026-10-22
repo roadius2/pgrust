@@ -28,6 +28,8 @@ elog = { path = "../../backend/utils/error/elog" }
 postgres_seams = { path = "../../backend/tcop/postgres_seams" }
 pgvector_hnsw = { path = "../pgvector_hnsw" }
 guc_seams = { path = "../../backend/utils/misc/guc_seams" }
+pgvector_hnsw_graph = { path = "../pgvector_hnsw_graph" }
+backend_progress = { path = "../../backend/utils/activity/backend_progress" }
 
 [dev-dependencies]
 pgvector = { path = "../pgvector" }
