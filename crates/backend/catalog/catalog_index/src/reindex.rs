@@ -347,7 +347,7 @@ pub fn reindex_index<'mcx>(
         indexam::index_close(iRel, NoLock)?;
         let iRel = indexam::index_open(mcx, indexId, NoLock)?;
 
-        crate::index_build(mcx, &heapRelation, &iRel, &mut indexInfo, true)?;
+        crate::index_build(mcx, &heapRelation, &iRel, &mut indexInfo, true, true)?;
         Ok(iRel)
     })();
     types_rel::reindex::reset_reindex_processing();

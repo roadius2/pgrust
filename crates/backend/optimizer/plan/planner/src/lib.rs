@@ -16,6 +16,7 @@ pub mod flatten_group;
 pub mod grouping;
 pub mod groupingsets;
 pub mod indxpath;
+pub mod index_workers;
 mod tidpath;
 mod inherit;
 pub use inherit::get_rel_all_updated_cols;
@@ -150,6 +151,7 @@ pub fn init_seams() {
     planner_seams::planner::set(|mcx, parse, query_string, cursor_options, bound_params| {
         planner(mcx, parse, query_string, cursor_options, bound_params)
     });
+    planner_seams::plan_create_index_workers::set(index_workers::plan_create_index_workers);
     // find_simplified_clause's gate (rangetypes.c): volatile / subplan /
     // >10*cpu_operator_cost elemExprs must not be evaluated twice. Deliberate
     // divergence from rangetypes.c:2910 cost_qual_eval_node(root): with the

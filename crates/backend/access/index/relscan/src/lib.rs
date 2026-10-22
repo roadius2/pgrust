@@ -106,6 +106,27 @@ impl IndexAmKind {
         }
     }
 
+    /// amcanbuildparallel (amapi.h:274). C sets it for btree (nbtree.c:137),
+    /// GIN (ginutil.c:60), BRIN (brin.c:272) and both pgvector AMs
+    /// (hnsw.c:351, ivfflat.c:268). DIVERGENCE: pgrust builds btree, GIN and
+    /// BRIN serially, so only the vector AMs answer true, and index_build's
+    /// DEBUG1 keeps saying "serially" for the others.
+    pub const fn amcanbuildparallel(self) -> bool {
+        match self {
+            IndexAmKind::Btree => false,
+            IndexAmKind::Hash => false,
+            IndexAmKind::Gin => false,
+            IndexAmKind::Gist => false,
+            IndexAmKind::Spgist => false,
+            IndexAmKind::Brin => false,
+            IndexAmKind::Hnsw => true,
+            IndexAmKind::Ivfflat => true,
+            IndexAmKind::Bloom => false,
+            #[cfg(feature = "mock")]
+            IndexAmKind::Mock => false,
+        }
+    }
+
     /// amclusterable: only btree (nbtree.c bthandler) and GiST (gist.c:78)
     /// let CLUSTER order a heap by the index (cluster.c:512).
     pub const fn amclusterable(self) -> bool {
@@ -656,5 +677,24 @@ mod am_property_tests {
         assert!(k.amcanorderbyop() && !k.amcanorder() && !k.amcanhash());
         assert!(!k.ampredlocks() && !k.amsummarizing() && !k.amsearcharray() && !k.amclusterable());
         assert!(!k.has_ammarkpos() && !k.has_amrestrpos() && !k.amstorage() && !k.has_aminsertcleanup());
+    }
+
+    // amcanbuildparallel (amapi.h:274): only the vector AMs build in parallel
+    // in pgrust (hnsw.c:351, ivfflat.c:268).
+    #[test]
+    fn amcanbuildparallel_is_the_vector_ams_only() {
+        assert!(IndexAmKind::Hnsw.amcanbuildparallel());
+        assert!(IndexAmKind::Ivfflat.amcanbuildparallel());
+        for k in [
+            IndexAmKind::Btree,
+            IndexAmKind::Hash,
+            IndexAmKind::Gin,
+            IndexAmKind::Gist,
+            IndexAmKind::Spgist,
+            IndexAmKind::Brin,
+            IndexAmKind::Bloom,
+        ] {
+            assert!(!k.amcanbuildparallel(), "{k:?}");
+        }
     }
 }

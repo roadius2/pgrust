@@ -333,7 +333,7 @@ pub fn index_concurrently_build<'mcx>(
     indexInfo.ii_Concurrent = true;
     indexInfo.ii_BrokenHotChain = false;
 
-    crate::index_build(mcx, &heapRel, &indexRelation, &mut indexInfo, false)?;
+    crate::index_build(mcx, &heapRel, &indexRelation, &mut indexInfo, false, true)?;
 
     guc::AtEOXact_GUC(false, save_nestlevel);
     guard.restore();

@@ -1054,7 +1054,7 @@ pub fn index_create<'mcx>(
     drop(indexRelation);
     let indexRelation = indexam::index_open(mcx, indexRelationId, NoLock)?;
 
-    index_build(mcx, heapRelation, &indexRelation, indexInfo, false)?;
+    index_build(mcx, heapRelation, &indexRelation, indexInfo, false, true)?;
 
     indexam::index_close(indexRelation, NoLock)?;
     Ok((indexRelationId, constraintId))
@@ -1235,42 +1235,60 @@ pub fn index_constraint_create<'mcx>(
     Ok(con_oid)
 }
 
-// index_build: btree only, serial only (C divergence: plan_create_index_workers
-// is not consulted — every build runs with ii_ParallelWorkers = 0; C picks the
-// same for tables under min_parallel_table_scan_size). The blocker is one
-// level down: C's parallel builds (_bt_begin_parallel, gin's equivalent) hand
-// each worker a tuplesort sharing a SortCoordinate/Sharedsort, and tuplesort
-// here is serial-only — no coordinate surface exists to hand out. Parallel
-// builds wait on a parallel tuplesort.
+// index_build (index.c:3030-3176). DIVERGENCE: C stores the worker count in
+// indexInfo->ii_ParallelWorkers for btree, GIN and BRIN's parallel builds;
+// pgrust builds those serially (IndexAmKind::amcanbuildparallel), and
+// pgvector's AMs ask plan_create_index_workers themselves (hnswbuild.c:1076,
+// ivfbuild.c:987), so the count only picks index.c's DEBUG1 line and
+// IndexInfo has no ii_ParallelWorkers field.
 pub fn index_build<'mcx>(
     mcx: Mcx<'mcx>,
     heapRelation: &Relation<'mcx>,
     indexRelation: &Relation<'mcx>,
     indexInfo: &mut IndexInfo<'mcx>,
     isreindex: bool,
+    parallel: bool,
 ) -> PgResult<()> {
     let am_kind = types_relscan::IndexAmKind::from_relam(indexRelation.rd_rel.relam);
 
-    let guard = miscinit::SecContextGuard::security_restricted(heapRelation.rd_rel.relowner);
-    let save_nestlevel = guc::NewGUCNestLevel();
-    guc::RestrictSearchPath()?;
+    // Determine worker process details for parallel CREATE INDEX. Note that
+    // planner considers parallel safety for us (index.c:3050-3060).
+    let mut parallel_workers = 0;
+    if parallel && miscinit::IsNormalProcessingMode() && am_kind.amcanbuildparallel() {
+        parallel_workers = planner_seams::plan_create_index_workers::call(
+            heapRelation.rd_id,
+            indexRelation.rd_id,
+        )?;
+    }
 
-    // C index.c:3033-3043: report which build path was chosen. Every pgrust
-    // build is serial (ii_ParallelWorkers == 0 always — see the header
-    // comment), so only C's "serially" branch is reachable; the
-    // "with request for %d parallel workers" branch belongs to the
-    // unported parallel-build path. errmsg_internal: not translated.
-    elog_seams::ereport::call(
-        PgError::new(
-            types_error::DEBUG1,
+    // index.c:3062-3072; errmsg_internal: not translated.
+    let (message, line) = if parallel_workers == 0 {
+        (
             format!(
                 "building index \"{}\" on table \"{}\" serially",
                 indexRelation.name(),
                 heapRelation.name()
             ),
+            3066,
         )
-        .with_location("index.c", 3034, "index_build"),
+    } else {
+        (
+            format!(
+                "building index \"{}\" on table \"{}\" with request for {} parallel workers",
+                indexRelation.name(),
+                heapRelation.name(),
+                parallel_workers
+            ),
+            3072,
+        )
+    };
+    elog_seams::ereport::call(
+        PgError::new(types_error::DEBUG1, message).with_location("index.c", line, "index_build"),
     )?;
+
+    let guard = miscinit::SecContextGuard::security_restricted(heapRelation.rd_rel.relowner);
+    let save_nestlevel = guc::NewGUCNestLevel();
+    guc::RestrictSearchPath()?;
 
     // Set up initial progress report status (index.c:3085-3102).
     {
@@ -1592,7 +1610,7 @@ fn index_build_dummy<'mcx>(
     isreindex: bool,
 ) -> types_error::PgResult<()> {
     let mut indexInfo = execindexing::BuildDummyIndexInfo(mcx, index_relation)?;
-    index_build(mcx, heap_relation, index_relation, &mut indexInfo, isreindex)
+    index_build(mcx, heap_relation, index_relation, &mut indexInfo, isreindex, false)
 }
 
 pub fn init_seams() {

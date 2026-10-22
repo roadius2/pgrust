@@ -88,6 +88,7 @@ partbounds = { path = "../../../partitioning/partbounds" }
 partprune = { path = "../../../partitioning/partprune" }
 tableam = { path = "../../../access/table/tableam" }
 tableam_vocab = { path = "../../../access/table/tableam_vocab" }
+execindexing = { path = "../../../executor/execindexing" }
 indexam = { path = "../../../access/index/indexam" }
 procarray = { path = "../../../storage/ipc/procarray" }
 injection_point = { path = "../../../utils/misc/injection_point" }

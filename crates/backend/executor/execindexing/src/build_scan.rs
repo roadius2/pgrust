@@ -1,7 +1,9 @@
 // heapam_index_build_range_scan (heapam_handler.c), serial lane; boundary
 // hoisted above heapam_handler (execindexing already sits above the AM stack
 // — a heapam_handler home would cycle).
-// Loud: concurrent builds, parallel scans.
+// Lanes: SnapshotAny or a concurrent build's MVCC snapshot, block ranges, and a parallel heap scan (heapam_handler.c:1272-1281).
+use std::ptr::NonNull;
+
 use ::datum::Datum;
 use ::mcx::{Mcx, PgVec};
 use ::types_core::{BlockNumber, INDEX_MAX_KEYS, InvalidBlockNumber};
@@ -77,14 +79,22 @@ where
     )
 }
 
-// heapam_scan_get_blocks_done (heapam_handler.c), serial-scan arm: blocks
-// completed so far, wrapping when the scan did not start at block 0.
-fn heapam_scan_get_blocks_done(scan: &heapam::HeapScanDescData<'_>) -> BlockNumber {
-    let startblock = scan.rs_startblock;
+// heapam_scan_get_blocks_done (heapam_handler.c:1987-2022): blocks completed
+// so far, wrapping when the scan did not start at block 0. In a parallel
+// scan, workers can be concurrently reading blocks further ahead than what
+// is reported.
+fn heapam_scan_get_blocks_done(
+    scan: &heapam::HeapScanDescData<'_>,
+    parallel: Option<&tableam_vocab::ParallelBlockTableScanDescData>,
+) -> BlockNumber {
+    let (startblock, nblocks) = match parallel {
+        Some(p) => (p.phs_startblock.load(core::sync::atomic::Ordering::Relaxed), p.phs_nblocks),
+        None => (scan.rs_startblock, scan.rs_nblocks),
+    };
     if scan.rs_cblock > startblock {
         scan.rs_cblock - startblock
     } else {
-        scan.rs_nblocks - startblock + scan.rs_cblock
+        nblocks - startblock + scan.rs_cblock
     }
 }
 
@@ -125,6 +135,7 @@ where
         numblocks,
         hoisted_oldest_xmin,
         None,
+        None,
         callback,
     )
 }
@@ -155,6 +166,40 @@ where
         InvalidBlockNumber,
         None,
         Some(snapshot),
+        None,
+        callback,
+    )
+}
+
+/// table_index_build_scan with a parallel heap scan (C's `scan` argument,
+/// heapam_handler.c:1172-1300): every participant of a parallel build calls
+/// this with the same shared descriptor, which hands out the blocks. A
+/// parallel scan always allows syncscan (heapam_handler.c:1280).
+pub fn table_index_build_scan_parallel<'mcx, F>(
+    mcx: Mcx<'mcx>,
+    heap_relation: &Relation<'mcx>,
+    index_relation: &Relation<'mcx>,
+    index_info: &mut IndexInfo<'mcx>,
+    progress: bool,
+    parallel_scan: &tableam::ParallelTableScanDescShared,
+    callback: F,
+) -> PgResult<f64>
+where
+    F: FnMut(&Relation<'mcx>, &ItemPointerData, &[Datum], &[bool], bool) -> PgResult<()>,
+{
+    build_range_scan_core(
+        mcx,
+        heap_relation,
+        index_relation,
+        index_info,
+        true,
+        false,
+        progress,
+        0,
+        InvalidBlockNumber,
+        None,
+        None,
+        Some(parallel_scan),
         callback,
     )
 }
@@ -172,6 +217,7 @@ fn build_range_scan_core<'mcx, F>(
     numblocks: BlockNumber,
     hoisted_oldest_xmin: Option<types_core::TransactionId>,
     snapshot: Option<&snapmgr::Snapshot>,
+    parallel_scan: Option<&tableam::ParallelTableScanDescShared>,
     mut callback: F,
 ) -> PgResult<f64>
 where
@@ -192,8 +238,23 @@ where
     );
 
     // Concurrent builds scan under a registered MVCC snapshot; OldestXmin is
-    // only for the SnapshotAny lane's HTSV routing.
-    let (registered, owned) = if let Some(snap) = snapshot {
+    // only for the SnapshotAny lane's HTSV routing. A parallel scan carries
+    // its snapshot (heapam_handler.c:1272-1281): SnapshotAny, or the leader's
+    // MVCC snapshot, restored and registered for this scan the way
+    // table_beginscan_parallel does (its SO_TEMP_SNAPSHOT), and dropped at
+    // the end.
+    let (registered, owned) = if let Some(p) = parallel_scan {
+        debug_assert!(allow_sync);
+        // heapam_handler.c:1293: SnapshotAny exactly when OldestXmin is used.
+        debug_assert!(p.pscan.phs_snapshot_any != concurrent);
+        match p.snapshot.as_ref() {
+            Some(serialized) if !p.pscan.phs_snapshot_any => {
+                let snap = snapmgr::RestoreSnapshot(serialized);
+                (Some(snapmgr::RegisterSnapshot(Some(&snap))?.expect("registered snapshot")), true)
+            }
+            _ => (None, false),
+        }
+    } else if let Some(snap) = snapshot {
         (Some(snap.clone()), false)
     } else if concurrent {
         let snap = snapmgr::GetTransactionSnapshot()?;
@@ -234,7 +295,7 @@ where
         registered.clone(), // None is SnapshotAny
         0,
         PgVec::new_in(mcx),
-        None,
+        parallel_scan.map(|p| NonNull::from(&p.pscan)),
         flags,
     )?;
 
@@ -243,7 +304,7 @@ where
     if progress {
         backend_progress_seams::pgstat_progress_update_param::call(
             PROGRESS_SCAN_BLOCKS_TOTAL,
-            i64::from(scan.rs_nblocks),
+            i64::from(parallel_scan.map_or(scan.rs_nblocks, |p| p.pscan.phs_nblocks)),
         );
     }
 
@@ -277,7 +338,7 @@ where
 
         // heapam_handler.c:1338-1348: report scan progress, if asked to.
         if progress {
-            let blocks_done = heapam_scan_get_blocks_done(&scan);
+            let blocks_done = heapam_scan_get_blocks_done(&scan, parallel_scan.map(|p| &p.pscan));
             if blocks_done != previous_blkno {
                 backend_progress_seams::pgstat_progress_update_param::call(
                     PROGRESS_SCAN_BLOCKS_DONE,
@@ -456,7 +517,7 @@ where
     if progress {
         backend_progress_seams::pgstat_progress_update_param::call(
             PROGRESS_SCAN_BLOCKS_DONE,
-            i64::from(scan.rs_nblocks),
+            i64::from(parallel_scan.map_or(scan.rs_nblocks, |p| p.pscan.phs_nblocks)),
         );
     }
 

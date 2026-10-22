@@ -18,6 +18,7 @@ pg_inherits = { path = "../pg_inherits" }
 tablecmds_seams = { path = "../../commands/tablecmds_seams" }
 rewrite_manip = { path = "../../rewrite/rewrite_manip" }
 datum = { path = "../../../_support/types/datum" }
+planner_seams = { path = "../../optimizer/plan/planner_seams" }
 execindexing = { path = "../../executor/execindexing" }
 elog = { path = "../../utils/error/elog" }
 fmgr_seams = { path = "../../utils/fmgr/fmgr_seams" }

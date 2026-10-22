@@ -23,6 +23,13 @@ seam_core::seam!(
     ) -> PgResult<PlannedStmt<'mcx>>
 );
 
+seam_core::seam!(
+    // plan_create_index_workers (planner.c:7114): index_build's worker count
+    // (index.c:3056-3060) and pgvector's builds' (hnswbuild.c:1076,
+    // ivfbuild.c:987).
+    pub fn plan_create_index_workers(table_oid: Oid, index_oid: Oid) -> PgResult<i32>
+);
+
 /// amcostestimate output shape (C fills the out-params of the AM handler).
 pub struct AmCostEstimate {
     pub index_startup_cost: f64,
