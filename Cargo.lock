@@ -14134,6 +14134,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgvector_parallel"
+version = "0.0.0"
+dependencies = [
+ "backend_status",
+ "elog",
+ "guc_tables",
+ "indexam",
+ "init_small",
+ "latch",
+ "lmgr_proc",
+ "mcx",
+ "parallel",
+ "planner_seams",
+ "snapmgr",
+ "table",
+ "tableam",
+ "types_core",
+ "types_error",
+ "types_rel",
+ "xact",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"

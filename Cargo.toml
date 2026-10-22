@@ -736,6 +736,7 @@ members = [
     "crates/_support/types/types_ivfflat",
     "crates/contrib/pgvector_ivfflat",
     "crates/contrib/pgvector_ivfflat_build",
+    "crates/contrib/pgvector_parallel",
     "crates/contrib/hstore",
     "crates/contrib/pg_trgm",
     "crates/contrib/btree_gin",

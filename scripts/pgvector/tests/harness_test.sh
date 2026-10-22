@@ -1080,6 +1080,31 @@ test_ondisk_capture_check() {
   rm -rf "$nopm"
 }
 
+# sqldiff drops a parallel build's per-participant lines (their counts and
+# order vary run to run, C against C), so two C servers agree on a forced
+# parallel IVFFlat build; the transcript still shows the build went parallel.
+test_sqldiff_parallel_counts() {
+  local log="$PGV_WORK/sqldiff-parallel.log"
+  if "$here/../sqldiff.sh" ref - >"$log" 2>&1 <<'SQL'; then
+CREATE TABLE t (id int, v vector(3));
+INSERT INTO t SELECT i, ARRAY[i % 7, i % 11, i % 13] FROM generate_series(1, 20000) i;
+SET min_parallel_table_scan_size = 1;
+SET client_min_messages = debug1;
+CREATE INDEX ON t USING ivfflat (v vector_l2_ops) WITH (lists = 10);
+RESET client_min_messages;
+SQL
+    pass "sqldiff: parallel builds compare equal"
+  else
+    fail "sqldiff: parallel builds compare equal (see $log)"
+  fi
+  if grep -q 'using 1 parallel workers' "$PGV_WORK/sqldiff/ref/ref.out" &&
+    ! grep -Eq 'processed [0-9]+ tuples|CONTEXT:  parallel worker' "$PGV_WORK/sqldiff/ref/ref.out"; then
+    pass "sqldiff: parallel build kept, participant lines dropped"
+  else
+    fail "sqldiff: parallel build kept, participant lines dropped (see $PGV_WORK/sqldiff/ref/ref.out)"
+  fi
+}
+
 # --- runner ---
 if [ "$#" -eq 0 ]; then
   # Declaration order (declare -F would sort): a test may read the results of

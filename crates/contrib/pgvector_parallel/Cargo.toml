@@ -1,0 +1,32 @@
+[package]
+name = "pgvector_parallel"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+# pgvector's parallel-build plumbing (hnswbuild.c and ivfbuild.c's
+# *BeginParallel, *EndParallel and *ParallelBuildMain prologue), shared by
+# pgvector_hnsw_build and pgvector_ivfflat_build (M6).
+
+[lib]
+name = "pgvector_parallel"
+path = "src/lib.rs"
+
+[dependencies]
+mcx = { path = "../../_support/mcx" }
+types_core = { path = "../../_support/types/types_core" }
+types_error = { path = "../../_support/types/types_error" }
+types_rel = { path = "../../_support/types/rel" }
+parallel = { path = "../../backend/access/transam/parallel" }
+xact = { path = "../../backend/access/transam/xact" }
+snapmgr = { path = "../../backend/utils/time/snapmgr" }
+tableam = { path = "../../backend/access/table/tableam" }
+table = { path = "../../backend/access/table/table" }
+indexam = { path = "../../backend/access/index/indexam" }
+elog = { path = "../../backend/utils/error/elog" }
+backend_status = { path = "../../backend/utils/activity/backend_status" }
+planner_seams = { path = "../../backend/optimizer/plan/planner_seams" }
+guc_tables = { path = "../../backend/utils/misc/guc_tables" }
+latch = { path = "../../backend/storage/ipc/latch" }
+lmgr_proc = { path = "../../backend/storage/lmgr/lmgr_proc" }
+init_small = { path = "../../backend/utils/init/init_small" }

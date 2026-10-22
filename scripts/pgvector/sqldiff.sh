@@ -26,6 +26,19 @@ strip_seeded_info() {
     { skip = 0; print }' "$1" >"$1.tmp"
   mv "$1.tmp" "$1"
 }
+
+# A parallel build prints one "leader processed N tuples" / "worker processed
+# N tuples" DEBUG1 line per participant (hnswbuild.c:826-830,
+# ivfbuild.c:707-711), and every message a worker sends carries
+# "CONTEXT:  parallel worker" (parallel.c:1179-1186). The counts and the order
+# vary run to run, C against C, and which participant raises a NOTICE or an
+# ERROR is not fixed, so drop both kinds of line before comparing.
+strip_parallel_participants() {
+  awk '/^psql:[^:]*:[0-9]+: DEBUG:  (leader|worker) processed [0-9]+ tuples$/ { next }
+    /^CONTEXT:  parallel worker$/ { next }
+    { print }' "$1" >"$1.tmp"
+  mv "$1.tmp" "$1"
+}
 [ "$#" -ge 2 ] || usage
 mode="$1"
 shift
@@ -57,6 +70,7 @@ for side in ref "$subject"; do
   pgv_psql "$port" -c 'CREATE EXTENSION vector' >/dev/null
   (cd "$out" && pgv_psql "$port" -a -v ON_ERROR_STOP=0 -f input.sql) >"$out/$side.out" 2>&1 || true
   strip_seeded_info "$out/$side.out"
+  strip_parallel_participants "$out/$side.out"
   server_stop "$side"
   [ "${PGV_KEEP_DATA:-}" = 1 ] || rm -rf "$out/data/$side"
 done
