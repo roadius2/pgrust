@@ -1,0 +1,24 @@
+[package]
+name = "pgvector_hnsw_graph"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+# pgvector's in-memory HNSW build graph and its lock protocol, shared by the
+# serial and parallel builds (M6). Only pgsync and pairingheap: tests/loom.rs
+# compiles this crate's whole dependency cone under --cfg loom, and backend
+# crates' statics do not build there.
+
+[lib]
+name = "pgvector_hnsw_graph"
+path = "src/lib.rs"
+
+[dependencies]
+pgsync = { path = "../../_support/pgsync" }
+pairingheap = { path = "../../backend/lib/pairingheap" }
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

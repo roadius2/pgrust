@@ -14072,6 +14072,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgvector_hnsw_graph"
+version = "0.0.0"
+dependencies = [
+ "loom",
+ "pairingheap",
+ "pgsync",
+]
+
+[[package]]
 name = "pgvector_ivfflat"
 version = "0.0.0"
 dependencies = [
