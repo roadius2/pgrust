@@ -8,11 +8,11 @@
 //! and the leader merges the tapes through a SharedFileSet (ivfbuild.c:661-720,
 //! 994-1000). pgrust's Tuplesort is thread-affine (nbtsort/src/pool.rs:20-44),
 //! so each worker assigns its rows to their nearest center and sends
-//! (list, tid, value) batches to the leader, which feeds its one sort. List
-//! membership is C's. The order within a list differs, which C's own sort,
-//! keyed on the list only (ivfbuild.c:612-621), does not fix either. The
-//! parallel phase ends after the scan: there are no shared tapes to keep
-//! alive through the load.
+//! (list, tid, value) batches to the leader through its own mailbox, and the
+//! leader feeds them to its one sort. List membership is C's. The order within
+//! a list differs, which C's own sort, keyed on the list only
+//! (ivfbuild.c:612-621), does not fix either. The parallel phase ends after
+//! the scan: there are no shared tapes to keep alive through the load.
 
 use std::sync::Arc;
 
@@ -32,11 +32,12 @@ use crate::{add_tuple_to_sort, assign_tuple, init_build_state, BuildState};
 const ENTRY_NAME: &str = "pgrust_ivfflat_parallel_build_main";
 /// A worker sends its batch once the values reach this many bytes.
 const BATCH_BYTES: usize = 64 * 1024;
-/// Batches in flight before a worker waits for the leader.
+/// Batches in flight in a worker's mailbox before the worker waits for the
+/// leader.
 const MAILBOX_BATCHES: usize = 64;
 
 /// IvfflatShared (ivfflat.h:151-173), the centers (PARALLEL_KEY_IVFFLAT_CENTERS)
-/// and the rows' channel to the leader.
+/// and each worker's channel to the leader.
 struct IvfflatShared {
     heaprelid: Oid,
     indexrelid: Oid,
@@ -44,7 +45,11 @@ struct IvfflatShared {
     pscan: ParallelTableScanDescShared,
     /// The leader's centers->items (ivfbuild.c:925-926), `itemsize` bytes per list.
     centers: Vec<u8>,
-    rows: MailboxSender<AssignBatch>,
+    /// One mailbox per worker, indexed by ParallelWorkerNumber. A pgsync
+    /// mailbox wakes one parked sender (its single sender_wake slot): workers
+    /// sharing one mailbox could each wait on it while full, and a pop would
+    /// wake only the last of them.
+    rows: Vec<MailboxSender<AssignBatch>>,
     /// The leader's ProcNumber, to wake it when rows arrive or a worker finishes.
     leader: usize,
     query_text: Option<String>,
@@ -129,7 +134,10 @@ pub(crate) fn assign_tuples_parallel<'mcx>(
     for i in 0..bs.centers.maxlen {
         centers.extend_from_slice(bs.centers.get(i)?);
     }
-    let (rows, receiver) = mailbox(Some(MAILBOX_BATCHES));
+    // One mailbox per worker (IvfflatShared::rows); a worker that does not
+    // launch never sends to its own.
+    let (rows, receivers): (Vec<_>, Vec<_>) =
+        (0..request).map(|_| mailbox(Some(MAILBOX_BATCHES))).unzip();
     let Some((leader, shared)) = pgvector_parallel::begin_parallel(
         ENTRY_NAME,
         ivfflat_parallel_build_main,
@@ -159,7 +167,7 @@ pub(crate) fn assign_tuples_parallel<'mcx>(
     // IvfflatLeaderParticipateAsWorker (ivfbuild.c:813-830): the leader's own
     // rows go straight into its sort, and the workers' batches are fed in
     // between them.
-    leader_scan(bs, mcx, heap, index_info, &shared, &receiver)?;
+    leader_scan(bs, mcx, heap, index_info, &shared, &receivers)?;
 
     // ivfbuild.c:971
     parallel::WaitForParallelWorkersToAttach(leader.pcxt)?;
@@ -169,14 +177,14 @@ pub(crate) fn assign_tuples_parallel<'mcx>(
     // check_for_interrupts here.
     let sort = bs.sortstate.as_mut().expect("sort state");
     loop {
-        drain(&receiver, sort)?;
+        drain(&receivers, sort)?;
         let (done, reltuples, indtuples) = {
             let s = pgsync::lock(&shared.stats);
             (s.nparticipantsdone, s.reltuples, s.indtuples)
         };
         if done == nparticipants {
             // Every participant sent its last batch before counting itself done.
-            drain(&receiver, sort)?;
+            drain(&receivers, sort)?;
             bs.reltuples = reltuples;
             bs.indtuples = indtuples;
             break;
@@ -197,7 +205,7 @@ fn leader_scan<'mcx>(
     heap: &Relation<'mcx>,
     index_info: &mut IndexInfo<'mcx>,
     shared: &IvfflatShared,
-    receiver: &MailboxReceiver<AssignBatch>,
+    receivers: &[MailboxReceiver<AssignBatch>],
 ) -> PgResult<()> {
     let index = bs.index;
     let mut inner_err: Option<Box<PgError>> = None;
@@ -214,7 +222,7 @@ fn leader_scan<'mcx>(
                 return Ok(());
             }
             add_tuple_to_sort(bs, tid, values)
-                .and_then(|()| drain(receiver, bs.sortstate.as_mut().expect("sort state")))
+                .and_then(|()| drain(receivers, bs.sortstate.as_mut().expect("sort state")))
                 .map_err(|e| {
                     inner_err = Some(e);
                     PgError::error("ivfflat build insert failed").into()
@@ -236,14 +244,15 @@ fn leader_scan<'mcx>(
     pgvector_parallel::report_processed(true, reltuples, "ivfbuild.c", 709, 711, "IvfflatParallelScanAndSort")
 }
 
-/// Feed every batch waiting in the mailbox to the leader's sort.
-fn drain(receiver: &MailboxReceiver<AssignBatch>, sort: &mut HeapSort) -> PgResult<()> {
-    loop {
-        match receiver.try_recv() {
-            TryRecv::Msg(batch) => batch.put_all(sort)?,
-            TryRecv::Empty | TryRecv::Disconnected => return Ok(()),
+/// Feed every batch waiting in the workers' mailboxes to the leader's sort.
+fn drain(receivers: &[MailboxReceiver<AssignBatch>], sort: &mut HeapSort) -> PgResult<()> {
+    for receiver in receivers {
+        // Empty or Disconnected: on to the next worker's mailbox.
+        while let TryRecv::Msg(batch) = receiver.try_recv() {
+            batch.put_all(sort)?;
         }
     }
+    Ok(())
 }
 
 /// IvfflatParallelBuildMain (ivfbuild.c:725-783).
@@ -281,6 +290,11 @@ fn worker_scan<'mcx>(
         bs.centers.get_mut(i)?.copy_from_slice(&shared.centers[start..start + itemsize]);
     }
     bs.centers.length = bs.centers.maxlen;
+    // This worker's own mailbox (IvfflatShared::rows)
+    let rows = usize::try_from(parallel::ParallelWorkerNumber())
+        .ok()
+        .and_then(|n| shared.rows.get(n))
+        .expect("ivfflat parallel build worker without its mailbox");
 
     let mut batch = AssignBatch::new();
     let mut inner_err: Option<Box<PgError>> = None;
@@ -302,7 +316,7 @@ fn worker_scan<'mcx>(
                     batch.push(list, *tid, &value);
                     bs.indtuples += 1.0;
                     if batch.bytes() >= BATCH_BYTES {
-                        send(shared, std::mem::replace(&mut batch, AssignBatch::new()))?;
+                        send(rows, shared.leader, std::mem::replace(&mut batch, AssignBatch::new()))?;
                     }
                 }
                 Ok(())
@@ -318,7 +332,7 @@ fn worker_scan<'mcx>(
         Err(e) => return Err(inner_err.unwrap_or(e)),
     };
     if batch.len() > 0 {
-        send(shared, batch)?;
+        send(rows, shared.leader, batch)?;
     }
 
     // Record statistics (ivfbuild.c:698-705)
@@ -334,16 +348,16 @@ fn worker_scan<'mcx>(
     Ok(())
 }
 
-/// Send a batch to the leader, waiting (interruptibly, on this worker's
-/// latch) while the leader's mailbox is full.
-fn send(shared: &IvfflatShared, batch: AssignBatch) -> PgResult<()> {
+/// Send a batch to the leader through this worker's mailbox, waiting
+/// (interruptibly, on this worker's latch) while it is full.
+fn send(rows: &MailboxSender<AssignBatch>, leader: usize, batch: AssignBatch) -> PgResult<()> {
     let wake = (pgvector_parallel::wake_proc as fn(usize), pgvector_parallel::my_proc_number());
-    match shared.rows.send_interruptible(batch, wake, || {
+    match rows.send_interruptible(batch, wake, || {
         parallel::wait_parallel_finish_quantum()?;
         postgres_seams::check_for_interrupts::call()
     })? {
         Ok(()) => {
-            pgvector_parallel::wake_proc(shared.leader);
+            pgvector_parallel::wake_proc(leader);
             Ok(())
         }
         // The leader dropped its receiver: it is unwinding, and this worker

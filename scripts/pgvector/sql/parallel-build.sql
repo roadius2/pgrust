@@ -78,4 +78,20 @@ CREATE INDEX ivf_unlogged_l2 ON ivf_unlogged USING ivfflat (v vector_l2_ops) WIT
 RESET client_min_messages;
 SELECT count(*) FROM (SELECT id FROM ivf_unlogged ORDER BY v <-> '[3,5,7]' LIMIT 20000) s;
 DROP TABLE ivf_unlogged;
+-- Backpressure: two workers stream wide values (vector(512), stored out of
+-- line) while the leader's tuplesort spills, so the workers' mailboxes fill
+-- and each worker waits for the leader. IVFFlat's sample buffer alone needs
+-- 20MB (ivfutils.c:126-134), so 24MB is the smallest round size that builds;
+-- the sorted values (about 41MB) still overflow it.
+CREATE TABLE ivf_wide (id int, v vector(512));
+INSERT INTO ivf_wide SELECT i, (array_fill((i % 97)::real, ARRAY[256]) || array_fill((i % 89)::real, ARRAY[256]))::vector(512)
+  FROM generate_series(1, 20000) i;
+ALTER TABLE ivf_wide SET (parallel_workers = 2);
+SET maintenance_work_mem = '24MB';
+SET client_min_messages = debug1;
+CREATE INDEX ivf_wide_l2 ON ivf_wide USING ivfflat (v vector_l2_ops) WITH (lists = 10);
+RESET client_min_messages;
+RESET maintenance_work_mem;
+SELECT count(*) FROM (SELECT id FROM ivf_wide ORDER BY v <-> array_fill(3::real, ARRAY[512])::vector(512) LIMIT 20000) s;
+DROP TABLE ivf_wide;
 RESET ivfflat.probes;
