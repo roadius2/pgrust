@@ -3,16 +3,16 @@
 //! writes the metapage and list pages. Then it assigns every row to its
 //! nearest center, sorts by list and loads the entry pages. Every page goes
 //! through GenericXLog, as in C.
-//! DIVERGENCE (recorded): no parallel build (plan_create_index_workers is
-//! unported, M6); C builds serially when no workers launch.
+//! The assign phase runs in parallel when the planner allows workers (parallel_build.rs).
 //! pgrust.ivfflat_build_seed reseeds a build the way C's -DIVFFLAT_BENCH
 //! build does (opt-in).
 
 pub mod kmeans;
+mod parallel_build;
 
 use datum::Datum;
 use execindexing::IndexInfo;
-use mcx::Mcx;
+use mcx::{Mcx, PgVec};
 use pgvector_ivfflat::sort::{HeapSort, INT4_LESS_OPERATOR};
 use pgvector_ivfflat::utils::*;
 use types_core::{ForkNumber, InvalidBlockNumber, Oid, INT4OID, TIDOID, VARBITOID};
@@ -183,21 +183,26 @@ fn sample_rows<'mcx>(
     Ok(())
 }
 
-// AddTupleToSort (ivfbuild.c:164-225).
-fn add_tuple_to_sort(bs: &mut BuildState<'_, '_, '_>, tid: &ItemPointerData, values: &[Datum]) -> PgResult<()> {
-    let tmp = mcx::MemoryContext::new_bump("Ivfflat build temporary context");
+// AddTupleToSort (ivfbuild.c:164-225) up to the sort: the nearest center's
+// list and the (possibly normalized) value the sort stores, or None when the
+// norm check skips the row. A parallel worker sends the pair to its leader.
+fn assign_tuple<'t>(
+    bs: &mut BuildState<'_, '_, '_>,
+    tmp: Mcx<'t>,
+    values: &[Datum],
+) -> PgResult<Option<(i32, PgVec<'t, u8>)>> {
     let mut min_distance = f64::MAX;
     let mut closest_center = 0i32;
 
     // Detoast once for all calls
-    let mut value = detoast_value(tmp.mcx(), values[0])?;
+    let mut value = detoast_value(tmp, values[0])?;
 
     // Normalize if needed
     if let Some(np) = bs.normprocinfo.as_mut() {
         if !ivfflat_check_norm(np, bs.collation, Datum::from_usize(value.as_ptr() as usize))? {
-            return Ok(());
+            return Ok(None);
         }
-        value = ivfflat_norm_value(bs.type_info, bs.collation, tmp.mcx(), &value)?;
+        value = ivfflat_norm_value(bs.type_info, bs.collation, tmp, &value)?;
     }
     let d = Datum::from_usize(value.as_ptr() as usize);
 
@@ -213,14 +218,24 @@ fn add_tuple_to_sort(bs: &mut BuildState<'_, '_, '_>, tid: &ItemPointerData, val
             closest_center = i;
         }
     }
+    Ok(Some((closest_center, value)))
+}
+
+// AddTupleToSort (ivfbuild.c:164-225).
+fn add_tuple_to_sort(bs: &mut BuildState<'_, '_, '_>, tid: &ItemPointerData, values: &[Datum]) -> PgResult<()> {
+    let tmp = mcx::MemoryContext::new_bump("Ivfflat build temporary context");
+    let Some((closest_center, value)) = assign_tuple(bs, tmp.mcx(), values)? else {
+        return Ok(());
+    };
 
     // Add tuple to sort; tuplesort copies the input, the TID by reference
     // (TIDOID)
     let tid_datum = Datum::from_usize(tid as *const ItemPointerData as usize);
-    bs.sortstate
-        .as_mut()
-        .expect("sort state")
-        .put(&[Datum::from_i32(closest_center), tid_datum, d])?;
+    bs.sortstate.as_mut().expect("sort state").put(&[
+        Datum::from_i32(closest_center),
+        tid_datum,
+        Datum::from_usize(value.as_ptr() as usize),
+    ])?;
 
     bs.indtuples += 1.0;
     Ok(())
@@ -513,8 +528,8 @@ fn create_list_pages(
     xp.commit()
 }
 
-// AssignTuples (ivfbuild.c:977-1018), serial. BuildCallback
-// (ivfbuild.c:230-250) is the closure.
+// AssignTuples (ivfbuild.c:977-1018). BuildCallback (ivfbuild.c:230-250) is
+// the serial closure; parallel_build.rs is the parallel arm.
 fn assign_tuples<'mcx>(
     bs: &mut BuildState<'_, '_, 'mcx>,
     mcx: Mcx<'mcx>,
@@ -525,8 +540,17 @@ fn assign_tuples<'mcx>(
         PROGRESS_IVFFLAT_PHASE_ASSIGN,
     );
 
-    // Begin serial tuplesort (InitBuildSortState, ivfbuild.c:612-621, over
-    // InitBuildState's sortdesc, ivfbuild.c:386-390)
+    // Calculate parallel workers (ivfbuild.c:986-987), behind the kill switch
+    let parallel_workers = match bs.heap {
+        Some(heap) if pgvector_parallel::vector_parallel_builds_enabled() => {
+            pgvector_parallel::plan_create_index_workers(heap, bs.index)?
+        }
+        _ => 0,
+    };
+
+    // Begin the leader's tuplesort (InitBuildSortState, ivfbuild.c:612-621,
+    // over InitBuildState's sortdesc, ivfbuild.c:386-390); a parallel build
+    // feeds it every participant's rows.
     let value_type = bs.index.rd_att.attr(0).atttypid;
     bs.sortstate = Some(HeapSort::begin(
         "Ivfflat build sort",
@@ -537,11 +561,15 @@ fn assign_tuples<'mcx>(
 
     // Add tuples to sort
     if let (Some(heap), Some(index_info)) = (bs.heap, index_info) {
+        // Attempt to launch parallel worker scan when required (ivfbuild.c:990-991)
+        if parallel_workers > 0
+            && parallel_build::assign_tuples_parallel(bs, mcx, heap, &mut *index_info, parallel_workers)?
+        {
+            return Ok(());
+        }
+
         let index = bs.index;
         let mut inner_err: Option<Box<PgError>> = None;
-        // BuildState is threaded via raw pointer: the callback is FnMut and
-        // borrows would alias bs.
-        let bs_ptr: *mut BuildState<'_, '_, 'mcx> = &mut *bs;
         let reltuples = execindexing::table_index_build_scan(
             mcx,
             heap,
@@ -554,8 +582,6 @@ fn assign_tuples<'mcx>(
                 if isnull[0] {
                     return Ok(());
                 }
-                // SAFETY: single-threaded serial build; bs outlives the scan.
-                let bs = unsafe { &mut *bs_ptr };
                 add_tuple_to_sort(bs, tid, values).map_err(|e| {
                     inner_err = Some(e);
                     PgError::error("ivfflat build insert failed").into()

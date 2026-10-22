@@ -30,6 +30,10 @@ guc_seams = { path = "../../backend/utils/misc/guc_seams" }
 pg_prng = { path = "../../common/pg_prng" }
 sampling = { path = "../../backend/utils/misc/sampling" }
 pgvector_ivfflat = { path = "../pgvector_ivfflat" }
+pgvector_parallel = { path = "../pgvector_parallel" }
+parallel = { path = "../../backend/access/transam/parallel" }
+pgsync = { path = "../../_support/pgsync" }
+tableam = { path = "../../backend/access/table/tableam" }
 
 [dev-dependencies]
 pgvector = { path = "../pgvector" }

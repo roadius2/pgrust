@@ -108,6 +108,15 @@ else
   r=FAIL
 fi
 printf 'core_error_locations\t%s\n' "$r" | tee -a "$out/summary.tsv"
+# Parallel IVFFlat and HNSW builds (M6): index.c's request line, pgvector's
+# "using N parallel workers", NOTICEs, errors and results, with each
+# participant's own lines dropped (sqldiff.sh).
+if "$here/sqldiff.sh" "$mode" "$here/sql/parallel-build.sql" >"$out/parallel-build.log" 2>&1; then
+  r=ok
+else
+  r=FAIL
+fi
+printf 'parallel_build\t%s\n' "$r" | tee -a "$out/summary.tsv"
 
 total=$(wc -l <"$out/summary.tsv" | tr -d ' ')
 passed=$(grep -c $'\tok$' "$out/summary.tsv" || true)

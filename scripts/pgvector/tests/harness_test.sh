@@ -395,7 +395,7 @@ test_diff_ref() {
     fail "diff ref: exit 0 (see $PGV_WORK/diff-ref.log)"
   fi
   n="$(grep -c $'\tok$' "$PGV_WORK/diff/ref/summary.tsv" 2>/dev/null || true)"
-  if [ "$n" = 21 ]; then pass "diff ref: 21 ok"; else fail "diff ref: '$n' ok, want 21"; fi
+  if [ "$n" = 22 ]; then pass "diff ref: 22 ok"; else fail "diff ref: '$n' ok, want 22"; fi
 }
 
 # Negative control: a B side without l2_normalize(halfvec) must be reported
