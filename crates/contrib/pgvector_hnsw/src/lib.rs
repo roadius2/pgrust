@@ -2,10 +2,10 @@
 //! hnswvacuum.c) for vector, halfvec, sparsevec and bit, serial on-disk
 //! rendering; the in-memory build phase lives in pgvector_hnsw_build.
 //! Support proc 3 resolves by its C symbol to hnswutils.c's static type info
-//! (utils.rs hnsw_get_type_info). DIVERGENCES (recorded): no parallel build
-//! (C falls back to serial when no workers launch); iterative-scan memory cap
-//! is a byte-exact model of C's so->tmpCtx (types_hnsw::tmpctx), charged at
-//! C's allocation points; level RNG uses the ported pg_global_prng (same
+//! (utils.rs hnsw_get_type_info). Parallel builds: pgvector_hnsw_build's
+//! parallel_build.rs. DIVERGENCES (recorded): iterative-scan memory cap is a
+//! byte-exact model of C's so->tmpCtx (types_hnsw::tmpctx), charged at C's
+//! allocation points; level RNG uses the ported pg_global_prng (same
 //! generator, per-backend seeding as stock C; builds reseed only with
 //! pgrust.hnsw_build_seed, C's -DHNSW_MEMORY SeedRandom); pgrust.hnsw_memory
 //! prints -DHNSW_MEMORY's per-batch scan line (scan.rs); an unknown support

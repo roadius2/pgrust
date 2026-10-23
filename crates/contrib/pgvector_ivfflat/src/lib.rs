@@ -5,10 +5,11 @@
 //! (utils.rs ivfflat_get_type_info). Elsewhere: ivfflat.c's cost estimate is
 //! planner selfuncs.rs ivfflatcostestimate, its reloptions are reloptions'
 //! ivfflatoptions, and its build phase names are adt_amutils'.
-//! DIVERGENCES (recorded): no parallel build (M6); an unknown support proc 5
-//! raises where C would call it; the scan keeps a detoasted copy of the query
-//! where C uses it in place; an insert into a list with no insert page raises
-//! where C asserts.
+//! DIVERGENCES (recorded): a parallel build streams its rows to one leader
+//! sort (pgvector_ivfflat_build's parallel_build.rs); an unknown support
+//! proc 5 raises where C would call it; the scan keeps a detoasted copy of
+//! the query where C uses it in place; an insert into a list with no insert
+//! page raises where C asserts.
 
 pub mod insert;
 pub mod scan;
