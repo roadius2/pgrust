@@ -1115,7 +1115,7 @@ test_buildtime_ref() {
   else
     fail "buildtime ref: exit 0 (see $log)"
   fi
-  if [ "$(wc -l <"$f" 2>/dev/null | tr -d ' ')" = 4 ] &&
+  if [ "$(wc -l 2>/dev/null <"$f" | tr -d ' ')" = 4 ] &&
     awk -F'\t' '$3 !~ /^[0-9.]+$/ || $5 !~ /^[0-9.]+$/ { bad = 1 } END { exit bad }' "$f"; then
     pass "buildtime ref: 4 timed rows"
   else

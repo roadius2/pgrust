@@ -13,11 +13,16 @@
 //! a list differs, which C's own sort, keyed on the list only
 //! (ivfbuild.c:612-621), does not fix either. The parallel phase ends after
 //! the scan: there are no shared tapes to keep alive through the load.
+//! There is one bounded mailbox per worker because a pgsync mailbox wakes
+//! only one parked sender. The leader drains the mailboxes only between its
+//! own non-null rows and in its final wait, so up to MAILBOX_BATCHES ×
+//! BATCH_BYTES per worker, plus each worker's partial batch, sit in flight
+//! outside maintenance_work_mem, where C's participants sort within their
+//! share of it.
 
 use std::sync::Arc;
 
 use datum::Datum;
-use execindexing::IndexInfo;
 use mcx::Mcx;
 use pgsync::{mailbox, MailboxReceiver, MailboxSender, Mutex, TryRecv};
 use pgvector_ivfflat::sort::HeapSort;
@@ -124,10 +129,9 @@ pub(crate) fn assign_tuples_parallel<'mcx>(
     bs: &mut BuildState<'_, '_, 'mcx>,
     mcx: Mcx<'mcx>,
     heap: &Relation<'mcx>,
-    index_info: &mut IndexInfo<'mcx>,
+    isconcurrent: bool,
     request: i32,
 ) -> PgResult<bool> {
-    let isconcurrent = index_info.ii_Concurrent;
     let (heaprelid, indexrelid) = (heap.rd_id, bs.index.rd_id);
     // Store centers in shared memory (ivfbuild.c:925-926)
     let mut centers = Vec::with_capacity(bs.centers.maxlen as usize * bs.centers.itemsize);
@@ -167,14 +171,17 @@ pub(crate) fn assign_tuples_parallel<'mcx>(
     // IvfflatLeaderParticipateAsWorker (ivfbuild.c:813-830): the leader's own
     // rows go straight into its sort, and the workers' batches are fed in
     // between them.
-    leader_scan(bs, mcx, heap, index_info, &shared, &receivers)?;
+    leader_scan(bs, mcx, heap, &shared, &receivers)?;
 
     // ivfbuild.c:971
     parallel::WaitForParallelWorkersToAttach(leader.pcxt)?;
 
     // ParallelHeapScan (ivfbuild.c:626-656): wait for every participant,
     // feeding their rows to the sort. A worker's error is raised by
-    // check_for_interrupts here.
+    // check_for_interrupts here. DIVERGENCE: C sleeps on workersdonecv as
+    // WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN (ivfbuild.c:649-650); this loop
+    // waits in the parallel crate's quantum, which pg_stat_activity.wait_event
+    // shows as PARALLEL_FINISH.
     let sort = bs.sortstate.as_mut().expect("sort state");
     loop {
         drain(&receivers, sort)?;
@@ -203,17 +210,21 @@ fn leader_scan<'mcx>(
     bs: &mut BuildState<'_, '_, 'mcx>,
     mcx: Mcx<'mcx>,
     heap: &Relation<'mcx>,
-    index_info: &mut IndexInfo<'mcx>,
     shared: &IvfflatShared,
     receivers: &[MailboxReceiver<AssignBatch>],
 ) -> PgResult<()> {
     let index = bs.index;
+    // Join parallel scan (ivfbuild.c:677-678): the leader scans with a fresh
+    // IndexInfo, as every worker does, so nothing its scan sets (such as
+    // ii_BrokenHotChain) reaches index_build's.
+    let mut index_info = execindexing::BuildIndexInfo(mcx, index)?;
+    index_info.ii_Concurrent = shared.isconcurrent;
     let mut inner_err: Option<Box<PgError>> = None;
     let reltuples = execindexing::table_index_build_scan_parallel(
         mcx,
         heap,
         index,
-        index_info,
+        &mut index_info,
         /* progress */ true,
         &shared.pscan,
         |_index_rel, tid, values, isnull, _alive| {
@@ -349,7 +360,10 @@ fn worker_scan<'mcx>(
 }
 
 /// Send a batch to the leader through this worker's mailbox, waiting
-/// (interruptibly, on this worker's latch) while it is full.
+/// (interruptibly, on this worker's latch) while it is full. DIVERGENCE: the
+/// park has no C counterpart (C's workers sort their own share); it waits in
+/// the parallel crate's quantum, shown as PARALLEL_FINISH in
+/// pg_stat_activity.wait_event.
 fn send(rows: &MailboxSender<AssignBatch>, leader: usize, batch: AssignBatch) -> PgResult<()> {
     let wake = (pgvector_parallel::wake_proc as fn(usize), pgvector_parallel::my_proc_number());
     match rows.send_interruptible(batch, wake, || {

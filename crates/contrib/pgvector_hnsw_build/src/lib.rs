@@ -27,7 +27,11 @@ pub struct IndexBuildResult {
 }
 
 // HnswBuildState (hnsw.h:311-347): one participant's state. `graph` is the
-// build's own (serial) or the shared one (parallel_build.rs).
+// build's own (serial) or the shared one (parallel_build.rs's participants).
+// The parallel leader's outer state keeps `graph` pointing at its empty local
+// graph while it flushes the shared one (C reassigns buildstate->graph,
+// hnswbuild.c:775), so flush_pages and its helpers use their `graph`
+// argument, never `bs.graph`.
 struct BuildState<'a, 'mcx> {
     heap: Option<&'a Relation<'mcx>>,
     index: &'a Relation<'mcx>,
@@ -280,6 +284,12 @@ fn write_neighbor_tuples(bs: &BuildState<'_, '_>, graph: &Graph, placements: &[P
 
 // FlushPages (hnswbuild.c:303-316), called with the graph's flush lock held
 // exclusively; the graph sets `flushed`.
+// DIVERGENCE: C resets graphCtx here (hnswbuild.c:315); the arena lives until
+// the build ends (pgvector_hnsw_graph's DIVERGENCE note). And pgsync's locks
+// do not hold off interrupts, so a cancel can raise mid-flush under
+// flush_lock where C's LWLockAcquire would hold it off: `flushed` stays
+// false, the next participant retries the NOTICE and the flush before the
+// abort reaches it, and the transaction aborts either way.
 fn flush_pages(bs: &BuildState<'_, '_>, graph: &Graph) -> PgResult<()> {
     create_meta_page(bs)?;
     let placements = create_graph_pages(bs, graph)?;

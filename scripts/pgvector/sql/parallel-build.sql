@@ -81,7 +81,8 @@ DROP TABLE ivf_unlogged;
 -- Backpressure: two workers stream wide values (vector(512), stored out of
 -- line) while the leader's tuplesort spills, so the workers' mailboxes fill
 -- and each worker waits for the leader. IVFFlat's sample buffer alone needs
--- 20MB (ivfutils.c:126-134), so 24MB is the smallest round size that builds;
+-- 20MB (sized at ivfbuild.c:456-466; ivfutils.c:126-134 is the check that
+-- raises), so 24MB is the smallest round size that builds;
 -- the sorted values (about 41MB) still overflow it.
 CREATE TABLE ivf_wide (id int, v vector(512));
 INSERT INTO ivf_wide SELECT i, (array_fill((i % 97)::real, ARRAY[256]) || array_fill((i % 89)::real, ARRAY[256]))::vector(512)
@@ -163,9 +164,12 @@ SET hnsw.iterative_scan = relaxed_order;
 SELECT count(*) FROM (SELECT id FROM d ORDER BY v <-> '[0,0,0]' LIMIT 2000) s;
 RESET hnsw.iterative_scan;
 
--- Review Focus 1: a row error inside a worker. HNSW indexes at most 1000
--- non-zeros (hnswutils.c:1392); whichever participant reads the last row
--- raises C's ERROR, and the build leaves no index and no worker.
+-- Review Focus 1: a row error during a parallel build. HNSW indexes at most
+-- 1000 non-zeros (hnswutils.c:1392); whichever participant reads the bad row
+-- raises C's ERROR, and the build leaves no index and no worker. In the
+-- observed runs the leader read it on both servers, so a worker-raised HNSW
+-- row error is covered only by M6 Task 3's relay check
+-- (~/.cache/pgrust/m6-evidence/task3/worker-error-*.out).
 CREATE TABLE sv_bad (id int, v sparsevec(2000));
 INSERT INTO sv_bad SELECT i, ('{' || (i % 2000) + 1 || ':1}/2000')::sparsevec FROM generate_series(1, 5000) i;
 INSERT INTO sv_bad SELECT 5001, (SELECT '{' || string_agg(j || ':1', ',') || '}/2000' FROM generate_series(1, 1001) j)::sparsevec;
@@ -176,14 +180,70 @@ SELECT count(*) FROM pg_class WHERE relname = 'sv_bad_l2';
 SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'parallel worker';
 
 -- Review Focus 3: statement_timeout fires mid-build (512MB keeps the graph
--- in memory, so no NOTICE races the timeout).
+-- in memory, so no NOTICE races the timeout). DEBUG1 shows the build went
+-- parallel before the timeout.
 CREATE TABLE big (id int, v vector(3));
 INSERT INTO big SELECT i, ARRAY[i % 101, (i * 7) % 103, (i * 11) % 107] FROM generate_series(1, 100000) i;
 SET maintenance_work_mem = '512MB';
 SET statement_timeout = '200ms';
+SET client_min_messages = debug1;
 CREATE INDEX big_l2 ON big USING hnsw (v vector_l2_ops);
+RESET client_min_messages;
 RESET statement_timeout;
 RESET maintenance_work_mem;
 SELECT count(*) FROM pg_class WHERE relname = 'big_l2';
 SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'parallel worker';
+
+-- REINDEX builds in parallel into the index's new relfilenode
+-- (index.c's reindex_index and index_concurrently_build pass parallel).
+CREATE INDEX ivf_re ON ivf USING ivfflat (v vector_l2_ops) WITH (lists = 10);
+SET client_min_messages = debug1;
+REINDEX INDEX ivf_re;
+RESET client_min_messages;
+SET ivfflat.probes = 10;
+SELECT count(*) FROM (SELECT id FROM ivf ORDER BY v <-> '[3,5,7]' LIMIT 20000) s;
+RESET ivfflat.probes;
+DROP INDEX ivf_re;
+-- An overflowing HNSW rebuild (h_disk's shape): every participant inserts on
+-- disk into the new relfilenode.
+ALTER TABLE h SET (parallel_workers = 2);
+SET maintenance_work_mem = '4MB';
+CREATE INDEX h_re ON h USING hnsw (v vector_l2_ops);
+SET client_min_messages = debug1;
+REINDEX INDEX h_re;
+RESET client_min_messages;
+RESET maintenance_work_mem;
+ALTER TABLE h RESET (parallel_workers);
+SELECT id FROM h ORDER BY v <-> (SELECT v FROM h WHERE id = 2500) LIMIT 1;
+DROP INDEX h_re;
+CREATE INDEX h_ric ON h USING hnsw (v vector_l2_ops);
+SET client_min_messages = debug1;
+REINDEX INDEX CONCURRENTLY h_ric;
+RESET client_min_messages;
+SELECT id FROM h ORDER BY v <-> (SELECT v FROM h WHERE id = 2500) LIMIT 1;
+DROP INDEX h_ric;
+
+-- One transaction: the workers scan a table the leader created and filled,
+-- and a table it truncated and refilled, before either commits.
+BEGIN;
+CREATE TABLE t1 (id int, v vector(3));
+INSERT INTO t1 SELECT i, ARRAY[i % 23, (i * 7) % 29, (i * 11) % 31] FROM generate_series(1, 5000) i;
+SET client_min_messages = debug1;
+CREATE INDEX t1_l2 ON t1 USING hnsw (v vector_l2_ops);
+RESET client_min_messages;
+COMMIT;
+SELECT id FROM t1 ORDER BY v <-> (SELECT v FROM t1 WHERE id = 2500) LIMIT 1;
+DROP TABLE t1;
+CREATE TABLE h2 AS SELECT * FROM h;
+BEGIN;
+TRUNCATE h2;
+INSERT INTO h2 SELECT * FROM h;
+SET client_min_messages = debug1;
+CREATE INDEX h2_l2 ON h2 USING ivfflat (v vector_l2_ops) WITH (lists = 10);
+RESET client_min_messages;
+COMMIT;
+SET ivfflat.probes = 10;
+SELECT count(*) FROM (SELECT id FROM h2 ORDER BY v <-> '[3,5,7]' LIMIT 5000) s;
+RESET ivfflat.probes;
+DROP TABLE h2;
 RESET hnsw.ef_search;

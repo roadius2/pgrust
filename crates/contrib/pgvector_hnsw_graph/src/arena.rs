@@ -3,6 +3,13 @@
 //! slots, so a handle never moves once published and no segment is ever
 //! reallocated; slots and segments are pgsync OnceLocks, set once and read
 //! without a lock.
+//!
+//! DIVERGENCE: segment k's 1024 << k slots are allocated inside `publish`,
+//! under the graph's allocator lock, by the insert that first needs one: a
+//! one-time stall at each segment boundary that touches about 144 bytes per
+//! slot. C has no such step (an element is one bump or Generation
+//! allocation). The slot arrays are not charged to the memory model, which
+//! counts C's allocation sizes only (memory.rs).
 
 use pgsync::OnceLock;
 

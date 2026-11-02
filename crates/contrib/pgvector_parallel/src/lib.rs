@@ -32,7 +32,7 @@ pub fn vector_parallel_builds_enabled() -> bool {
 }
 
 fn kill_switch_allows(value: Option<&str>) -> bool {
-    value.map_or(true, |v| v.trim() != "0")
+    value.is_none_or(|v| v.trim() != "0")
 }
 
 /// plan_create_index_workers (planner.c:7114), through the planner's seam.
@@ -47,6 +47,7 @@ pub fn max_parallel_maintenance_workers() -> i32 {
 
 /// HnswLeader / IvfflatLeader (hnsw.h:276-283, ivfflat.h:178-186): what the
 /// leader keeps to end the parallel phase.
+#[must_use = "end_parallel must run"]
 pub struct Leader {
     pub pcxt: ParallelContextId,
     pub nworkers_launched: i32,
@@ -89,7 +90,7 @@ pub fn begin_parallel<T: Any + Send + Sync>(
 
     parallel::InitializeParallelDSM(pcxt)?;
     let mut pscan = ParallelTableScanDescShared::default();
-    tableam::table_parallelscan_initialize(heap, &mut pscan, &snapshot.clone())?;
+    tableam::table_parallelscan_initialize(heap, &mut pscan, &snapshot)?;
     let shared = make_shared(pscan)?;
     parallel::set_private(pcxt, Arc::clone(&shared) as Arc<dyn Any + Send + Sync>);
 
@@ -172,7 +173,7 @@ pub fn worker_open<'mcx>(
     Ok(WorkerRelations { heap, index, heap_lock, index_lock })
 }
 
-/// hnswbuild.c:884-885, ivfbuild.c:780-781.
+/// hnswbuild.c:884-885, ivfbuild.c:781-782.
 pub fn worker_close(rels: WorkerRelations<'_>) -> PgResult<()> {
     indexam::index_close(rels.index, rels.index_lock)?;
     table::table_close(rels.heap, rels.heap_lock)
@@ -208,7 +209,6 @@ pub fn wake_proc(procno: usize) {
 pub fn my_proc_number() -> usize {
     init_small::globals::MyProcNumber() as usize
 }
-
 
 #[cfg(test)]
 mod tests {

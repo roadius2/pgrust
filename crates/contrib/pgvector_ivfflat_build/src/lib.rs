@@ -1,9 +1,10 @@
-//! pgvector 0.8.7 ivfbuild.c, serial rendering. It samples rows (ANALYZE's
-//! block sampler and reservoir), runs k-means (kmeans.rs, ivfkmeans.c) and
-//! writes the metapage and list pages. Then it assigns every row to its
-//! nearest center, sorts by list and loads the entry pages. Every page goes
-//! through GenericXLog, as in C.
-//! The assign phase runs in parallel when the planner allows workers (parallel_build.rs).
+//! pgvector 0.8.7 ivfbuild.c, its serial and parallel renderings. It samples
+//! rows (ANALYZE's block sampler and reservoir), runs k-means (kmeans.rs,
+//! ivfkmeans.c) and writes the metapage and list pages. Then it assigns every
+//! row to its nearest center, sorts by list and loads the entry pages. Every
+//! page goes through GenericXLog, as in C. The assign phase runs in parallel
+//! when the planner allows workers (parallel_build.rs); the rest stays serial
+//! on the leader, as in C.
 //! pgrust.ivfflat_build_seed reseeds a build the way C's -DIVFFLAT_BENCH
 //! build does (opt-in).
 
@@ -563,7 +564,13 @@ fn assign_tuples<'mcx>(
     if let (Some(heap), Some(index_info)) = (bs.heap, index_info) {
         // Attempt to launch parallel worker scan when required (ivfbuild.c:990-991)
         if parallel_workers > 0
-            && parallel_build::assign_tuples_parallel(bs, mcx, heap, &mut *index_info, parallel_workers)?
+            && parallel_build::assign_tuples_parallel(
+                bs,
+                mcx,
+                heap,
+                index_info.ii_Concurrent,
+                parallel_workers,
+            )?
         {
             return Ok(());
         }

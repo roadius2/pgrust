@@ -32,11 +32,15 @@ strip_seeded_info() {
 # ivfbuild.c:707-711), and every message a worker sends carries
 # "CONTEXT:  parallel worker" (parallel.c:1179-1186). The counts and the order
 # vary run to run, C against C, and which participant raises a NOTICE or an
-# ERROR is not fixed, so drop both kinds of line before comparing.
+# ERROR is not fixed, so drop both kinds of line before comparing. Under
+# --verbose a count line reads "DEBUG:  00000: ..." and is followed by its
+# LOCATION line (after its CONTEXT line, for a worker's), which goes with it;
+# a kept message keeps its LOCATION line.
 strip_parallel_participants() {
-  awk '/^psql:[^:]*:[0-9]+: DEBUG:  (leader|worker) processed [0-9]+ tuples$/ { next }
+  awk '/^psql:[^:]*:[0-9]+: DEBUG:  (00000: )?(leader|worker) processed [0-9]+ tuples$/ { skip = 1; next }
     /^CONTEXT:  parallel worker$/ { next }
-    { print }' "$1" >"$1.tmp"
+    skip && /^LOCATION:  / { skip = 0; next }
+    { skip = 0; print }' "$1" >"$1.tmp"
   mv "$1.tmp" "$1"
 }
 [ "$#" -ge 2 ] || usage

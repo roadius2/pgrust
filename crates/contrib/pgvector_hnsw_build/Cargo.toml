@@ -13,12 +13,10 @@ mcx = { path = "../../_support/mcx" }
 datum = { path = "../../_support/types/datum" }
 types_core = { path = "../../_support/types/types_core" }
 types_error = { path = "../../_support/types/types_error" }
-types_fmgr = { path = "../../_support/types/fmgr" }
 types_tuple = { path = "../../_support/types/types_tuple" }
 types_rel = { path = "../../_support/types/rel" }
 types_storage = { path = "../../_support/types/types_storage" }
 types_hnsw = { path = "../../_support/types/types_hnsw" }
-types_nodes = { path = "../../_support/types/nodes" }
 bufmgr = { path = "../../backend/storage/buffer/bufmgr" }
 bufmgr_seams = { path = "../../backend/storage/buffer/bufmgr_seams" }
 xloginsert = { path = "../../backend/access/transam/xloginsert" }
@@ -34,6 +32,3 @@ pgvector_parallel = { path = "../pgvector_parallel" }
 parallel = { path = "../../backend/access/transam/parallel" }
 pgsync = { path = "../../_support/pgsync" }
 tableam = { path = "../../backend/access/table/tableam" }
-
-[dev-dependencies]
-pgvector = { path = "../pgvector" }

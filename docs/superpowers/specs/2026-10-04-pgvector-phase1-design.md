@@ -23,7 +23,7 @@ The survey `docs/Vector Search for pgrust Algorithm & Benchmark Survey.md` sets 
 | Reverse on-disk direction | **Reported, not gated**, in Phase 1 | See §2.1. |
 | Bit-exact distances | **Not required.** Distances are compared with a relative tolerance. | pgvector builds with `-fassociative-math`, so its own results vary with compiler vectorization. Regression outputs must still match exactly. |
 | Performance | **Parallel index builds are in scope. No performance gate.** | Without parallel builds, index builds on a multi-core machine are many times slower than pgvector's. Build time is measured and reported. |
-| Approach | **Faithful port + parallel builds on the morsel pool** | Byte compatibility holds by construction, and the code follows repo conventions (C names, file:line citations, C line numbers in errors). Porting Postgres' DSM/bgworker parallel-build machinery and a clean-room redesign were both rejected. |
+| Approach | **Faithful port + parallel builds on the morsel pool** (ruling M6-1 replaced the pool with launched workers; see §7.1) | Byte compatibility holds by construction, and the code follows repo conventions (C names, file:line citations, C line numbers in errors). Porting Postgres' DSM/bgworker parallel-build machinery and a clean-room redesign were both rejected. |
 | Where work lives | Feature branches in the `roadius2/pgrust` fork | Upstream does not accept PRs. |
 
 ### 2.1 On-disk direction policy
@@ -73,12 +73,14 @@ The survey `docs/Vector Search for pgrust Algorithm & Benchmark Survey.md` sets 
 ### 4.3 HNSW: extend the existing crates
 - `types_hnsw` gains `HnswTypeInfo`: max dimensions, normalize, value check, and the dimension-count function added in 0.8.7.
 - `pgvector_hnsw` gains the 0.8.7 changes and type dispatch.
-- `pgvector_hnsw_build` gains the opt-in build seed (§5.4) and a new `parallel.rs` module (§7).
+- `pgvector_hnsw_build` gains the opt-in build seed (§5.4) and a new `parallel_build.rs` module (§7).
+- `crates/contrib/pgvector_hnsw_graph` (new in M6) holds the in-memory build graph, with C's lock protocol and a model of C's allocator; the serial build and every parallel participant insert through it (§7.2).
 
 ### 4.4 IVFFlat: three new crates, mirroring HNSW
 - `crates/_support/types/types_ivfflat` holds the `ivfflat.h` vocabulary and the scan state. It lives here so `relscan`'s `IndexScanOpaque` can hold the scan state without a dependency cycle.
 - `crates/contrib/pgvector_ivfflat` has modules for `ivfflat.c`, `ivfutils.c`, `ivfinsert.c`, `ivfscan.c` and `ivfvacuum.c`.
 - `crates/contrib/pgvector_ivfflat_build` has `ivfbuild.c`, `ivfkmeans.c` and parallel builds.
+- `crates/contrib/pgvector_parallel` (new in M6) holds what both AMs' parallel builds share: the launch and teardown, the worker prologue, the per-participant DEBUG1 lines and the kill switch (§7.1).
 
 ### 4.5 Core hook points for IVFFlat
 
@@ -266,7 +268,7 @@ Every error message is copied verbatim with C's SQLSTATE, about 20 per type. Tex
 | M3 | HNSW type info and opclasses for all types | Regression files `hnsw_bit`, `hnsw_halfvec` and `hnsw_sparsevec` pass, plus all HNSW TAP tests (serial builds) |
 | M4 | IVFFlat serial port; switch to the verbatim 0.8.7 script and upgrade scripts | Regression files `ivfflat_bit`, `ivfflat_halfvec` and `ivfflat_vector` pass, plus all IVFFlat TAP tests (serial builds); lookup-coverage test passes. All 14 regression files now pass. |
 | M5 | On-disk tiers | Forward gate passes (clean, crash, 0.8.1 upgrade); reverse report produced |
-| M6 | Port `plan_create_index_workers`; IVFFlat parallel build; HNSW shared graph. **Spike first:** the morsel pool hosting heavy per-row worker jobs. | Loom tests pass; recall TAP tests pass with workers forced; build time against pgvector reported |
+| M6 | Port `plan_create_index_workers`; IVFFlat parallel build; HNSW shared graph. **Spike first:** the morsel pool hosting heavy per-row worker jobs (ruling M6-1 answered it from the code and replaced the pool with launched workers; see §7.1). | Loom tests pass; recall TAP tests pass with workers forced; build time against pgvector reported |
 | M7 | Approximate differential; final run of every gated tier through the wrapper; update `CLAUDE.md` | Everything gated is green |
 
 **Ordering notes**
@@ -280,7 +282,7 @@ Every error message is copied verbatim with C's SQLSTATE, about 20 per type. Tex
 |---|---|
 | The hybrid TAP setup doesn't work (the repo's old TAP runners are missing) | Spike in M0, before anything depends on it |
 | Concurrency bugs in the shared HNSW graph | Loom tests on the lock protocol, serial fallback, kill switch, recall tests run with workers forced |
-| The morsel pool's thread-bound relation handling may not suit heavy per-row worker jobs | Spike at the start of M6 |
+| The morsel pool's thread-bound relation handling may not suit heavy per-row worker jobs | Spike at the start of M6 (ruling M6-1 replaced the pool with launched workers; see §7.1) |
 | pgvector's tests expose pgrust core gaps (pgrust-to-pgrust replication, `EXPLAIN` details, index-build progress views) | Fix in core only if the fix is small and needed for a gate; otherwise record a test exclusion with a reason and a note |
 | Upstream drift (pgvector 0.8.8, pgrust `main`) | Keep core edits to the §4.5 hook points; periodically rebase `vector/phase1` onto `upstream/main`; watch whether upstream starts its own vector work |
 | Tolerance-based comparison hides real bugs | Keep the tolerance tight; the byte-identical tier and the on-disk "identical approximate results" rule act as backstops |

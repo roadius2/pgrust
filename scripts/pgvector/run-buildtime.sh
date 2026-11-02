@@ -9,7 +9,8 @@
 #   PGV_BUILDTIME_ROWS (default 100000) and PGV_BUILDTIME_DIM (default 128)
 #   size the table; PGV_BUILDTIME_WORKERS (default "0 1 2 4") lists the
 #   worker counts. One run per cell; the builds run one at a time.
-#   Report: $PGV_WORK/buildtime/<mode>/report.md, rows in summary.tsv.
+#   Report: $PGV_WORK/buildtime/<mode>/report.md, rows in summary.tsv. The
+#   clusters are removed after the builds unless PGV_KEEP_DATA=1.
 set -euo pipefail
 . "$(dirname "$0")/common.sh"
 
@@ -83,6 +84,11 @@ for am in hnsw ivfflat; do
     printf '%s\t%s\t%s\t%s\n' "$am" "$w" "$c" "$s" >>"$out/summary.tsv"
   done
 done
+# Nothing reads the clusters after the builds (about 1.3 GB at the defaults);
+# PGV_KEEP_DATA=1 keeps them. The EXIT trap's stops then find no server.
+server_stop ref
+server_stop "$subject"
+[ "${PGV_KEEP_DATA:-}" = 1 ] || rm -rf "$out/data"
 
 {
   echo "# Build time: $subject against C pgvector 0.8.7"

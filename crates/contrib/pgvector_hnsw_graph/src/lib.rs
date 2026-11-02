@@ -21,7 +21,8 @@
 //! values and charges C's sizes to a model of C's allocator (memory.rs), so
 //! the flush point is C's while the bytes actually held differ; and the arena
 //! is freed with the graph, not when the graph is flushed (C resets graphCtx
-//! in a serial build, hnswbuild.c:315).
+//! in a serial build, hnswbuild.c:315). The arena's slot arrays are allocated
+//! under the allocator lock and are not charged to the model (arena.rs).
 
 mod algo;
 mod arena;

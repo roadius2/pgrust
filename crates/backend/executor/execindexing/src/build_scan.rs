@@ -1,7 +1,8 @@
-// heapam_index_build_range_scan (heapam_handler.c), serial lane; boundary
-// hoisted above heapam_handler (execindexing already sits above the AM stack
-// — a heapam_handler home would cycle).
-// Lanes: SnapshotAny or a concurrent build's MVCC snapshot, block ranges, and a parallel heap scan (heapam_handler.c:1272-1281).
+// heapam_index_build_range_scan (heapam_handler.c); boundary hoisted above
+// heapam_handler (execindexing already sits above the AM stack — a
+// heapam_handler home would cycle).
+// Lanes: SnapshotAny or a concurrent build's MVCC snapshot, block ranges,
+// and a parallel heap scan (heapam_handler.c:1272-1281).
 use std::ptr::NonNull;
 
 use ::datum::Datum;
@@ -245,14 +246,36 @@ where
     // the end.
     let (registered, owned) = if let Some(p) = parallel_scan {
         debug_assert!(allow_sync);
+        // table_beginscan_parallel (tableam.c:172) asserts that the relation
+        // is the file the parallel scan was initialized for. DIVERGENCE: an
+        // ERROR where C asserts. A participant whose relcache entry missed an
+        // in-transaction relfilenode change (REINDEX, TRUNCATE) would
+        // otherwise scan a stale file without a word.
+        if heap_relation.rd_locator.get() != p.pscan.phs_locator {
+            return Err(Box::new(
+                types_error::PgError::error(format!(
+                    "parallel scan was initialized for a different file of relation \"{}\"",
+                    heap_relation.name()
+                ))
+                .with_location("tableam.c", 172, "table_beginscan_parallel"),
+            ));
+        }
         // heapam_handler.c:1293: SnapshotAny exactly when OldestXmin is used.
         debug_assert!(p.pscan.phs_snapshot_any != concurrent);
-        match p.snapshot.as_ref() {
-            Some(serialized) if !p.pscan.phs_snapshot_any => {
-                let snap = snapmgr::RestoreSnapshot(serialized);
-                (Some(snapmgr::RegisterSnapshot(Some(&snap))?.expect("registered snapshot")), true)
-            }
-            _ => (None, false),
+        if p.pscan.phs_snapshot_any {
+            (None, false)
+        } else {
+            // tableam.c:174-178 restores the snapshot serialized beside the
+            // scan; pgrust's typed field must carry it, as tableam's own
+            // table_beginscan_parallel expects. No SnapshotAny fallback.
+            let Some(serialized) = p.snapshot.as_ref() else {
+                return Err(Box::new(
+                    types_error::PgError::error("MVCC parallel scan carries no serialized snapshot")
+                        .with_location("tableam.c", 177, "table_beginscan_parallel"),
+                ));
+            };
+            let snap = snapmgr::RestoreSnapshot(serialized);
+            (Some(snapmgr::RegisterSnapshot(Some(&snap))?.expect("registered snapshot")), true)
         }
     } else if let Some(snap) = snapshot {
         (Some(snap.clone()), false)

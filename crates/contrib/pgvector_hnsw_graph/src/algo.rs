@@ -254,9 +254,13 @@ impl Graph {
     // pointers into the caller's neighbor array, so e->closer updates land in
     // that array; `c` is taken mutably and the computed closer flags are
     // written back by origin index. Tie order: equal distances break by element
-    // handle (hnswutils.c:996-1038): C's pointer order within the serial
-    // build's Generation context, C's relptr order in a parallel build's area;
-    // handles rise with allocation order in both.
+    // handle (hnswutils.c:996-1038), standing in for C's pointer order in the
+    // serial build's Generation context and its relptr order in a parallel
+    // build's area. Relptrs rise with allocation order across the area, as
+    // handles do; pointers rise with it only within one 1 MB Generation block
+    // (each block is a separate malloc, often placed top-down), while handles
+    // keep rising across blocks. If a bytecmp case ever diverges on an
+    // exact-distance tie across blocks, look here first.
     #[allow(clippy::too_many_arguments)]
     fn select_neighbors<E>(
         &self,

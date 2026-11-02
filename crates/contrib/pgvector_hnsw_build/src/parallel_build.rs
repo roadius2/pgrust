@@ -105,16 +105,32 @@ pub(crate) fn build_graph_parallel<'mcx>(
     parallel::WaitForParallelWorkersToAttach(leader.pcxt)?;
 
     // ParallelHeapScan (hnswbuild.c:762-790): C sleeps on workersdonecv until
-    // every participant is done; the workers' exit is the same point here.
+    // every participant has counted itself done. Here the leader waits for
+    // the workers to exit, which follows each one's count and its
+    // worker_close. DIVERGENCE: C's sleep shows as
+    // WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN (hnswbuild.c:783-784); this wait
+    // shows as PARALLEL_FINISH in pg_stat_activity.wait_event.
     parallel::WaitForParallelWorkersToFinish(leader.pcxt)?;
     let (participants, reltuples) = {
         let stats = pgsync::lock(&shared.stats);
         (stats.nparticipantsdone, stats.reltuples)
     };
-    debug_assert_eq!(participants, leader.nworkers_launched + 1);
+    // C's loop ends only when nparticipantsdone == nparticipanttuplesorts
+    // (hnswbuild.c:769-782); every worker has exited, so a shortfall is a bug.
+    if participants != leader.nworkers_launched + 1 {
+        return Err(PgError::error(format!(
+            "hnsw parallel build: {participants} participants done, expected {}",
+            leader.nworkers_launched + 1
+        ))
+        .with_location("hnswbuild.c", 773, "ParallelHeapScan")
+        .into());
+    }
     let indtuples = shared.graph.indtuples();
 
-    // Flush pages (hnswbuild.c:1119-1120), the leader's state on the shared graph
+    // Flush pages (hnswbuild.c:1119-1120), the leader's state on the shared
+    // graph. The outer `bs.graph` is still the leader's empty local graph
+    // (C reassigns buildstate->graph instead, hnswbuild.c:775), so flush_pages
+    // and its helpers must use their `graph` argument, never `bs.graph`.
     shared.graph.flush_if_needed(|graph| flush_pages(bs, graph))?;
 
     pgvector_parallel::end_parallel(leader)?;
