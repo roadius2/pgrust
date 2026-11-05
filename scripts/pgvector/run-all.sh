@@ -16,7 +16,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 mode="$1"
 port_for "$mode" >/dev/null
 
-tiers=(regress tap bytecmp iterscan diff ondisk)
+tiers=(regress tap bytecmp iterscan diff ondisk recall)
 rm -f "$PGV_WORK/report-$mode.md" "$PGV_WORK/ondisk/$mode/reverse.tsv"
 for tier in "${tiers[@]}"; do
   rm -f "$PGV_WORK/$tier/$mode/summary.tsv"

@@ -753,6 +753,7 @@ test_run_all_exit_status() {
   stub_tier "$w/bin" iterscan 0 ""
   stub_tier "$w/bin" diff 0 "d:ok"
   stub_tier "$w/bin" ondisk 0 "o:ok"
+  stub_tier "$w/bin" recall 0 "r:ok"
   if PGV_WORK="$w" PGV_TIER_DIR="$w/bin" "$here/../run-all.sh" ref >"$w.log" 2>&1; then
     fail "run-all: exits 0 with failing tiers"
   else
@@ -778,14 +779,14 @@ test_run_all_exit_status() {
   else
     fail "run-all: iterscan's empty run (see $r)"
   fi
-  if grep -qxF '**4/8 passed**' "$r"; then pass "run-all: 4/8 passed"; else fail "run-all: the totals (see $r)"; fi
+  if grep -qxF '**5/9 passed**' "$r"; then pass "run-all: 5/9 passed"; else fail "run-all: the totals (see $r)"; fi
   if grep -qF '(no results: run-ondisk.sh wrote no reverse.tsv' "$r"; then
     pass "run-all: a missing reverse.tsv is reported"
   else
     fail "run-all: the reverse section (see $r)"
   fi
-  for t in regress tap bytecmp iterscan diff ondisk; do stub_tier "$w/bin" "$t" 0 "x:ok"; done
-  if PGV_WORK="$w" PGV_TIER_DIR="$w/bin" "$here/../run-all.sh" ref >"$w.log.2" 2>&1 && grep -qxF '**6/6 passed**' "$r"; then
+  for t in regress tap bytecmp iterscan diff ondisk recall; do stub_tier "$w/bin" "$t" 0 "x:ok"; done
+  if PGV_WORK="$w" PGV_TIER_DIR="$w/bin" "$here/../run-all.sh" ref >"$w.log.2" 2>&1 && grep -qxF '**7/7 passed**' "$r"; then
     pass "run-all: all-ok tiers pass"
   else
     fail "run-all: all-ok tiers (see $w.log.2)"
@@ -805,7 +806,7 @@ test_run_all_exit_status() {
   else
     fail "run-all: an interrupted run (exit $rc) left $r"
   fi
-  if [ ! -e "$w/iterscan/ref/summary.tsv" ] && [ ! -e "$w/diff/ref/summary.tsv" ] && [ ! -e "$w/ondisk/ref/summary.tsv" ]; then
+  if [ ! -e "$w/iterscan/ref/summary.tsv" ] && [ ! -e "$w/diff/ref/summary.tsv" ] && [ ! -e "$w/ondisk/ref/summary.tsv" ] && [ ! -e "$w/recall/ref/summary.tsv" ]; then
     pass "run-all: an interrupted run leaves no old summary.tsv"
   else
     fail "run-all: an interrupted run left old summary.tsv files (see $w)"
