@@ -15,7 +15,7 @@
 #   fails when the baseline's median is outside PGV_RECALL_BAND, where a
 #   comparison cannot detect a difference. Exit 1 if any row fails; a guard
 #   (a build that failed, a parallel case built serially, a plan that is not an
-#   index scan) dies, leaving no summary.tsv.
+#   index scan, a search that returned a row twice) dies, leaving no summary.tsv.
 #   Output in $PGV_WORK/recall/<mode>/: summary.tsv; recall.tsv (case, side,
 #   build number, build ms, recall@10, recall@100, rows returned, flush tuples
 #   or empty, flushing participant or empty); report.md; the logs. The clusters
@@ -214,7 +214,7 @@ flush_of() {
 # its recall.tsv row.
 measure() {
   local c="$1" side="$2" n="$3" port rest am space build workers=2 mem=2GB ddl
-  local log plan res err set_perturb="" search search_set ms launched flush r10 r100 got
+  local log plan res err set_perturb="" search search_set ms launched flush r10 r100 got repeats
   port="$(port_for "$side")"
   am="${c%%_*}"
   rest="${c#*_}"
@@ -269,8 +269,8 @@ SQL
 SET hnsw.ef_search = $ef_search;
 SET ivfflat.probes = $probes;
 $set_perturb"
-  search="SELECT q.id AS qid, n.d FROM rec_query q, LATERAL (
-  SELECT b.$col $op q.$col AS d FROM rec_base b ORDER BY b.$col $op q.$col LIMIT 100) n"
+  search="SELECT q.id AS qid, n.id, n.d FROM rec_query q, LATERAL (
+  SELECT b.id, b.$col $op q.$col AS d FROM rec_base b ORDER BY b.$col $op q.$col LIMIT 100) n"
   # A sequential scan would read recall 1.0 and prove nothing.
   pgv_psql "$port" -At >"$plan" 2>"$err" <<SQL || die "$c on $side: EXPLAIN failed; see $err"
 $search_set
@@ -278,23 +278,27 @@ EXPLAIN (COSTS OFF) $search;
 SQL
   grep -q 'Index Scan using rec_idx' "$plan" || die "$c on $side: not an index scan; see $plan"
 
-  # The denominators are fixed, so a short result lowers recall. Results are
-  # stdout only: the seeded build prints INFO lines to stderr.
+  # The denominators are fixed, so a short result lowers recall. A repeated row
+  # would count as a hit, so an index holding every row twice could read 1.0:
+  # the last column is the rows returned twice. Results are stdout only: the
+  # seeded build prints INFO lines to stderr.
   pgv_psql "$port" -At -F "$tab" >"$res" 2>"$err" <<SQL || die "$c on $side: the measurement failed; see $err"
 $search_set
 CREATE TEMP TABLE got AS
 $search;
 CREATE TEMP TABLE ranked AS
-SELECT qid, d, row_number() OVER (PARTITION BY qid ORDER BY d) AS r FROM got;
+SELECT qid, id, d, row_number() OVER (PARTITION BY qid ORDER BY d) AS r FROM got;
 SELECT count(*) FILTER (WHERE r <= 10 AND d <= t.d10 + 1e-5) / (10.0 * $queries),
        count(*) FILTER (WHERE r <= 100 AND d <= t.d100 + 1e-5) / (100.0 * $queries),
-       count(*)
+       count(*),
+       count(*) - count(DISTINCT (ranked.qid, ranked.id))
 FROM ranked JOIN rec_truth t ON t.qid = ranked.qid AND t.space = '$space';
 DROP INDEX rec_idx;
 ALTER TABLE rec_base RESET (parallel_workers);
 SQL
-  IFS="$tab" read -r r10 r100 got <"$res" || true
-  [ -n "$got" ] || die "$c on $side: no measurement; see $res"
+  IFS="$tab" read -r r10 r100 got repeats <"$res" || true
+  [ -n "$repeats" ] || die "$c on $side: no measurement; see $res"
+  [ "$repeats" = 0 ] || die "$c on $side: returned a row twice ($repeats repeats); see $res"
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$c" "$side" "$n" "$ms" "$r10" "$r100" "$got" "$flush" >>"$out/recall.tsv"
 }
 
