@@ -22,7 +22,9 @@
 #   are removed at exit unless PGV_KEEP_DATA=1.
 #   Environment, with defaults: PGV_RECALL_ROWS 100000, PGV_RECALL_QUERIES
 #   1000, PGV_RECALL_DIM 100, PGV_RECALL_NNZ 16, PGV_RECALL_BUILDS 3 (odd, so
-#   a median is one build's value), PGV_RECALL_LISTS 316, PGV_RECALL_EF_SEARCH
+#   a median is one build's value), PGV_RECALL_BIT_BUILDS 9 (odd too; it replaces
+#   PGV_RECALL_BUILDS for ivfflat_bit_serial and ivfflat_bit_parallel, whose
+#   spread is wider than the margin), PGV_RECALL_LISTS 316, PGV_RECALL_EF_SEARCH
 #   100, PGV_RECALL_PROBES 20, PGV_RECALL_SPILL_MEM 64MB, PGV_RECALL_BAND
 #   "0.5 0.995". PGV_RECALL_TEXT and PGV_RECALL_CACHE reach recall-data.sh.
 #   PGV_RECALL_PERTURB_SUBJECT (self-test only) is a name=value setting applied
@@ -85,6 +87,7 @@ queries="${PGV_RECALL_QUERIES:-1000}"
 dim="${PGV_RECALL_DIM:-100}"
 nnz="${PGV_RECALL_NNZ:-16}"
 builds="${PGV_RECALL_BUILDS:-3}"
+bit_builds="${PGV_RECALL_BIT_BUILDS:-9}"
 lists="${PGV_RECALL_LISTS:-316}"
 ef_search="${PGV_RECALL_EF_SEARCH:-100}"
 probes="${PGV_RECALL_PROBES:-20}"
@@ -92,10 +95,15 @@ spill_mem="${PGV_RECALL_SPILL_MEM:-64MB}"
 band="${PGV_RECALL_BAND:-0.5 0.995}"
 perturb="${PGV_RECALL_PERTURB_SUBJECT:-}"
 
-case "$builds" in
-  "" | 0* | *[!0-9]*) die "PGV_RECALL_BUILDS must be a positive odd number, got '$builds'" ;;
-esac
-[ $((builds % 2)) -eq 1 ] || die "PGV_RECALL_BUILDS must be odd, got $builds"
+# Dies unless $2, the value of the setting $1, is a positive odd number.
+check_builds() {
+  case "$2" in
+    "" | 0* | *[!0-9]*) die "$1 must be a positive odd number, got '$2'" ;;
+  esac
+  [ $(($2 % 2)) -eq 1 ] || die "$1 must be odd, got $2"
+}
+check_builds PGV_RECALL_BUILDS "$builds"
+check_builds PGV_RECALL_BIT_BUILDS "$bit_builds"
 read -r band_lo band_hi band_rest <<<"$band"
 case "$band_lo:$band_hi:$band_rest" in
   *[!0-9.:]* | :* | *::* | *:*:?*) die "PGV_RECALL_BAND must be two numbers, got '$band'" ;;
@@ -115,6 +123,14 @@ mkdir -p "$out"
 [ -x "$PG_VEC/bin/postgres" ] || die "missing $PG_VEC/bin/postgres; run scripts/pgvector/build-reference.sh"
 
 data="$("$(dirname "$0")/recall-data.sh" "$rows" "$queries" "$dim" "$nnz")" || die "preparing the dataset failed"
+
+# The builds on each side of case $1.
+builds_of() {
+  case "$1" in
+    ivfflat_bit_serial | ivfflat_bit_parallel) echo "$bit_builds" ;;
+    *) echo "$builds" ;;
+  esac
+}
 
 # Sets col, op and opclass for the space (the column type) $1.
 space_ops() {
@@ -302,11 +318,13 @@ SQL
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$c" "$side" "$n" "$ms" "$r10" "$r100" "$got" "$flush" >>"$out/recall.tsv"
 }
 
-# The median of column $3 of case $1 on side $2. builds is odd, so it is one
-# build's value.
+# The median of column $3 of case $1 on side $2. The case's build count is odd,
+# so it is one build's value.
 median() {
+  local count
+  count="$(builds_of "$1")"
   awk -F'\t' -v c="$1" -v s="$2" -v col="$3" '$1 == c && $2 == s { print $col }' "$out/recall.tsv" |
-    LC_ALL=C sort -n | sed -n "$(((builds + 1) / 2))p"
+    LC_ALL=C sort -n | sed -n "$(((count + 1) / 2))p"
 }
 
 # Prints "<baseline>\t<subject>\t<difference>\t<verdict>" for the medians $2
@@ -368,10 +386,11 @@ done
 
 : >"$out/recall.tsv"
 for c in "${selected[@]}"; do
+  count="$(builds_of "$c")"
   for side in ref "$subject"; do
     n=1
-    while [ "$n" -le "$builds" ]; do
-      echo "$c: $side build $n of $builds" >&2
+    while [ "$n" -le "$count" ]; do
+      echo "$c: $side build $n of $count" >&2
       measure "$c" "$side" "$n"
       n=$((n + 1))
     done
@@ -403,7 +422,8 @@ if [ -n "${PGV_RECALL_TEXT:-}" ]; then source="the text file $PGV_RECALL_TEXT (P
   echo "Subject binary: $subject_bin; commit $(git -C "$PGV_REPO" rev-parse --short HEAD); data: $source."
   echo
   echo "$rows rows and $queries held-out queries of $source at $dim dimensions (sparsevec keeps $nnz" \
-    "entries); $builds builds on each side, medians shown; HNSW m = 16, ef_construction = 64," \
+    "entries); $builds builds on each side, $bit_builds for the IVFFlat bit cases, medians shown;" \
+    "HNSW m = 16, ef_construction = 64," \
     "ef_search = $ef_search; IVFFlat lists = $lists, probes = $probes; maintenance_work_mem = 2GB," \
     "or $spill_mem for spill; $(uname -sm). A row passes when the subject is at least the baseline" \
     "minus 0.01 and the baseline is within $band_lo to $band_hi."

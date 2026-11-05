@@ -1283,11 +1283,12 @@ recall_toy_dies() {
 }
 
 # The whole tier, C against C: every row passes, and the rows it writes are the
-# ones run-all.sh and the report read. Three builds, as in the real tier: even
-# the fixture has outliers (about one parallel sparsevec build in 60 reads
-# 0.985 at @10), and a single build would fail the row on one of them.
+# ones run-all.sh and the report read. The real tier's build counts, three and
+# the default nine for IVFFlat bit: even the fixture has outliers (about one
+# parallel sparsevec build in 60 reads 0.985 at @10), and a single build would
+# fail the row on one of them.
 test_recall_ref() {
-  local log="$PGV_WORK/recall-ref.log" d="$PGV_WORK/recall/ref"
+  local log="$PGV_WORK/recall-ref.log" d="$PGV_WORK/recall/ref" ms
   if PGV_RECALL_BUILDS=3 recall_toy ref >"$log" 2>&1; then
     pass "recall ref: exit 0"
   else
@@ -1299,10 +1300,36 @@ test_recall_ref() {
   else
     fail "recall ref: 34 two-column rows, all ok (see $d/summary.tsv)"
   fi
-  if [ "$(wc -l 2>/dev/null <"$d/recall.tsv" | tr -d ' ')" = 90 ]; then
-    pass "recall ref: 90 measurements (15 cases, 2 sides, 3 builds)"
+  if [ "$(wc -l 2>/dev/null <"$d/recall.tsv" | tr -d ' ')" = 114 ]; then
+    pass "recall ref: 114 measurements (13 cases, 2 sides, 3 builds; 2 cases, 2 sides, 9 builds)"
   else
-    fail "recall ref: 90 measurements (see $d/recall.tsv)"
+    fail "recall ref: 114 measurements (see $d/recall.tsv)"
+  fi
+  if awk -F'\t' '{ n[$1 FS $2]++ }
+      END {
+        for (k in n) {
+          pairs++
+          if (n[k] != (k ~ /^ivfflat_bit_(serial|parallel)\t/ ? 9 : 3)) bad = 1
+        }
+        exit (bad || pairs != 30)
+      }' "$d/recall.tsv"; then
+    pass "recall ref: 9 builds a side for the IVFFlat bit cases, 3 for the others"
+  else
+    fail "recall ref: 9 builds a side for the IVFFlat bit cases, 3 for the others (see $d/recall.tsv)"
+  fi
+  # The toy's recall saturates, so a median taken at the wrong rank would still
+  # read right; build times differ, so they show which build it took.
+  ms="$(awk -F'\t' '$1 == "ivfflat_bit_serial" && $2 == "ref" { print $4 }' "$d/recall.tsv" |
+    LC_ALL=C sort -n | awk 'NR == 5 { printf "%.1f", $1 }')"
+  if [ -n "$ms" ] && grep -qF "| ivfflat_bit_serial | $ms |" "$d/report.md"; then
+    pass "recall ref: an IVFFlat bit median is the 5th of its 9 builds"
+  else
+    fail "recall ref: an IVFFlat bit median is the 5th of its 9 builds (want $ms; see $d/report.md)"
+  fi
+  if grep -qF '3 builds on each side, 9 for the IVFFlat bit cases' "$d/report.md"; then
+    pass "recall ref: the report states both build counts"
+  else
+    fail "recall ref: the report states both build counts (see $d/report.md)"
   fi
   if awk -F'\t' '$1 == "hnsw_vector_spill" { n++; if ($8 !~ /^[0-9]+$/ || $9 !~ /^(leader|worker)$/) bad = 1 }
       END { exit (bad || n != 6) }' "$d/recall.tsv"; then
@@ -1373,13 +1400,14 @@ test_recall_guards() {
     fail "recall guards: that row is below the band and inside the margin (see $d/recall.tsv)"
   fi
   RECALL_DIES_KEEPS=1 PGV_RECALL_BUILDS=2 recall_toy_dies "recall guards: an even build count" even odd ref
+  RECALL_DIES_KEEPS=1 PGV_RECALL_BIT_BUILDS=2 recall_toy_dies "recall guards: an even bit build count" even-bit odd ref
   RECALL_DIES_KEEPS=1 recall_toy_dies "recall guards: an unknown case" unknown 'unknown case' ref nosuchcase
 }
 
 # The tier on pgrust, and pgrust's kill switch: it turns a parallel case into a
-# serial build, which must die rather than pass. Three builds for the reason
-# test_recall_ref gives: here also about one bit build in 50 reads below 0.99 at
-# @100, on C as on pgrust, because pgrust's k-means is unseeded.
+# serial build, which must die rather than pass. The real tier's build counts,
+# for the reason test_recall_ref gives: here also about one bit build in 50 reads
+# below 0.99 at @100, on C as on pgrust, because pgrust's k-means is unseeded.
 test_recall_pgrust() {
   local log="$PGV_WORK/recall-pgrust.log" d="$PGV_WORK/recall/pgrust"
   if PGV_RECALL_BUILDS=3 recall_toy pgrust >"$log" 2>&1 && [ "$(wc -l <"$d/summary.tsv" | tr -d ' ')" = 34 ]; then
