@@ -16,7 +16,8 @@ Date: 2026-11-05 · pgrust commit: `c055897146` (every run below; M7 changes no 
 
 **What the claim doesn't say:**
 - The rule is one-sided, so it shows pgrust isn't worse than C by more than 0.01. It says nothing about pgrust being better.
-- The gate ran at 100,000 rows and 100 dimensions on the `fast-profile` binary. The shipped `release` binary ran three `vector` cases at 396,000 rows and 300 dimensions, as a report, one build each. All 7 rows there are `ok`.
+- The gate ran at 100,000 rows and 100 dimensions on the `fast-profile` binary. A separate scale run covered three `vector` cases at 396,000 rows and 300 dimensions, as a report, one build each, and all 7 of its rows are `ok`. It was launched to use the release binary, but nothing saved confirms which binary served it (The scale run).
+- The tier can fail by chance: about 7% per run on the IVFFlat `bit` rows, a rough estimate from 31 builds a side (Recall). Neither full-size run did.
 - pgrust builds indexes more slowly than C: 1.1 to 1.9 times C's time on most cases, and much more for `halfvec` (5.0 to 5.6 times on HNSW, 12.6 to 16.7 times on IVFFlat). See Build time.
 
 ## Gates
@@ -43,7 +44,7 @@ Every command ran under `caffeinate -ims` from the repo root, one at a time, on 
 - **Unit tests,** 0 failed in each: `pgvector` 48, `pgvector_f16_parity` 3, `pgvector_hnsw` 13, `pgvector_hnsw_build` 2, `pgvector_hnsw_graph` 16, `pgvector_ivfflat` 8, `pgvector_ivfflat_build` 7, `pgvector_parallel` 1, `types_hnsw` 6, `types_ivfflat` 3 (each `cargo test -p <crate>`), and M6's core crates: `planner` 2 (filtered to `index_workers`), `types_relscan` 3, `execindexing` 18, `catalog_index` 5 (each `--lib`).
 - **Loom:** 5 passed. **Lints:** `lint_seam_installs` 1, `lint_determinism` 11, `lint_walker_arms` 1, `lint_inplace_locks` 1. `lint-determinism.sh` prints `PASS (0 violations; 43 warning(s))`.
 - **Reference trees:** `git status --porcelain --ignored` on both is empty.
-- **Capture key:** `8342dca63fe99622`, both as cached and recomputed from the inputs. Neither `run-all` log has a `capture:` line, so the on-disk tier reused the capture and no container was created.
+- **Capture key:** `8342dca63fe99622`, both as cached and recomputed from the inputs. The on-disk tier reused the capture: `pgvector-work/ondisk/capture/key` is dated Oct 19 and still matches. Containers were still created during both runs, because the reverse step boots the C image (`run-ondisk.sh:197`, `:255`). None is left.
 
 **Sleep:** no sleep, wake or DarkWake event falls inside any run. The last one in `pmset -g log` is 2026-11-02 11:48:23, three days before this work (`task4/pm-events.txt`). The wrapper first counted events before and after each command, and that count fell by one across the scale run because the log drops old entries. A before-and-after count can't be trusted, so the check was redone by date, which is what this paragraph rests on.
 
@@ -75,14 +76,33 @@ Evidence: `task4/run-all-pgrust/{report.md,recall.tsv}`, `task2/pgrust/`.
 
 Reading it:
 - **No overall bias.** The mean difference is −0.0008 in this run and −0.00003 in Task 2's. This run has 8 positive differences out of 30.
-- **`ivfflat_bit_serial` is the one case below C every time:** −0.0041 and −0.0037 here, −0.0024 and −0.0027 in Task 2's. Three builds a side, twice over, can't separate a small real gap from noise, so this is unresolved, not a finding. It's the first case to look at if the tier ever fails.
-- **Single builds are noisy, most of all IVFFlat `bit`.** Pooling both runs (6 builds a side), `ivfflat_bit_parallel@10` spans 0.0172 on pgrust and 0.0108 on C; `ivfflat_bit_serial@10` spans 0.0146 and 0.0072; `ivfflat_bit_serial@100` spans 0.0158 and 0.0063. pgrust's range is the wider one in 19 of the 30 rows. Task 2's 151 builds a side at toy size showed matching distributions, but nothing has measured that at full size. A span above the margin means a median of 3 could fail a row by chance, though neither run did.
+- **Two cases were below C in all four comparisons, and neither gap is real.** `ivfflat_bit_serial` read −0.0041 and −0.0037 here, −0.0024 and −0.0027 in Task 2's; `hnsw_vector_parallel` read −0.0022 and −0.0019, then −0.0033 and −0.0028. Two others were above C in all four (`hnsw_vector_serial`, `hnsw_sparsevec_parallel`). Each of those comparisons rests on 3 builds a side, so both low cases were measured again at 31 builds a side, and neither shows a gap (below).
+- **Single builds are noisy, most of all IVFFlat `bit`, and equally so on both servers.** Over 31 builds a side, IVFFlat `bit`'s standard deviations are 0.0042 to 0.0057 on C and 0.0037 to 0.0055 on pgrust. Its spans are above the 0.01 margin on every row and on both servers: 0.0164 to 0.0267 on C, 0.0151 to 0.0215 on pgrust.
+
+**Two larger samples,** taken after the gate on the fast-profile binary at this report's code, at full size, 31 builds a side. The mean gap is pgrust minus C. The last column resamples those builds to estimate how often a median of 3 fails the rule by chance. Evidence: `~/.cache/pgrust/m7-evidence/bit-sample/`, `hnsw-parallel-sample/`.
+
+| Row | mean gap | standard error | SD, C | SD, pgrust | span, C | span, pgrust | chance failure |
+|---|---|---|---|---|---|---|---|
+| ivfflat_bit_serial@10 | +0.0014 | 0.0012 | 0.0057 | 0.0037 | 0.0267 | 0.0185 | about 0.4% |
+| ivfflat_bit_serial@100 | −0.0003 | 0.0011 | 0.0042 | 0.0046 | 0.0214 | 0.0208 | about 0.8% |
+| ivfflat_bit_parallel@10 | −0.0015 | 0.0012 | 0.0042 | 0.0055 | 0.0204 | 0.0215 | about 4.1% |
+| ivfflat_bit_parallel@100 | −0.0016 | 0.0010 | 0.0042 | 0.0039 | 0.0164 | 0.0151 | about 2.1% |
+| hnsw_vector_parallel@10 | −0.0001 | 0.0003 | 0.0013 | 0.0013 | 0.0054 | 0.0050 | none in 200,000 resamples |
+| hnsw_vector_parallel@100 | −0.0001 | 0.0003 | 0.0010 | 0.0010 | 0.0041 | 0.0044 | none in 200,000 resamples |
+| hnsw_vector_serial@10 (control) | +0.0001 | 0.0004 | 0.0015 | 0.0017 | 0.0066 | 0.0067 | none in 200,000 resamples |
+| hnsw_vector_serial@100 (control) | +0.0001 | 0.0003 | 0.0012 | 0.0011 | 0.0050 | 0.0049 | none in 200,000 resamples |
+
+- **No gap in either case.** Every IVFFlat `bit` mean is within 1.6 standard errors of zero, and every HNSW mean within 0.5. The streaks in the 3-build runs were noise.
+- **The gate itself can fail by chance on the IVFFlat `bit` rows,** at about 7% per run across the four rows if they're independent. This is a rough estimate from 31 builds a side, and `@10` and `@100` come from the same builds, so the rows aren't fully independent. A failure there wouldn't mean pgrust regressed.
+- **What to do about it is the user's decision,** before the v0.4-beta merge gates on this tier: whether to raise `PGV_RECALL_BUILDS` for the tier or for the IVFFlat `bit` cases. The rule and margin don't change either way. Until it's decided, a row failure with no bug goes to the user under the plan's stop.
 
 **`ref` mode (C against C):** 34/34, worst row −0.0024. The seeded build's three builds are identical in 10 of the 15 cases, every IVFFlat case and every serial HNSW case, so those medians are a single draw rather than a median of variation. Only parallel HNSW and spill vary. That's probably why its IVFFlat rows sit above stock C's together (+0.0019 to +0.0061, apart from one at −0.0006): one fixed k-means result against stock C's varying ones. The `ref` run proves the tier passes C against C; it isn't a measure of C's own spread.
 
 ## The scale run
 
-The claim on the shipped binary, as a report: `target/release/postgres` (built at `c055897146`), 396,000 rows, 300 dimensions, `lists = 630`, `probes = 20`, one build per side. The command, verbatim from the plan: `PGRUST_PROFILE=release PGV_RECALL_ROWS=396000 PGV_RECALL_DIM=300 PGV_RECALL_NNZ=48 PGV_RECALL_LISTS=630 PGV_RECALL_BUILDS=1 scripts/pgvector/run-recall.sh pgrust hnsw_vector_serial hnsw_vector_parallel ivfflat_vector_serial`. Evidence: `~/.cache/pgrust/m7-evidence/scale/`.
+A report, not a gate: 396,000 rows, 300 dimensions, `lists = 630`, `probes = 20`, one build per side. The command, verbatim from the plan: `PGRUST_PROFILE=release PGV_RECALL_ROWS=396000 PGV_RECALL_DIM=300 PGV_RECALL_NNZ=48 PGV_RECALL_LISTS=630 PGV_RECALL_BUILDS=1 scripts/pgvector/run-recall.sh pgrust hnsw_vector_serial hnsw_vector_parallel ivfflat_vector_serial`. Evidence: `~/.cache/pgrust/m7-evidence/scale/`.
+
+**Which binary served it is not confirmed.** The run was launched to use `target/release/postgres` (built at `c055897146`), and that's probably what ran: `PGRUST_PROFILE=release` was set in the same command prefix as the five `PGV_RECALL_*` values, all of which appear in `report.md`; `PGRUST_BIN` isn't set in the environment, so `common.sh` derives the path from the profile; and the release binary's access time, 01:36:19, falls inside the run. But the wrapper logged only the command's arguments, and the clusters and server logs are gone, so no saved file records the server's path. Treat the results below as the scale run's, not as proof about the shipped binary.
 
 | Case | C | pgrust | difference | verdict | C build ms | pgrust build ms | pgrust / C |
 |---|---|---|---|---|---|---|---|
@@ -95,8 +115,8 @@ The claim on the shipped binary, as a report: `target/release/postgres` (built a
 
 `exact_vector` is `ok`, with a largest difference of 4.9e-07 over 100 queries. No row fell below the rule, so no rerun at 3 builds was needed.
 
-- **Recall is lower at this size on both servers,** about 0.75 for HNSW, because the search settings stayed at the gate's values. The two servers track each other; this isn't a pgrust effect.
-- **The build ratios are higher than the gate's** (1.91 to 3.10, against 1.48 to 1.66 for the same cases). Size, dimensions and binary all differ, and it's one build each, so this shows the gap doesn't shrink at scale. It doesn't say why.
+- **Recall is lower at this size on both servers,** about 0.75 for HNSW, probably because the search settings stayed at the gate's values while rows and dimensions both grew. That wasn't tested. The two servers track each other, so this isn't a pgrust effect.
+- **The build ratios are higher than the gate's** (1.91 to 3.10, against 1.48 to 1.66 for the same cases). That's three single builds, with size, dimensions and probably the binary all different, so it shows no trend and no cause.
 - **Only three cases ran at this size.** `halfvec`, `sparsevec`, `bit`, spill and parallel IVFFlat did not.
 
 ## Build time
@@ -171,7 +191,7 @@ Limits:
 ## Not run
 
 - **`halfvec`, `sparsevec`, `bit`, spill and parallel IVFFlat at scale.**
-- **The full tier on the release binary.** Only the scale run used it; the gate used `fast-profile`.
+- **The full tier on the release binary.** The gate used `fast-profile`, and only the scale run was launched for release (The scale run).
 - **More than two full-size samples of the tier per mode.** Task 2's run predates `run-all.sh`'s wiring, but the tier's scripts haven't changed since it (`git diff 52b5bae361 HEAD` on them is empty).
 - **x86_64, and the wasm build.** macOS arm64 only, as before.
 - **Clippy, and a workspace-wide `cargo test`.** M7 changes no Rust.
@@ -181,8 +201,9 @@ Limits:
 
 **Found by M7:**
 - **`halfvec` build speed** (Build time): the largest performance gap in the port, cause unknown.
-- **pgrust's build-time gap against C at scale:** 1.91× to 3.10× on the release binary.
-- **IVFFlat `bit`'s spread and `ivfflat_bit_serial`'s position below C** (Recall): within the rule in every run. A larger sample at full size would settle it, and would show how often a median of 3 can fail by chance.
+- **pgrust's build-time gap against C at scale:** 1.91× to 3.10× in three single builds (The scale run).
+- **The scale run's binary is unconfirmed** (The scale run). A rerun that saves the server's path would settle it.
+- **The tier's chance failures on IVFFlat `bit`:** about 7% per run, a rough estimate (Recall). The user decides whether to raise `PGV_RECALL_BUILDS` for the tier or for those cases, before the merge gates on it. There's no gap to chase: the 31-build samples show none for IVFFlat `bit` or `hnsw_vector_parallel`.
 
 **Closed by M7:** a worker doing the overflow flush, for the path above; CLAUDE.md's capture-key list; the rerun of the full `harness_test.sh`, `run-repair-check.sh` and the client suite after M6's final fixes; M6's sleep-affected build-time table.
 
