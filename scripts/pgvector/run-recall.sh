@@ -395,10 +395,14 @@ done
   awk -F'\t' '{ print $1 "\t" ($5 == "ok" ? "ok" : "FAIL") }' "$out/rows.tsv"
 } >"$out/summary.tsv"
 
+source="GloVe 6B"
+if [ -n "${PGV_RECALL_TEXT:-}" ]; then source="the text file $PGV_RECALL_TEXT (PGV_RECALL_TEXT)"; fi
 {
   echo "# Recall: $subject against C pgvector 0.8.7"
   echo
-  echo "$rows rows and $queries held-out queries of GloVe 6B at $dim dimensions (sparsevec keeps $nnz" \
+  echo "Subject binary: $subject_bin; commit $(git -C "$PGV_REPO" rev-parse --short HEAD); data: $source."
+  echo
+  echo "$rows rows and $queries held-out queries of $source at $dim dimensions (sparsevec keeps $nnz" \
     "entries); $builds builds on each side, medians shown; HNSW m = 16, ef_construction = 64," \
     "ef_search = $ef_search; IVFFlat lists = $lists, probes = $probes; maintenance_work_mem = 2GB," \
     "or $spill_mem for spill; $(uname -sm). A row passes when the subject is at least the baseline" \
