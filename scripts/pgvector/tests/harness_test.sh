@@ -680,6 +680,7 @@ test_stale_results() {
   stale_results_check bytecmp PAGEMASK_BIN
   stale_results_check diff DIFFRUNNER_BIN
   stale_results_check ondisk PAGEMASK_BIN
+  stale_results_check recall PG_VEC_SEEDED
   # An argument error comes before the clear: a typo touches nothing. No
   # pagemask, so a part check that let it through could not start a capture.
   mkdir -p "$w/ondisk/ref"
@@ -1223,6 +1224,170 @@ test_recall_download_check() {
   mkdir -p "$cache"
   echo garbage >"$cache/glove.6B.zip"
   PGV_RECALL_TEXT='' recall_dies "recall download: garbage zip" checksum "$cache" 20 10 4 2
+}
+
+# The recall tier at a toy size: 2,000 rows and 20 queries. $1 is the mode, the
+# rest are cases. PGV_RECALL_BUILDS and PGV_RECALL_BAND pass through; the rest
+# of the environment reaches the tier. Stock C never seeds a build, and at 20
+# queries an unsaturated recall moves by more than the 0.01 margin from one
+# k-means to the next, so the fixture is shaped to saturate: a thin strip around
+# a ring, whose lists are arcs, so 3 of 10 probes hold a query's 100 nearest
+# whatever k-means does, while 1 probe does not. The strip's width keeps HNSW's
+# graph connected (a bare ring does not), and the offset keeps the same 4
+# entries in every sparsevec.
+recall_toy() {
+  local mode="$1" fixture="$PGV_WORK/recall-toy.txt"
+  shift
+  awk 'BEGIN {
+    for (i = 1; i <= 2020; i++) {
+      printf "w%d", i
+      for (j = 1; j <= 16; j++)
+        printf " %.6f", (j <= 4 ? 2 : 0) + sin(i * 12.9898 + j * 78.233) + 0.3 * sin(i * 7.77 + j * 156.466)
+      printf "\n"
+    }
+  }' >"$fixture"
+  PGV_RECALL_TEXT="$fixture" PGV_RECALL_CACHE="$PGV_WORK/recall-toy-cache" \
+    PGV_RECALL_ROWS=2000 PGV_RECALL_QUERIES=20 PGV_RECALL_DIM=16 PGV_RECALL_NNZ=4 \
+    PGV_RECALL_BUILDS="${PGV_RECALL_BUILDS:-1}" PGV_RECALL_LISTS=10 PGV_RECALL_PROBES=3 \
+    PGV_RECALL_SPILL_MEM=3073kB PGV_RECALL_BAND="${PGV_RECALL_BAND:-0 1.01}" \
+    "$here/../run-recall.sh" "$mode" "$@"
+}
+
+# The result of row $2 in the summary.tsv of mode $1.
+recall_row() {
+  awk -F'\t' -v n="$2" '$1 == n { print $2 }' "$PGV_WORK/recall/$1/summary.tsv" 2>/dev/null
+}
+
+# recall_toy must die with $3 in its message. $1 labels the check, $2 names its
+# log, and the rest are recall_toy's arguments; the caller sets the environment.
+# A summary.tsv from before is gone afterwards, or with RECALL_DIES_KEEPS=1 (an
+# argument error, which comes before the clear) still there.
+recall_toy_dies() {
+  local label="$1" log="$PGV_WORK/recall-dies-$2.log" want="$3" f
+  shift 3
+  f="$PGV_WORK/recall/$1/summary.tsv"
+  mkdir -p "$(dirname "$f")"
+  printf 'old\tok\n' >"$f"
+  if recall_toy "$@" >"$log" 2>&1; then
+    fail "$label: dies (see $log)"
+  elif ! grep -qF "$want" "$log"; then
+    fail "$label: dies with '$want' (see $log)"
+  elif [ -n "${RECALL_DIES_KEEPS:-}" ] && [ ! -e "$f" ]; then
+    fail "$label: keeps the old summary.tsv"
+  elif [ -z "${RECALL_DIES_KEEPS:-}" ] && [ -e "$f" ]; then
+    fail "$label: leaves no summary.tsv"
+  else
+    pass "$label: dies with '$want'"
+  fi
+}
+
+# The whole tier, C against C: every row passes, and the rows it writes are the
+# ones run-all.sh and the report read. Three builds, as in the real tier: even
+# the fixture has outliers (about one parallel sparsevec build in 60 reads
+# 0.985 at @10), and a single build would fail the row on one of them.
+test_recall_ref() {
+  local log="$PGV_WORK/recall-ref.log" d="$PGV_WORK/recall/ref"
+  if PGV_RECALL_BUILDS=3 recall_toy ref >"$log" 2>&1; then
+    pass "recall ref: exit 0"
+  else
+    fail "recall ref: exit 0 (see $log)"
+  fi
+  if [ "$(wc -l 2>/dev/null <"$d/summary.tsv" | tr -d ' ')" = 34 ] &&
+    awk -F'\t' 'NF != 2 || $2 != "ok" { bad = 1 } END { exit bad }' "$d/summary.tsv"; then
+    pass "recall ref: 34 two-column rows, all ok"
+  else
+    fail "recall ref: 34 two-column rows, all ok (see $d/summary.tsv)"
+  fi
+  if [ "$(wc -l 2>/dev/null <"$d/recall.tsv" | tr -d ' ')" = 90 ]; then
+    pass "recall ref: 90 measurements (15 cases, 2 sides, 3 builds)"
+  else
+    fail "recall ref: 90 measurements (see $d/recall.tsv)"
+  fi
+  if awk -F'\t' '$1 == "hnsw_vector_spill" { n++; if ($8 !~ /^[0-9]+$/ || $9 !~ /^(leader|worker)$/) bad = 1 }
+      END { exit (bad || n != 6) }' "$d/recall.tsv"; then
+    pass "recall ref: every spill build has a flush count and a participant"
+  else
+    fail "recall ref: every spill build has a flush count and a participant (see $d/recall.tsv)"
+  fi
+  if [ -s "$d/report.md" ] && [ ! -e "$d/data" ]; then
+    pass "recall ref: a report, and the clusters removed"
+  else
+    fail "recall ref: a report, and the clusters removed (see $d)"
+  fi
+  if "$PG_TOOLS/bin/pg_isready" -q -h "$PGV_WORK/sock" -p "$(port_for ref)" ||
+    "$PG_TOOLS/bin/pg_isready" -q -h "$PGV_WORK/sock" -p "$(port_for seeded)"; then
+    fail "recall ref: both servers stopped"
+  else
+    pass "recall ref: both servers stopped"
+  fi
+}
+
+# A subject degraded after the build must lose recall, and a result cut short
+# must count against it rather than shrink the denominator.
+test_recall_detects_difference() {
+  local log="$PGV_WORK/recall-detect.log" f="$PGV_WORK/recall/ref/recall.tsv"
+  if PGV_RECALL_PERTURB_SUBJECT=ivfflat.probes=1 recall_toy ref ivfflat_vector_serial >"$log" 2>&1; then
+    fail "recall detects: probes = 1 exits non-zero (see $log)"
+  elif [ "$(recall_row ref ivfflat_vector_serial@10)" = FAIL ]; then
+    pass "recall detects: probes = 1 fails @10"
+  else
+    fail "recall detects: probes = 1 fails @10 (see $log)"
+  fi
+  if PGV_RECALL_PERTURB_SUBJECT=hnsw.ef_search=10 recall_toy ref hnsw_vector_serial >"$log" 2>&1; then
+    fail "recall detects: ef_search = 10 exits non-zero (see $log)"
+  elif [ "$(recall_row ref hnsw_vector_serial@100)" = FAIL ]; then
+    pass "recall detects: ef_search = 10 fails @100"
+  else
+    fail "recall detects: ef_search = 10 fails @100 (see $log)"
+  fi
+  if awk -F'\t' '$2 == "ref" { b = $7 } $2 == "seeded" { s = $7 } END { exit !(s + 0 > 0 && s + 0 < b + 0) }' "$f"; then
+    pass "recall detects: the cut-short subject returned fewer rows"
+  else
+    fail "recall detects: the cut-short subject returned fewer rows (see $f)"
+  fi
+}
+
+# Everything that must stop the tier rather than let it pass.
+test_recall_guards() {
+  local log="$PGV_WORK/recall-band.log" d="$PGV_WORK/recall/ref" row="ivfflat_halfvec_serial@100"
+  # HNSW, not IVFFlat: with both scans disabled the planner goes by cost, and at
+  # this size IVFFlat's index scan is still the cheaper.
+  PGV_RECALL_PERTURB_SUBJECT=enable_indexscan=off recall_toy_dies \
+    "recall guards: a sequential scan" indexscan 'not an index scan' ref hnsw_vector_serial
+  PGV_RECALL_PERTURB_SUBJECT=max_parallel_maintenance_workers=0 recall_toy_dies \
+    "recall guards: a serial parallel build" serial 'expected 2 parallel workers' ref hnsw_vector_parallel
+  # A baseline outside the band fails the row although the subject is inside
+  # the margin: such a comparison could not have shown a difference.
+  if PGV_RECALL_BAND="0.9999 1" recall_toy ref ivfflat_halfvec_serial >"$log" 2>&1; then
+    fail "recall guards: a baseline outside the band exits non-zero (see $log)"
+  elif [ "$(recall_row ref "$row")" = FAIL ] && grep -F "$row" "$d/report.md" | grep -qF 'cannot detect a difference'; then
+    pass "recall guards: a baseline outside the band fails its row"
+  else
+    fail "recall guards: a baseline outside the band fails its row (see $log)"
+  fi
+  if awk -F'\t' '$2 == "ref" { b = $6 } $2 == "seeded" { s = $6 }
+      END { exit !(b < 0.9999 && s >= b - 0.01) }' "$d/recall.tsv"; then
+    pass "recall guards: that row is below the band and inside the margin"
+  else
+    fail "recall guards: that row is below the band and inside the margin (see $d/recall.tsv)"
+  fi
+  RECALL_DIES_KEEPS=1 PGV_RECALL_BUILDS=2 recall_toy_dies "recall guards: an even build count" even odd ref
+  RECALL_DIES_KEEPS=1 recall_toy_dies "recall guards: an unknown case" unknown 'unknown case' ref nosuchcase
+}
+
+# The tier on pgrust, and pgrust's kill switch: it turns a parallel case into a
+# serial build, which must die rather than pass. Three builds for the reason
+# test_recall_ref gives: here also about one bit build in 50 reads below 0.99 at
+# @100, on C as on pgrust, because pgrust's k-means is unseeded.
+test_recall_pgrust() {
+  local log="$PGV_WORK/recall-pgrust.log" d="$PGV_WORK/recall/pgrust"
+  if PGV_RECALL_BUILDS=3 recall_toy pgrust >"$log" 2>&1 && [ "$(wc -l <"$d/summary.tsv" | tr -d ' ')" = 34 ]; then
+    pass "recall pgrust: 34 rows, exit 0"
+  else
+    fail "recall pgrust: 34 rows, exit 0 (see $log)"
+  fi
+  PGRUST_VECTOR_INDEXBUILD_POOL=0 recall_toy_dies \
+    "recall pgrust: the kill switch" pool 'expected 2 parallel workers' pgrust hnsw_vector_parallel
 }
 
 # --- runner ---
