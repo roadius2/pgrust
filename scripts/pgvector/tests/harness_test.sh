@@ -1129,6 +1129,102 @@ test_buildtime_ref() {
   fi
 }
 
+# recall-data.sh must die with $2 in its message and leave no prep-* (a .part
+# included) in the cache $3, which the caller made. $1 labels the check; the
+# rest are the arguments, and the caller sets PGV_RECALL_TEXT.
+recall_dies() {
+  local label="$1" want="$2" cache="$3" log="$3.log"
+  shift 3
+  if PGV_RECALL_CACHE="$cache" "$here/../recall-data.sh" "$@" >"$log" 2>&1; then
+    fail "$label: dies (see $log)"
+  elif ! grep -q "$want" "$log"; then
+    fail "$label: dies with '$want' (see $log)"
+  elif ls -d "$cache"/prep-* >/dev/null 2>&1; then
+    fail "$label: leaves no prepared directory (see $cache)"
+  else
+    pass "$label: dies with '$want', no prepared directory"
+  fi
+}
+
+# The dataset's preparation, on a fixture: which lines are queries, the dense
+# and sparse forms, reuse, and every way a preparation must refuse.
+test_recall_prep() {
+  local d="$PGV_WORK/recall-prep" log="$PGV_WORK/recall-prep.log" dir again
+  local fixture="$PGV_WORK/recall-prep/fixture.txt"
+  rm -rf "$d"
+  mkdir -p "$d/cache" "$d/not-multiple" "$d/bad-line" "$d/short"
+  {
+    echo 'w 0.5 -0.9 0.1 0.5'
+    echo 'x 1.50 -2e-05 0.10 3'
+    awk 'BEGIN { for (i = 3; i <= 30; i++)
+      printf "w%d %.3f %.3f %.3f %.3f\n", i, sin(i), cos(i), sin(2 * i), cos(2 * i) }'
+  } >"$fixture"
+  if dir="$(PGV_RECALL_TEXT="$fixture" PGV_RECALL_CACHE="$d/cache" "$here/../recall-data.sh" 20 10 4 2 2>"$log")"; then
+    pass "recall prep: exit 0"
+  else
+    fail "recall prep: exit 0 (see $log)"
+    return
+  fi
+  case "$dir" in
+    *.part) fail "recall prep: prints the prepared directory: '$dir'" ;;
+    "$d/cache/prep-"*) pass "recall prep: prints the prepared directory" ;;
+    *) fail "recall prep: prints the prepared directory: '$dir'" ;;
+  esac
+  if [ "$(wc -l <"$dir/base.tsv" | tr -d ' ')" = 20 ] && [ "$(wc -l <"$dir/query.tsv" | tr -d ' ')" = 10 ]; then
+    pass "recall prep: 20 base lines, 10 query lines"
+  else
+    fail "recall prep: 20 base lines, 10 query lines (see $dir)"
+  fi
+  if [ "$(cut -f1 "$dir/query.tsv" | tr '\n' ' ')" = "3 6 9 12 15 18 21 24 27 30 " ] &&
+    [ "$(cut -f1 "$dir/base.tsv" | tr '\n' ' ')" = "1 2 4 5 7 8 10 11 13 14 16 17 19 20 22 23 25 26 28 29 " ]; then
+    pass "recall prep: every third line is a query"
+  else
+    fail "recall prep: every third line is a query (see $dir)"
+  fi
+  if [ "$(sed -n 1p "$dir/base.tsv")" = "$(printf '1\t[0.5,-0.9,0.1,0.5]\t{1:0.5,2:-0.9}/4')" ]; then
+    pass "recall prep: largest magnitudes, ties to the lower index"
+  else
+    fail "recall prep: largest magnitudes, ties to the lower index: '$(sed -n 1p "$dir/base.tsv")'"
+  fi
+  if [ "$(sed -n 2p "$dir/base.tsv")" = "$(printf '2\t[1.50,-2e-05,0.10,3]\t{1:1.50,4:3}/4')" ]; then
+    pass "recall prep: values verbatim"
+  else
+    fail "recall prep: values verbatim: '$(sed -n 2p "$dir/base.tsv")'"
+  fi
+  # A relative cache still prints the absolute path.
+  again="$(cd "$d" && PGV_RECALL_TEXT="$fixture" PGV_RECALL_CACHE=cache "$here/../recall-data.sh" 20 10 4 2 2>>"$log")" || true
+  if [ "$again" = "$dir" ]; then
+    pass "recall prep: a second run prints the same path"
+  else
+    fail "recall prep: a second run prints the same path: '$again' (see $log)"
+  fi
+  # An interrupted preparation: its .part is rebuilt, never trusted.
+  mv "$dir" "$dir.part"
+  : >"$dir.part/base.tsv"
+  again="$(PGV_RECALL_TEXT="$fixture" PGV_RECALL_CACHE="$d/cache" "$here/../recall-data.sh" 20 10 4 2 2>>"$log")" || true
+  if [ "$again" = "$dir" ] && [ "$(wc -l <"$dir/base.tsv" | tr -d ' ')" = 20 ] && [ ! -e "$dir.part" ]; then
+    pass "recall prep: a leftover .part is rebuilt"
+  else
+    fail "recall prep: a leftover .part is rebuilt: '$again' (see $log)"
+  fi
+
+  PGV_RECALL_TEXT="$fixture" recall_dies "recall prep: rows not a multiple of queries" multiple "$d/not-multiple" 21 10 4 2
+  sed '7s/ [^ ]*$//' "$fixture" >"$d/bad-line.txt"
+  PGV_RECALL_TEXT="$d/bad-line.txt" recall_dies "recall prep: wrong field count" 'line 7 has 4 fields' "$d/bad-line" 20 10 4 2
+  head -n 29 "$fixture" >"$d/short.txt"
+  PGV_RECALL_TEXT="$d/short.txt" recall_dies "recall prep: short fixture" 'expected 10' "$d/short" 20 10 4 2
+}
+
+# A zip that fails the pinned checksum is never read. The garbage file is
+# already in place, so nothing touches the network.
+test_recall_download_check() {
+  local cache="$PGV_WORK/recall-download"
+  rm -rf "$cache"
+  mkdir -p "$cache"
+  echo garbage >"$cache/glove.6B.zip"
+  PGV_RECALL_TEXT='' recall_dies "recall download: garbage zip" checksum "$cache" 20 10 4 2
+}
+
 # --- runner ---
 if [ "$#" -eq 0 ]; then
   # Declaration order (declare -F would sort): a test may read the results of
