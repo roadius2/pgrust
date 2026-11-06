@@ -979,6 +979,8 @@ fn am_of(relam: Oid) -> IndexAm {
         K::Spgist => IndexAm::Spgist,
         K::Gin => IndexAm::Gin,
         K::Brin => IndexAm::Brin,
+        K::Hnsw => IndexAm::Hnsw,
+        K::Ivfflat => IndexAm::Ivfflat,
         _ => IndexAm::Other,
     }
 }

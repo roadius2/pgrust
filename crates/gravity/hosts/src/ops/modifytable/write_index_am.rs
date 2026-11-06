@@ -4,16 +4,17 @@ use types_rel::Relation;
 use types_relscan::IndexAmKind;
 
 /// D3279: the AMs whose insert `index_maint` serves through `indexam::index_insert` (ExecInsertIndexTuples' call): the
-/// core six and contrib bloom; pgvector's hnsw stays out until a PostgreSQL 18.6 oracle with pgvector witnesses it.
+/// core six, contrib bloom and (fork) pgvector's hnsw and ivfflat, which the fork's harness witnesses against PostgreSQL
+/// 18.6 with pgvector 0.8.7 (scripts/pgvector).
 pub fn insertable(kind: IndexAmKind) -> bool {
-    matches!(kind, IndexAmKind::Btree | IndexAmKind::Hash | IndexAmKind::Gin | IndexAmKind::Gist | IndexAmKind::Spgist | IndexAmKind::Brin | IndexAmKind::Bloom)
+    matches!(kind, IndexAmKind::Btree | IndexAmKind::Hash | IndexAmKind::Gin | IndexAmKind::Gist | IndexAmKind::Spgist | IndexAmKind::Brin | IndexAmKind::Bloom | IndexAmKind::Hnsw | IndexAmKind::Ivfflat)
 }
 
 pub fn unmaintainable_am(index: &Relation<'_>) -> Option<&'static str> {
     let form = index.rd_index.as_ref()?;
     let kind = IndexAmKind::from_relam(index.rd_rel.relam);
     if !insertable(kind) {
-        Some("an index whose access method is not btree / hash / gin / gist / spgist / brin / bloom")
+        Some("an index whose access method is not btree / hash / gin / gist / spgist / brin / bloom / hnsw / ivfflat")
     } else if !matches!(kind, IndexAmKind::Btree) && form.indisunique && !form.indisexclusion {
         Some("a unique constraint on a non-btree index without exclusion operators (no core AM: amcanunique is btree's)")
     } else {

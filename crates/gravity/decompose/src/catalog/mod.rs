@@ -57,6 +57,9 @@ pub enum IndexAm {
     Spgist,
     Gin,
     Brin,
+    /// pgvector's access methods (fork): ordinary scans that serve only `ORDER BY column <op> value`.
+    Hnsw,
+    Ivfflat,
     Other,
 }
 
@@ -65,7 +68,8 @@ impl IndexAm {
         IndexAm::ALL.iter().copied().find(|a| a.name() == name).unwrap_or(IndexAm::Other)
     }
 
-    pub const ALL: [IndexAm; 6] = [IndexAm::Btree, IndexAm::Hash, IndexAm::Gist, IndexAm::Spgist, IndexAm::Gin, IndexAm::Brin];
+    pub const ALL: [IndexAm; 8] =
+        [IndexAm::Btree, IndexAm::Hash, IndexAm::Gist, IndexAm::Spgist, IndexAm::Gin, IndexAm::Brin, IndexAm::Hnsw, IndexAm::Ivfflat];
 
     pub const fn name(self) -> &'static str {
         match self {
@@ -75,6 +79,8 @@ impl IndexAm {
             IndexAm::Spgist => "spgist",
             IndexAm::Gin => "gin",
             IndexAm::Brin => "brin",
+            IndexAm::Hnsw => "hnsw",
+            IndexAm::Ivfflat => "ivfflat",
             IndexAm::Other => "other",
         }
     }
@@ -86,7 +92,7 @@ impl IndexAm {
 
     /// The AM serves `ORDER BY column <op> value` (`amcanorderbyop`): the nearest-neighbour walk.
     pub const fn order_by_op(self) -> bool {
-        matches!(self, IndexAm::Gist | IndexAm::Spgist)
+        matches!(self, IndexAm::Gist | IndexAm::Spgist | IndexAm::Hnsw | IndexAm::Ivfflat)
     }
 
     /// The AM has an ordinary scan (`amgettuple`); gin and brin answer through a bitmap only.

@@ -102,7 +102,7 @@ fn shape(node: i32, why: &'static str) -> ! {
 /// `hosts::index_maint::unmaintainable`'s conditions off the decomposer's classification (validity: `pending`, D624).
 fn unmaintainable(i: &gravity_decompose::ops::shared::modifytable::IndexDesc) -> Option<&'static str> {
     if !i.insertable {
-        Some("an index whose access method is not btree / hash / gin / gist / spgist / brin / bloom (index_maint)")
+        Some("an index whose access method is not btree / hash / gin / gist / spgist / brin / bloom / hnsw / ivfflat (index_maint)")
     } else if !matches!(i.am, IndexAm::Btree) && i.unique && !i.exclusion {
         Some("a unique constraint on a non-btree index of the written relation without exclusion operators (index_maint)")
     } else {
