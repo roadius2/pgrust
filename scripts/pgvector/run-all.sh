@@ -6,6 +6,7 @@
 # timeout) leaves no previous verdict behind, and a tier that dies before
 # writing a summary.tsv reports "(no results)". A tier that exits non-zero
 # after writing only ok rows (it died partway) gets a FAIL row of its own.
+# The TAP tier's accepted divergences (tap-accepted.tsv) get a section.
 # PGV_TIER_DIR (harness self-test only) runs the run-<tier>.sh scripts from
 # another directory.
 set -euo pipefail
@@ -17,7 +18,7 @@ mode="$1"
 port_for "$mode" >/dev/null
 
 tiers=(regress tap bytecmp iterscan diff ondisk recall)
-rm -f "$PGV_WORK/report-$mode.md" "$PGV_WORK/ondisk/$mode/reverse.tsv"
+rm -f "$PGV_WORK/report-$mode.md" "$PGV_WORK/ondisk/$mode/reverse.tsv" "$PGV_WORK/tap/$mode/accepted.tsv"
 for tier in "${tiers[@]}"; do
   rm -f "$PGV_WORK/$tier/$mode/summary.tsv"
 done
@@ -59,6 +60,15 @@ passed=0
     fi
   done
   printf '\n**%d/%d passed**\n' "$passed" "$total"
+  # TAP failures tap-accepted.tsv pins: counted ok above, listed here so none
+  # passes unseen.
+  if [ -s "$PGV_WORK/tap/$mode/accepted.tsv" ]; then
+    printf '\n## Accepted divergences (counted ok above)\n\n'
+    printf '| Test | Failed checks | Reason |\n|---|---|---|\n'
+    while IFS=$'\t' read -r name checks reason; do
+      printf '| %s | %s | %s |\n' "$name" "$checks" "$reason"
+    done <"$PGV_WORK/tap/$mode/accepted.tsv"
+  fi
   # On-disk, reverse (spec §8.2): reported, never counted.
   printf '\n## Reported, not gated: on-disk reverse\n\n'
   if [ -s "$PGV_WORK/ondisk/$mode/reverse.tsv" ]; then

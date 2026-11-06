@@ -47,6 +47,27 @@ pg_regress_bin() {
   echo "$("$PG_TOOLS/bin/pg_config" --pkglibdir)/pgxs/src/test/regress/pg_regress"
 }
 
+# --- accepted TAP divergences (run-tap.sh) ---
+
+# <test>\t<failed checks, as prove prints them>\t<reason>; see the file's header.
+PGV_TAP_ACCEPTED="${PGV_TAP_ACCEPTED:-$PGV_REPO/scripts/pgvector/tap-accepted.tsv}"
+
+# Prints the reason and returns 0 when test $2's failure, in prove log $3, is
+# an accepted divergence in mode $1: pgrust only, the test listed, no parse
+# error (the test ran to its end), and prove's failed checks exactly the
+# listed ones.
+tap_failure_accepted() {
+  local mode="$1" name="$2" log="$3" want got
+  [ "$mode" = pgrust ] || return 1
+  [ -f "$PGV_TAP_ACCEPTED" ] || return 1
+  want="$(awk -F'\t' -v n="$name" '!/^#/ && $1 == n { print $2; exit }' "$PGV_TAP_ACCEPTED")"
+  [ -n "$want" ] || return 1
+  if grep -q '^  Parse errors: ' "$log"; then return 1; fi
+  got="$(sed -n 's/^  Failed tests:  //p' "$log")"
+  [ "$got" = "$want" ] || return 1
+  awk -F'\t' -v n="$name" '!/^#/ && $1 == n { print $3; exit }' "$PGV_TAP_ACCEPTED"
+}
+
 # --- pgrust binary and servers ---
 
 PGRUST_PROFILE="${PGRUST_PROFILE:-fast-profile}"

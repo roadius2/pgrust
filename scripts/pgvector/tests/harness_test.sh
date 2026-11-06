@@ -791,6 +791,25 @@ test_run_all_exit_status() {
   else
     fail "run-all: all-ok tiers (see $w.log.2)"
   fi
+  # The TAP tier's accepted divergences get a section of their own, and there
+  # is none without them.
+  if ! grep -qF '## Accepted divergences' "$r"; then
+    pass "run-all: no accepted section without accepted rows"
+  else
+    fail "run-all: an accepted section without accepted rows (see $r)"
+  fi
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'mkdir -p "$PGV_WORK/tap/$1"'
+    echo "printf 't\\tok\\n' >\"\$PGV_WORK/tap/\$1/summary.tsv\""
+    echo "printf 't\\t5, 14\\twhy\\n' >\"\$PGV_WORK/tap/\$1/accepted.tsv\""
+  } >"$w/bin/run-tap.sh"
+  if PGV_WORK="$w" PGV_TIER_DIR="$w/bin" "$here/../run-all.sh" ref >"$w.log.4" 2>&1 &&
+    grep -qxF '**7/7 passed**' "$r" && grep -qxF '| t | 5, 14 | why |' "$r"; then
+    pass "run-all: accepted divergences are counted ok and listed"
+  else
+    fail "run-all: the accepted section (see $r)"
+  fi
   # A run killed partway (Ctrl-C, a timeout) keeps none of the all-ok run's
   # verdicts: no report, and no summary.tsv for the tiers it never reached.
   {
@@ -1417,6 +1436,49 @@ test_recall_pgrust() {
   fi
   PGRUST_VECTOR_INDEXBUILD_POOL=0 recall_toy_dies \
     "recall pgrust: the kill switch" pool 'expected 2 parallel workers' pgrust hnsw_vector_parallel
+}
+
+# A TAP failure counts as ok only in pgrust mode, for a listed test, with
+# exactly the failed checks its row pins and no parse error (tap-accepted.tsv).
+# The real list's one row holds on pgrust today: 018_aggregates, three checks.
+test_tap_accepted() {
+  local w="$PGV_WORK/tap-accepted" list log out
+  rm -rf "$w"
+  mkdir -p "$w"
+  list="$w/list.tsv"
+  log="$w/prove.log"
+  printf '# a comment\nt_one\t5, 14, 16\tbecause\n' >"$list"
+  # prove's summary for a test whose checks $1 failed; $2 is an extra line.
+  prove_log() {
+    printf 'not ok 5\n\nTest Summary Report\n-------------------\n/x/t_one.pl (Wstat: 768 Tests: 17 Failed: 3)\n  Failed tests:  %s\n%s  Non-zero exit status: 3\n' "$1" "${2:-}" >"$log"
+  }
+  accepted() { PGV_TAP_ACCEPTED="$list" tap_failure_accepted "$@"; }
+  prove_log '5, 14, 16'
+  if out="$(accepted pgrust t_one "$log")" && [ "$out" = because ]; then
+    pass "tap accepted: the pinned checks, with the reason"
+  else
+    fail "tap accepted: the pinned checks were not accepted"
+  fi
+  if accepted ref t_one "$log" >/dev/null; then fail "tap accepted: accepted for the C reference"; else pass "tap accepted: never for the C reference"; fi
+  if accepted pgrust t_two "$log" >/dev/null; then fail "tap accepted: an unlisted test"; else pass "tap accepted: not an unlisted test"; fi
+  prove_log '5, 14, 16, 17'
+  if accepted pgrust t_one "$log" >/dev/null; then fail "tap accepted: one check more"; else pass "tap accepted: not with one check more"; fi
+  prove_log '5, 14'
+  if accepted pgrust t_one "$log" >/dev/null; then fail "tap accepted: one check fewer"; else pass "tap accepted: not with one check fewer"; fi
+  prove_log '5, 14, 16' '  Parse errors: No plan found in TAP output\n'
+  if accepted pgrust t_one "$log" >/dev/null; then fail "tap accepted: a test that died"; else pass "tap accepted: not a test that died"; fi
+  if awk -F'\t' '!/^#/ && (NF != 3 || $1 == "" || $2 == "" || $3 == "") { bad = 1 } END { exit bad }' "$PGV_TAP_ACCEPTED"; then
+    pass "tap accepted: every row of the list has a test, its checks and a reason"
+  else
+    fail "tap accepted: a malformed row in $PGV_TAP_ACCEPTED"
+  fi
+  if "$here/../run-tap.sh" pgrust 018_aggregates.pl >"$w.log" 2>&1 &&
+    grep -qxF "018_aggregates	ok" "$PGV_WORK/tap/pgrust/summary.tsv" &&
+    [ "$(cut -f1,2 "$PGV_WORK/tap/pgrust/accepted.tsv")" = "018_aggregates	5, 14, 16" ]; then
+    pass "tap accepted: 018_aggregates on pgrust is ok and listed in accepted.tsv"
+  else
+    fail "tap accepted: 018_aggregates on pgrust (see $w.log)"
+  fi
 }
 
 # --- runner ---

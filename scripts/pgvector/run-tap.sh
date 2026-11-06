@@ -4,6 +4,9 @@
 # usage: run-tap.sh {pgrust|ref} [NNN_name.pl ...]   (default: all of test/t)
 #   ref:    pure C install ($PG_VEC).
 #   pgrust: C initdb creates each cluster, pgrust runs it (hybrid bin dir).
+#           A failure tap-accepted.tsv lists, with exactly the failed checks
+#           it pins, counts as ok and is written to accepted.tsv beside
+#           summary.tsv (test, failed checks, reason).
 set -euo pipefail
 . "$(dirname "$0")/common.sh"
 
@@ -56,6 +59,7 @@ else
 fi
 
 : >"$out/summary.tsv"
+: >"$out/accepted.tsv"
 for t in "${tests[@]}"; do
   [ -f "$t" ] || die "no such TAP test: $t"
   name="$(basename "$t" .pl)"
@@ -76,13 +80,25 @@ for t in "${tests[@]}"; do
     if [ "$mode" = pgrust ] && ! grep -qs 'starting pgrust' "$out/log/$name"/*.log; then
       echo "error: $name: not a pgrust server ($PGRUST_BIN never logged 'starting pgrust')" >&2
       result=FAIL
+    elif [ "$mode" = pgrust ] && grep -qs "^$name	" "$PGV_TAP_ACCEPTED"; then
+      echo "warning: $name passes; remove its row from $PGV_TAP_ACCEPTED" >&2
     fi
   else
     result=FAIL
+    # An accepted divergence, if pgrust served the test.
+    if reason="$(tap_failure_accepted "$mode" "$name" "$out/prove/$name.log")" &&
+      grep -qs 'starting pgrust' "$out/log/$name"/*.log; then
+      result=ok
+      printf '%s\t%s\t%s\n' "$name" "$(sed -n 's/^  Failed tests:  //p' "$out/prove/$name.log")" "$reason" >>"$out/accepted.tsv"
+    fi
   fi
   printf '%s\t%s\n' "$name" "$result" | tee -a "$out/summary.tsv"
 done
 
 passed="$(grep -c $'\tok$' "$out/summary.tsv" || true)"
 echo "tap ($mode): $passed/${#tests[@]} passed; logs $out/prove and $out/log"
+accepted="$(wc -l <"$out/accepted.tsv" | tr -d ' ')"
+if [ "$accepted" -gt 0 ]; then
+  echo "tap ($mode): $accepted of the passed by an accepted divergence; see $out/accepted.tsv"
+fi
 [ "$passed" -eq "${#tests[@]}" ]

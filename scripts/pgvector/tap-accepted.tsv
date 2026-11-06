@@ -1,0 +1,6 @@
+# pgvector TAP tests that pgrust fails by design, each pinned to the exact checks that fail. run-tap.sh reads this in
+# pgrust mode only: the C reference must pass every test. A row holds only while prove reports exactly these failed
+# checks and the test runs to its end; one check more or fewer, or a test that dies, fails the tier. run-all.sh lists
+# every accepted row in its report. Add a row only on the user's decision.
+# <test>\t<failed checks, as prove prints them>\t<reason>
+018_aggregates	5, 14, 16	upstream v0.4-beta's planner builds no parallel plans (planner lib.rs: assess_parallel = false), so EXPLAIN shows no Partial Aggregate and sum(halfvec) is C's serial answer, not its three-participant one; user decision 2026-11-05
