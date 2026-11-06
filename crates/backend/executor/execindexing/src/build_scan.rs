@@ -304,7 +304,9 @@ where
         } else {
             // tableam.c:174-178 restores the snapshot serialized beside the
             // scan; pgrust's typed field must carry it, as tableam's own
-            // table_beginscan_parallel expects. No SnapshotAny fallback.
+            // table_beginscan_parallel expects. DIVERGENCE: C always has the
+            // snapshot there; an ERROR here, never a SnapshotAny fallback,
+            // which would index rows the concurrent build must not see.
             let Some(serialized) = p.snapshot.as_ref() else {
                 return Err(Box::new(
                     types_error::PgError::error("MVCC parallel scan carries no serialized snapshot")

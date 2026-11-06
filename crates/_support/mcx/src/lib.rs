@@ -3126,15 +3126,8 @@ impl fmt::Debug for Mcx<'_> {
 #[cold]
 #[inline(never)]
 fn alloc_ceiling_exceeded(size: usize) -> ! {
-    // A bare PgError payload, not upstream's boxed one: the statement
-    // boundary's pg_error_from_panic decodes either and keeps the LOCATION
-    // (MemoryContextSizeFailure, mcxt.c:1180), but the lmgr_proc/ipc
-    // containment catchers decode only a bare PgError, and a boxed payload
-    // would cost them the message. no_std builds keep the string form.
-    // cfg(any(feature = "std", test)): only std graphs (the server, via
-    // init_small) get the structured payload.
     #[cfg(any(feature = "std", test))]
-    std::panic::panic_any(invalid_alloc_size_error(size));
+    std::panic::panic_any(invalid_alloc_size(size));
     #[cfg(not(any(feature = "std", test)))]
     panic!("invalid memory alloc request size {size}")
 }
@@ -3473,14 +3466,10 @@ pub const MAX_ALLOC_HUGE_SIZE: usize = usize::MAX / 2;
 
 #[cold]
 fn invalid_alloc_size(request: usize) -> alloc::boxed::Box<PgError> {
-    invalid_alloc_size_error(request).into()
-}
-
-// MemoryContextSizeFailure (mcxt.c:1172-1181): elog(ERROR), XX000.
-#[cold]
-fn invalid_alloc_size_error(request: usize) -> PgError {
+    // MemoryContextSizeFailure (mcxt.c:1172-1181): elog(ERROR), XX000.
     PgError::error(alloc::format!("invalid memory alloc request size {request}"))
         .with_location("mcxt.c", 1180, "MemoryContextSizeFailure")
+        .into()
 }
 
 #[inline]

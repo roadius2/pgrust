@@ -11,7 +11,7 @@ use pairingheap::PairingHeap;
 use pgsync::{RwLockReadGuard, RwLockWriteGuard};
 
 use crate::memory::layer_m;
-use crate::{read, write, Candidate, Graph, InsertParams, NeighborArray, HNSW_HEAPTIDS};
+use crate::{read, write, Candidate, Graph, GraphError, InsertError, InsertParams, NeighborArray, HNSW_HEAPTIDS, TMP_CONTEXT};
 
 type CandHeap = PairingHeap<(f64, u32), fn(&(f64, u32), &(f64, u32)) -> i32>;
 
@@ -68,7 +68,7 @@ impl Graph {
         element: u32,
         p: &InsertParams,
         distance: &mut impl FnMut(&[u8], &[u8]) -> Result<f64, E>,
-    ) -> Result<(), E> {
+    ) -> Result<(), InsertError<E>> {
         let level = self.element(element).level;
 
         // Wait if another process needs exclusive lock on entry lock
@@ -126,19 +126,19 @@ impl Graph {
         entry_point: Option<u32>,
         p: &InsertParams,
         distance: &mut impl FnMut(&[u8], &[u8]) -> Result<f64, E>,
-    ) -> Result<(), E> {
+    ) -> Result<(), InsertError<E>> {
         let e = self.element(element);
         let q = e.value();
         let Some(entry_point) = entry_point else { return Ok(()) };
 
         let entry_level = self.element(entry_point).level as i32;
-        let ep_dist = distance(q, self.element(entry_point).value())?;
+        let ep_dist = distance(q, self.element(entry_point).value()).map_err(InsertError::Callback)?;
         let mut ep: Vec<(u32, f64)> = vec![(entry_point, ep_dist)];
 
         let mut lc = entry_level;
         // lc >= level + 1 (hnswutils.c:1309)
         while lc > e.level as i32 {
-            ep = self.search_layer(q, ep, 1, lc, distance)?;
+            ep = self.search_layer(q, ep, 1, lc, distance).map_err(InsertError::Callback)?;
             lc -= 1;
         }
 
@@ -146,7 +146,7 @@ impl Graph {
         let mut lc = level;
         loop {
             let lm = layer_m(p.m, lc);
-            let w = self.search_layer(q, ep.clone(), p.ef_construction, lc, distance)?;
+            let w = self.search_layer(q, ep.clone(), p.ef_construction, lc, distance).map_err(InsertError::Callback)?;
 
             let mut lw: Vec<Candidate> =
                 w.iter().map(|&(id, d)| Candidate { element: id, distance: d as f32, closer: false }).collect();
@@ -272,15 +272,24 @@ impl Graph {
         sort_candidates: bool,
         out: &mut Vec<Candidate>,
         distance: &mut impl FnMut(&[u8], &[u8]) -> Result<f64, E>,
-    ) -> Result<(), E> {
+    ) -> Result<(), InsertError<E>> {
         out.clear();
         if c.len() as i32 <= lm {
             out.extend_from_slice(c);
             return Ok(());
         }
 
-        let mut w: Vec<Candidate> = c.to_vec();
-        let mut w_is_new: Vec<bool> = vec![false; w.len()];
+        // C pallocs these lists in the build's temporary context; a request
+        // the host refuses is that context's "out of memory" ERROR.
+        let oom = |n: usize, size: usize| {
+            InsertError::Graph(GraphError::HostOutOfMemory { context: TMP_CONTEXT, bytes: n * size })
+        };
+        let mut w: Vec<Candidate> = Vec::new();
+        w.try_reserve_exact(c.len()).map_err(|_| oom(c.len(), size_of::<Candidate>()))?;
+        w.extend_from_slice(c);
+        let mut w_is_new: Vec<bool> = Vec::new();
+        w_is_new.try_reserve_exact(w.len()).map_err(|_| oom(w.len(), size_of::<bool>()))?;
+        w_is_new.resize(w.len(), false);
         // Origin index into `c` for closer-flag write-back.
         let mut w_src: Vec<usize> = (0..w.len()).collect();
         if let Some(nc) = new_candidate {
@@ -303,7 +312,8 @@ impl Graph {
         }
 
         let must_calculate = !*closer_set;
-        let mut wd: Vec<Candidate> = Vec::with_capacity(w.len());
+        let mut wd: Vec<Candidate> = Vec::new();
+        wd.try_reserve_exact(w.len()).map_err(|_| oom(w.len(), size_of::<Candidate>()))?;
         let mut added: Vec<Candidate> = Vec::new();
         let mut removed_any = false;
 
@@ -313,21 +323,21 @@ impl Graph {
             let e_src = w_src.pop().expect("nonempty");
 
             if must_calculate {
-                e.closer = self.check_element_closer(&e, out, distance)?;
+                e.closer = self.check_element_closer(&e, out, distance).map_err(InsertError::Callback)?;
             } else if !added.is_empty() {
                 if e.closer {
-                    e.closer = self.check_element_closer(&e, &added, distance)?;
+                    e.closer = self.check_element_closer(&e, &added, distance).map_err(InsertError::Callback)?;
                     if !e.closer {
                         removed_any = true;
                     }
                 } else if removed_any {
-                    e.closer = self.check_element_closer(&e, out, distance)?;
+                    e.closer = self.check_element_closer(&e, out, distance).map_err(InsertError::Callback)?;
                     if e.closer {
                         added.push(e);
                     }
                 }
             } else if e_is_new {
-                e.closer = self.check_element_closer(&e, out, distance)?;
+                e.closer = self.check_element_closer(&e, out, distance).map_err(InsertError::Callback)?;
                 if e.closer {
                     added.push(e);
                 }
@@ -371,7 +381,7 @@ impl Graph {
         new_distance: f32,
         lm: i32,
         distance: &mut impl FnMut(&[u8], &[u8]) -> Result<f64, E>,
-    ) -> Result<(), E> {
+    ) -> Result<(), InsertError<E>> {
         let new_hc = Candidate { element: new_element, distance: new_distance, closer: false };
         if (neighbors.len() as i32) < lm {
             neighbors.push(new_hc);
@@ -410,7 +420,7 @@ impl Graph {
         e: u32,
         m: i32,
         distance: &mut impl FnMut(&[u8], &[u8]) -> Result<f64, E>,
-    ) -> Result<(), E> {
+    ) -> Result<(), InsertError<E>> {
         let element = self.element(e);
         let level = element.level as i32;
         for lc in (0..=level).rev() {

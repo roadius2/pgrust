@@ -82,9 +82,9 @@ impl AssignBatch {
         AssignBatch { lists: Vec::new(), tids: Vec::new(), offsets: Vec::new(), words: Vec::new() }
     }
 
-    fn push(&mut self, list: i32, tid: ItemPointerData, value: &[u8]) {
+    fn push(&mut self, list: i32, tid: ItemPointerData, value: &[u8]) -> PgResult<()> {
         let offset = self.words.len();
-        self.words.resize(offset + value.len().div_ceil(8), 0);
+        ::mcx::std_vec_resize("pgvector_ivfflat_build", &mut self.words, offset + value.len().div_ceil(8), 0)?;
         // SAFETY: the words just added span at least value.len() bytes, and
         // u8 has no alignment or validity requirement.
         unsafe {
@@ -94,6 +94,7 @@ impl AssignBatch {
         self.lists.push(list);
         self.tids.push(tid);
         self.offsets.push(offset);
+        Ok(())
     }
 
     fn len(&self) -> usize {
@@ -134,7 +135,8 @@ pub(crate) fn assign_tuples_parallel<'mcx>(
 ) -> PgResult<bool> {
     let (heaprelid, indexrelid) = (heap.rd_id, bs.index.rd_id);
     // Store centers in shared memory (ivfbuild.c:925-926)
-    let mut centers = Vec::with_capacity(bs.centers.maxlen as usize * bs.centers.itemsize);
+    let mut centers =
+        ::mcx::std_vec_with_capacity("pgvector_ivfflat_build", bs.centers.maxlen as usize * bs.centers.itemsize)?;
     for i in 0..bs.centers.maxlen {
         centers.extend_from_slice(bs.centers.get(i)?);
     }
@@ -324,7 +326,7 @@ fn worker_scan<'mcx>(
             let r = (|| -> PgResult<()> {
                 let tmp = mcx::MemoryContext::new_bump("Ivfflat build temporary context");
                 if let Some((list, value)) = assign_tuple(&mut bs, tmp.mcx(), values)? {
-                    batch.push(list, *tid, &value);
+                    batch.push(list, *tid, &value)?;
                     bs.indtuples += 1.0;
                     if batch.bytes() >= BATCH_BYTES {
                         send(rows, shared.leader, std::mem::replace(&mut batch, AssignBatch::new()))?;
@@ -391,8 +393,8 @@ mod tests {
         let mut b = AssignBatch::new();
         let v1: Vec<u8> = (0..20u8).collect();
         let v2: Vec<u8> = (100..109u8).collect();
-        b.push(3, ItemPointerData::new(7, 2), &v1);
-        b.push(5, ItemPointerData::new(8, 1), &v2);
+        b.push(3, ItemPointerData::new(7, 2), &v1).unwrap();
+        b.push(5, ItemPointerData::new(8, 1), &v2).unwrap();
         assert_eq!(b.len(), 2);
         assert_eq!(b.bytes(), 40);
         assert_eq!(b.lists, vec![3, 5]);

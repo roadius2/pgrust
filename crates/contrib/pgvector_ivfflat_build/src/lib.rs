@@ -402,7 +402,11 @@ fn init_build_state<'a, 'm, 'mcx>(
         cx,
         samples: None,
         centers,
-        list_info: vec![ListInfo { blkno: InvalidBlockNumber, offno: 0 }; lists as usize],
+        list_info: ::mcx::std_vec_from_elem(
+            "pgvector_ivfflat_build",
+            ListInfo { blkno: InvalidBlockNumber, offno: 0 },
+            lists as usize,
+        )?,
         itemsize,
         rstate: None,
         samplerows: 0.0,
@@ -496,7 +500,7 @@ fn create_list_pages(
 ) -> PgResult<()> {
     let xcx = mcx::MemoryContext::new("Ivfflat build xlog");
     let list_size = maxalign(ivfflat_list_size(centers.itemsize));
-    let mut list = vec![0u8; list_size];
+    let mut list = ::mcx::std_vec_from_elem("pgvector_ivfflat_build", 0u8, list_size)?;
 
     let buf = ivfflat_new_buffer(index, fork_num)?;
     let mut xp = ivfflat_init_register_page(index, buf, xcx.mcx())?;

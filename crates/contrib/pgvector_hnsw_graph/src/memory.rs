@@ -126,6 +126,10 @@ pub enum GraphError {
     AllocationTooLarge,
     /// "hnsw allocator out of memory"
     OutOfMemory,
+    /// The host's allocator refused `bytes` for something C pallocs in
+    /// `context`: palloc's "out of memory" ERROR (mcxt.c:1163-1167), where
+    /// an infallible Rust allocation would abort the server.
+    HostOutOfMemory { context: &'static str, bytes: usize },
 }
 
 #[derive(Clone, Debug)]

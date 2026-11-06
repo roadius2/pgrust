@@ -1629,9 +1629,8 @@ fn allocator_rejects_over_ceiling_grow() {
 
 // Over-ceiling requests unwind with C's MemoryContextSizeFailure ERROR so
 // the statement boundary recovers them as ERROR. D3267: the payload is the
-// ERROR itself (a PgError, XX000), which the boundary's pg_error_from_panic
-// recovers with its LOCATION; a plain message is a crash there. (Unit tests
-// always link std, so the no_std string payload never reaches this helper.)
+// ERROR itself (a boxed PgError, XX000), which the boundary's classifier
+// recovers; a plain message is a crash there.
 fn assert_ceiling_error<T: core::fmt::Debug>(
     r: Result<Result<T, ()>, std::boxed::Box<dyn core::any::Any + Send>>,
     size: Option<usize>,

@@ -37,6 +37,12 @@ pub use memory::{Accounting, GenerationModel, GraphError};
 /// HNSW_HEAPTIDS (hnsw.h:69).
 pub const HNSW_HEAPTIDS: usize = 10;
 
+/// C's names for the build's two memory contexts (hnswbuild.c:733, 739),
+/// for GraphError::HostOutOfMemory: elements live in the first, the lists
+/// SelectNeighbors builds in the second.
+pub(crate) const GRAPH_CONTEXT: &str = "Hnsw build graph context";
+pub(crate) const TMP_CONTEXT: &str = "Hnsw build temporary context";
+
 /// A heap TID as its 6-byte ItemPointerData image.
 pub type HeapTid = [u8; 6];
 
@@ -76,13 +82,17 @@ pub struct Element {
 }
 
 impl Element {
-    fn new(level: u8, value: &[u8], links: Links) -> Element {
-        let mut words = vec![0u64; value.len().div_ceil(8)].into_boxed_slice();
+    fn new(level: u8, value: &[u8], links: Links) -> Result<Element, GraphError> {
+        let n = value.len().div_ceil(8);
+        let mut words: Vec<u64> = Vec::new();
+        words.try_reserve_exact(n).map_err(|_| GraphError::HostOutOfMemory { context: GRAPH_CONTEXT, bytes: n * 8 })?;
+        words.resize(n, 0);
+        let mut words = words.into_boxed_slice();
         // SAFETY: `words` spans at least value.len() bytes, and u8 has no
         // alignment or validity requirement.
         unsafe { core::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), value.len()) }
             .copy_from_slice(value);
-        Element { level, value: words, value_len: value.len(), links: RwLock::new(links) }
+        Ok(Element { level, value: words, value_len: value.len(), links: RwLock::new(links) })
     }
 
     /// HnswGetValue: the value's image.
@@ -252,19 +262,23 @@ impl Graph {
         // Ok, we can proceed to allocate the element
         let level = draw_level();
         allocator.accounting.charge_element(level, params.m, value.len()).map_err(InsertError::Graph)?;
-        let id = allocator.len;
-        allocator.len += 1;
         let mut heaptids = [[0u8; 6]; HNSW_HEAPTIDS];
         heaptids[0] = heaptid;
         let neighbors = (0..=level).map(|_| NeighborArray::default()).collect();
-        self.elements.publish(id, Element::new(level, value, Links { heaptids, heaptids_len: 1, neighbors }));
+        // Built before the element is counted, so a refused allocation
+        // leaves no handle without an element.
+        let element =
+            Element::new(level, value, Links { heaptids, heaptids_len: 1, neighbors }).map_err(InsertError::Graph)?;
+        let id = allocator.len;
+        allocator.len += 1;
+        self.elements.publish(id, element);
 
         // We have now allocated the space needed for the element, so we don't
         // need the allocator lock anymore.
         drop(allocator);
 
         // Insert tuple
-        self.insert_in_memory(id, params, distance).map_err(InsertError::Callback)?;
+        self.insert_in_memory(id, params, distance)?;
 
         // Release flush lock
         drop(flushed);
@@ -291,7 +305,8 @@ impl Graph {
         let neighbors = (0..=level).map(|_| NeighborArray::default()).collect();
         self.elements.publish(
             id,
-            Element::new(level, value, Links { heaptids: [[0u8; 6]; HNSW_HEAPTIDS], heaptids_len: 0, neighbors }),
+            Element::new(level, value, Links { heaptids: [[0u8; 6]; HNSW_HEAPTIDS], heaptids_len: 0, neighbors })
+                .expect("element"),
         );
         id
     }

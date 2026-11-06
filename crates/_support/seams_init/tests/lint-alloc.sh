@@ -274,14 +274,15 @@ function vecmacro_site(line,   rest, p, q, body, depth, i, c, semi, n) {
 # RESERVED-CAPACITY RULE: a .resize/.reserve whose receiver binding was
 # sized fallibly within the 4 preceding code lines — `R.try_reserve[_exact](`
 # / `std_vec_reserve(.., &mut R,` / `let mut R[: T] = ..vec_with_capacity_in(`
-# / `..std_vec_with_capacity(` — is a fill within reserved capacity and cannot
+# / `..vec_with_capacity_huge_in(` (fork: the MCXT_ALLOC_HUGE twin, which the
+# same reasoning covers) / `..std_vec_with_capacity(` — is a fill within reserved capacity and cannot
 # allocate: the sanctioned "reserve fallibly, then resize" idiom.
 function within_reserved(recv,   i, prev, chain, sawcap, sawlet) {
     if (recv == "") return 0
     chain = 0; sawcap = 0; sawlet = 0
     for (i = 1; i <= 4; i++) {
         prev = hist[i]
-        if (index(prev, "vec_with_capacity_in") > 0 || index(prev, "std_vec_with_capacity") > 0) sawcap = 1
+        if (index(prev, "vec_with_capacity_in") > 0 || index(prev, "vec_with_capacity_huge_in") > 0 || index(prev, "std_vec_with_capacity") > 0) sawcap = 1
         if (index(prev, "let mut " recv) > 0) sawlet = 1
         if (sawcap && sawlet) return 1
         if (index(prev, recv ".try_reserve") > 0) return 1
@@ -289,7 +290,7 @@ function within_reserved(recv,   i, prev, chain, sawcap, sawlet) {
         if (prev ~ /^[ \t]*\.try_reserve/) chain = 1
         else if (chain && prev ~ ("(^|[^A-Za-z0-9_.])" recv "[ \t]*$")) return 1
         if (index(prev, "std_vec_reserve(") > 0 && index(prev, "&mut " recv) > 0) return 1
-        if ((index(prev, "vec_with_capacity_in") > 0 || index(prev, "std_vec_with_capacity") > 0) \
+        if ((index(prev, "vec_with_capacity_in") > 0 || index(prev, "vec_with_capacity_huge_in") > 0 || index(prev, "std_vec_with_capacity") > 0) \
             && (index(prev, "let mut " recv " ") > 0 || index(prev, "let mut " recv ":") > 0 \
                 || index(prev, "let mut " recv "=") > 0 || index(prev, recv " = ") > 0)) return 1
     }

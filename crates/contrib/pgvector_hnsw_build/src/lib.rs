@@ -184,7 +184,7 @@ fn serialize_neighbor_tuple(buf: &mut Vec<u8>, e: &Element, placements: &[Placem
 // (duplicates merged away are not on it).
 fn create_graph_pages(bs: &BuildState<'_, '_>, graph: &Graph) -> PgResult<Vec<Placement>> {
     let max_size = HNSW_MAX_SIZE;
-    let mut placements = vec![UNPLACED; graph.element_count() as usize];
+    let mut placements = ::mcx::std_vec_from_elem("pgvector_hnsw_build", UNPLACED, graph.element_count() as usize)?;
     let mut etup: Vec<u8> = Vec::new();
     let mut ntup_placeholder: Vec<u8> = Vec::new();
 
@@ -303,6 +303,8 @@ fn graph_error(e: GraphError) -> Box<PgError> {
     let (message, line) = match e {
         GraphError::AllocationTooLarge => ("hnsw allocation too large", 672),
         GraphError::OutOfMemory => ("hnsw allocator out of memory", 676),
+        // palloc's ERROR in the context C allocates from (mcxt.c:1163-1167).
+        GraphError::HostOutOfMemory { context, bytes } => return mcx::oom_named(context, bytes).into(),
     };
     PgError::error(message).with_location("hnswbuild.c", line, "HnswSharedMemoryAlloc").into()
 }

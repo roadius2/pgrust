@@ -558,7 +558,9 @@ fn put_options(buf: &mut Buf<'_>, o: &Option<RdOptions>) {
             put_i32(buf, o.ef_construction);
         }
         Some(RdOptions::Ivfflat(o)) => {
-            put_u8(buf, 12);
+            // Fork tags count down from 255: upstream numbers its kinds
+            // upward, and both sides once chose 12 (its Pgrcolumnar).
+            put_u8(buf, 255);
             put_i32(buf, o.lists);
         }
         Some(RdOptions::Bloom(o)) => {
@@ -700,7 +702,7 @@ fn parse_options(rd: &mut Rd<'_>) -> Option<Option<RdOptions>> {
                 bit_size,
             })))
         }
-        12 => Some(Some(RdOptions::Ivfflat(types_rel::reloptions::IvfflatOptions {
+        255 => Some(Some(RdOptions::Ivfflat(types_rel::reloptions::IvfflatOptions {
             lists: rd.i32()?,
         }))),
         _ => None,
@@ -1519,6 +1521,28 @@ fn remove_in_dir(tblspc: &Path) {
         fd::FreeDir(dir)?;
         Ok(())
     })();
+}
+
+#[cfg(test)]
+mod option_tags {
+    use super::*;
+
+    // Every vector AM's options come back as written: a tag two kinds share
+    // parses one as the other.
+    #[test]
+    fn vector_am_options_round_trip() {
+        let cx = ::mcx::MemoryContext::new("t");
+        for o in [
+            RdOptions::Hnsw(types_rel::reloptions::HnswOptions { m: 24, ef_construction: 80 }),
+            RdOptions::Ivfflat(types_rel::reloptions::IvfflatOptions { lists: 316 }),
+        ] {
+            let mut buf: Buf<'_> = PgVec::new_in(cx.mcx());
+            put_options(&mut buf, &Some(o));
+            let mut rd = Rd { b: &buf, off: 0 };
+            assert_eq!(parse_options(&mut rd), Some(Some(o)));
+            assert_eq!(rd.off, buf.len());
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1697,8 +1697,13 @@ _support/mcx/src/aset.rs	SHELF	non-session	D4679: the growth shelf (a dropped co
 backend/postmaster/memruntime/src/memlog.rs	GATE_BEFORE	non-session	D4812 (2): the server-log writer a thread had while mcx's block gate defers its lines (scoped: gate_defer_begin sets it, gate_defer_end takes it back inside one gated allocation)
 _support/mcx/tests/d4812_block_gate.rs	ASKER	non-session	D4812 (2) test: this thread is the block gate's asker
 _support/mcx/tests/d4812_block_gate.rs	HELD	non-session	D4812 (2) test: this thread holds interrupts off
+backend/access/index/amapi/src/tests.rs	FMGR_INFO_CALLS	non-session
 backend/postmaster/memruntime/src/lib.rs	WATCHDOG_THREAD	non-session	ppres: marks the memory watchdog thread (the pool reserve sheds only on its R1 ask)
 backend/postmaster/memruntime/src/lib.rs	RESIDENT_SPLIT	non-session	pppress: the last allocator_resident reading's two terms, taken by the memory view on the same thread
+backend/utils/adt/adt_amutils/src/tests.rs	FMGR_INFO_CALLS	non-session
+contrib/pgvector_ivfflat/src/lib.rs	ITERATIVE_SCAN	non-session
+contrib/pgvector_ivfflat/src/lib.rs	MAX_PROBES	non-session
+contrib/pgvector_ivfflat/src/lib.rs	PROBES	non-session
 gravity/exec/src/runner/execute.rs	ADMISSION_REFUSED	non-session	re-plan and retry: one simple-protocol statement's admission refusal state, cleared per statement
 gravity/exec/src/runner/execute.rs	REPLAN_ARMED	non-session	re-plan and retry: one simple-protocol statement's admission refusal state, cleared per statement
 gravity/exec/src/runner/execute.rs	DEFER_REFUSAL_LINE	non-session	re-plan and retry: one simple-protocol statement's admission refusal state, cleared per statement

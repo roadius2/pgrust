@@ -172,7 +172,7 @@ fn get_scan_value(so: &mut IvfflatScanOpaqueData, orderby: &ScanKeyData) -> PgRe
     // Check dimensions match index
     ivfflat_check_dim(so.dimensions, so.type_info, so.collation, tmp.mcx(), Datum::from_usize(value.as_ptr() as usize))?;
 
-    Ok(Some(value.to_vec()))
+    Ok(Some(::mcx::std_vec_from_slice("pgvector_ivfflat", &value)?))
 }
 
 // ivfflatbeginscan (ivfscan.c:252-333).
@@ -216,7 +216,7 @@ pub fn ivfflatbeginscan<'mcx>(
         // Reuse same set of shared buffers for scan
         bas: bufmgr::GetAccessStrategy(BufferAccessStrategyType::BasBulkread),
         list_queue: new_scan_list_heap(),
-        list_pages: vec![InvalidBlockNumber; max_probes as usize],
+        list_pages: ::mcx::std_vec_from_elem("pgvector_ivfflat", InvalidBlockNumber, max_probes as usize)?,
         list_index: 0,
         // Prep sort: (distance float8, heaptid tid), by distance
         sortstate: Some(Box::new(HeapSort::begin(

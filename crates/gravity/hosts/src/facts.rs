@@ -561,7 +561,7 @@ impl Facts for RelcacheFacts<'_> {
         }
         let Some((r, _held)) = self.open_index(indexid) else { return IndexOpc::UNKNOWN };
         let n = r.rd_index.as_ref().map_or(0, |i| i.indnkeyatts.max(0) as usize);
-        let ok = n > 0 && n <= limits::KEYS && am_of(r.rd_rel.relam) != IndexAm::Other && r.rd_opfamily.len() >= n && r.rd_opcintype.len() >= n && r.rd_att.attrs.len() >= n;
+        let ok = n > 0 && n <= limits::KEYS && !matches!(am_of(r.rd_rel.relam), IndexAm::Other | IndexAm::Hnsw | IndexAm::Ivfflat) && r.rd_opfamily.len() >= n && r.rd_opcintype.len() >= n && r.rd_att.attrs.len() >= n;
         let o = ok.then(|| {
             let mut builtin = 0u32;
             for k in 0..n {
@@ -969,7 +969,8 @@ fn family_initdb(mcx: Mcx<'_>, fam: Oid) -> Option<bool> {
 }
 
 /// An index AM by its handler's routine, never its oid (D429): `CREATE ACCESS METHOD gist2 TYPE INDEX HANDLER gisthandler`
-/// is gist. The relcache resolved the handler when the index opened, so this cannot fail; an extension's handler is Other.
+/// is gist. The relcache resolved the handler when the index opened, so this cannot fail; an extension's handler is Other,
+/// except pgvector's two (fork), which the engine scans and maintains: `index_opc` still counts them as an extension's.
 fn am_of(relam: Oid) -> IndexAm {
     use types_relscan::IndexAmKind as K;
     match K::from_relam(relam) {
