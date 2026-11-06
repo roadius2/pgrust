@@ -276,7 +276,10 @@ fn extension_am_handler(amoid: Oid) -> PgResult<Option<Vec<u8>>> {
     let Some(prosrc) = syscache_seams::lookup_pg_proc_prosrc::call(scratch.mcx(), handler).ok().flatten() else {
         return Ok(None);
     };
-    let symbol = prosrc.as_bytes().to_vec();
+    let b = prosrc.as_bytes();
+    let mut symbol = Vec::new();
+    let _ = symbol.try_reserve(b.len());
+    symbol.extend_from_slice(b);
     if matches!(symbol.as_slice(), b"hnswhandler" | b"ivfflathandler" | b"blhandler") {
         fmgr_seams::fmgr_info::call(handler)?;
     }

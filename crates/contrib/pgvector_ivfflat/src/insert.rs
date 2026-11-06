@@ -69,7 +69,7 @@ fn insert_tuple(
 
     // Normalize if needed
     if let Some(mut normprocinfo) = ivfflat_optional_proc_info(index, IVFFLAT_NORM_PROC)? {
-        if !ivfflat_check_norm(&mut normprocinfo, collation, Datum::from_usize(value.as_ptr() as usize))? {
+        if !ivfflat_check_norm(&mut normprocinfo, collation, cx, Datum::from_usize(value.as_ptr() as usize))? {
             return Ok(());
         }
         value = ivfflat_norm_value(type_info, collation, cx, &value)?;
@@ -80,7 +80,7 @@ fn insert_tuple(
     let (_, dimensions) = ivfflat_get_meta_page_info(index)?;
 
     // Check dimensions match index
-    ivfflat_check_dim(dimensions, type_info, collation, d)?;
+    ivfflat_check_dim(dimensions, type_info, collation, cx, d)?;
 
     // Find the insert page - sets the page and list info
     let mut procinfo = index_getprocinfo(index, IVFFLAT_DISTANCE_PROC)?;

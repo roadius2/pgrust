@@ -148,7 +148,7 @@ pub fn hnswendscan(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
 }
 
 // GetScanValue (hnswscan.c:97-119): detoast, then HnswNormValue for
-// opclasses with a norm proc. Scratch goes in a local bump; the returned
+// opclasses with a norm proc. Scratch goes in a local AllocSet; the returned
 // image is owned so it frees at the next rescan. C normalizes in tmpCtx,
 // so the normalize function's allocations are charged to the model.
 fn get_scan_value(
@@ -160,7 +160,7 @@ fn get_scan_value(
     if orderby.sk_flags & SK_ISNULL != 0 {
         return Ok(None);
     }
-    let tmp = mcx::MemoryContext::new_bump("hnsw scan value");
+    let tmp = mcx::MemoryContext::new_wholesale("hnsw scan value");
     let tmcx = tmp.mcx();
     let d = orderby.sk_argument;
     let p = d.as_usize() as *const u8;
@@ -173,9 +173,9 @@ fn get_scan_value(
     if support.normprocinfo.is_some() {
         let normed = hnsw_norm_value(type_info, support.collation, tmcx, &flat)?;
         charge_norm_value(tmp_ctx, flat.len(), normed.len());
-        return Ok(Some(normed.to_vec()));
+        return Ok(Some(::mcx::std_vec_from_slice("pgvector_hnsw", &normed)?));
     }
-    Ok(Some(flat.to_vec()))
+    Ok(Some(::mcx::std_vec_from_slice("pgvector_hnsw", &flat)?))
 }
 
 // HnswNormValue's allocations in tmpCtx (hnswscan.c:115): the normalize
@@ -240,6 +240,8 @@ fn get_scan_items(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
     // Meta fields come from disk unvalidated; reject out-of-range values before
     // they drive the hash preallocation and layer buffers below.
     validate_meta_fields(meta.m as i32, meta.ef_construction as i32, meta.entry_level as i32)?;
+    let tmp = mcx::MemoryContext::new_wholesale("hnsw scan search");
+    let tmcx = tmp.mcx();
     // Check dimensions match index (hnswscan.c:42-44): only for a non-NULL
     // value, and before the empty-index return below.
     if let Some(v) = so.value.as_ref() {
@@ -247,6 +249,7 @@ fn get_scan_items(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
             meta.dimensions as i32,
             so.type_info,
             so.support.collation,
+            tmcx,
             Datum::from_usize(v.as_ptr() as usize),
         )?;
     }
@@ -260,8 +263,6 @@ fn get_scan_items(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
         return Ok(());
     };
 
-    let tmp = mcx::MemoryContext::new_bump("hnsw scan search");
-    let tmcx = tmp.mcx();
     let mut pool = ElementPool::new(tmcx);
     let mut support = so.support.clone();
 
@@ -314,7 +315,8 @@ fn get_scan_items(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
     so.tuples = tuples;
     so.w_list = ListShape::lappend_n(w.len(), &mut so.tmp_ctx);
     so.support = support;
-    so.w = w.iter().map(|sc| pool.scan_element(sc.element, sc.distance)).collect();
+    so.w = ::mcx::std_vec_with_capacity("pgvector_hnsw", w.len())?;
+    so.w.extend(w.iter().map(|sc| pool.scan_element(sc.element, sc.distance)));
     Ok(())
 }
 
@@ -335,7 +337,7 @@ fn resume_scan_items(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
         return Ok(());
     }
 
-    let tmp = mcx::MemoryContext::new_bump("hnsw scan resume");
+    let tmp = mcx::MemoryContext::new_wholesale("hnsw scan resume");
     let tmcx = tmp.mcx();
     let mut pool = ElementPool::new(tmcx);
     let mut support = so.support.clone();
@@ -388,7 +390,8 @@ fn resume_scan_items(scan: &mut IndexScanDescData<'_>) -> PgResult<()> {
     so.tuples = tuples;
     so.w_list = ListShape::lappend_n(w.len(), &mut so.tmp_ctx);
     so.support = support;
-    so.w = w.iter().map(|sc| pool.scan_element(sc.element, sc.distance)).collect();
+    so.w = ::mcx::std_vec_with_capacity("pgvector_hnsw", w.len())?;
+    so.w.extend(w.iter().map(|sc| pool.scan_element(sc.element, sc.distance)));
     Ok(())
 }
 
@@ -397,7 +400,7 @@ pub fn hnswgettuple(
     _direction: types_scan::ScanDirection,
 ) -> PgResult<bool> {
     if opaque(scan).first {
-        scan.xs_pgstat_index_scans += 1;
+        scan.xs_pgstat.count(1, 0, 0);
         scan.xs_nsearches += 1;
 
         if scan.numberOfOrderBys == 0 || scan.orderByData.is_empty() {

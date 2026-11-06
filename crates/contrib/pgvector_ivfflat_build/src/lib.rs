@@ -81,12 +81,12 @@ fn add_sample(bs: &mut BuildState<'_, '_, '_>, values: &[Datum]) -> PgResult<()>
     let d = Datum::from_usize(value.as_ptr() as usize);
 
     // Check dimensions match index
-    ivfflat_check_dim(bs.dimensions, bs.type_info, bs.collation, d)?;
+    ivfflat_check_dim(bs.dimensions, bs.type_info, bs.collation, tmp.mcx(), d)?;
 
     // Check with KMEANS_NORM_PROC that the value can be normalized since
     // spherical distance function expects unit vectors
     if let Some(np) = bs.kmeansnormprocinfo.as_mut() {
-        if !ivfflat_check_norm(np, bs.collation, d)? {
+        if !ivfflat_check_norm(np, bs.collation, tmp.mcx(), d)? {
             return Ok(());
         }
     }
@@ -200,7 +200,7 @@ fn assign_tuple<'t>(
 
     // Normalize if needed
     if let Some(np) = bs.normprocinfo.as_mut() {
-        if !ivfflat_check_norm(np, bs.collation, Datum::from_usize(value.as_ptr() as usize))? {
+        if !ivfflat_check_norm(np, bs.collation, tmp, Datum::from_usize(value.as_ptr() as usize))? {
             return Ok(None);
         }
         value = ivfflat_norm_value(bs.type_info, bs.collation, tmp, &value)?;
@@ -208,7 +208,7 @@ fn assign_tuple<'t>(
     let d = Datum::from_usize(value.as_ptr() as usize);
 
     // Check dimensions match index
-    ivfflat_check_dim(bs.dimensions, bs.type_info, bs.collation, d)?;
+    ivfflat_check_dim(bs.dimensions, bs.type_info, bs.collation, tmp, d)?;
 
     // Find the list that minimizes the distance
     for i in 0..bs.centers.length {

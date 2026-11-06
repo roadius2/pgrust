@@ -150,9 +150,10 @@ pub fn hnsw_check_dim(
     expected: i32,
     type_info: &HnswTypeInfo,
     collation: Oid,
+    mcx: Mcx<'_>,
     value: Datum,
 ) -> PgResult<()> {
-    let dim = types_fmgr::fcinfo::direct_function_call1_coll(type_info.dimensions, collation, value)?
+    let dim = types_fmgr::fcinfo::direct_function_call1_coll_in(type_info.dimensions, collation, mcx, value)?
         .as_i32();
     if dim != expected {
         return Err(PgError::error(format!("expected {expected} dimensions, not {dim}"))
@@ -333,7 +334,7 @@ pub fn update_meta_page(
         apply(&mut buf_page_bytes_mut(buf)[PAGE_CONTENTS_OFF..]);
         MarkBufferDirty(buf)?;
     } else {
-        let scratch = mcx::MemoryContext::new_bump("hnsw meta xlog");
+        let scratch = mcx::MemoryContext::new_wholesale("hnsw meta xlog");
         let state = generic_xlog::GenericXLogStart(scratch.mcx(), index)?;
         let mut state = state;
         let page = state.register_buffer(buf, 0)?;
@@ -745,7 +746,7 @@ pub fn search_layer_disk<'t>(
     }
     drop(ep);
 
-    let mut unvisited: Vec<(BlockNumber, u16)> = Vec::with_capacity(lm as usize);
+    let mut unvisited: Vec<(BlockNumber, u16)> = ::mcx::std_vec_with_capacity("pgvector_hnsw", lm as usize)?;
     let mut tidbuf = [[0u8; 6]; 200];
 
     while let Some((c_dist, c_elem)) = c_heap.remove_first() {
@@ -889,8 +890,8 @@ pub fn select_neighbors(
         return Ok(());
     }
 
-    let mut w: Vec<Candidate> = c.to_vec();
-    let mut w_is_new: Vec<bool> = vec![false; w.len()];
+    let mut w: Vec<Candidate> = ::mcx::std_vec_from_slice("pgvector_hnsw", &c)?;
+    let mut w_is_new: Vec<bool> = ::mcx::std_vec_from_elem("pgvector_hnsw", false, w.len())?;
     if let Some(nc) = new_candidate {
         w_is_new[nc] = true;
     }
@@ -911,7 +912,7 @@ pub fn select_neighbors(
     }
 
     let must_calculate = !*closer_set;
-    let mut wd: Vec<Candidate> = Vec::with_capacity(w.len());
+    let mut wd: Vec<Candidate> = ::mcx::std_vec_with_capacity("pgvector_hnsw", w.len())?;
     let mut added: Vec<Candidate> = Vec::new();
     let mut removed_any = false;
 
@@ -1017,12 +1018,12 @@ pub fn update_connection(
 }
 
 // HnswSetElementTuple: serialize the element tuple bytes.
-pub fn set_element_tuple(buf: &mut Vec<u8>, pool: &ElementPool<'_>, id: u32) {
+pub fn set_element_tuple(buf: &mut Vec<u8>, pool: &ElementPool<'_>, id: u32) -> PgResult<()> {
     let e = pool.get(id);
     let value = e.value.as_ref().expect("value loaded");
     let size = element_tuple_size(value.len());
     buf.clear();
-    buf.resize(size, 0);
+    ::mcx::std_vec_resize("pgvector_hnsw", buf, size, 0)?;
     buf[0] = HNSW_ELEMENT_TUPLE_TYPE;
     buf[1] = e.level;
     buf[2] = 0;
@@ -1038,15 +1039,16 @@ pub fn set_element_tuple(buf: &mut Vec<u8>, pool: &ElementPool<'_>, id: u32) {
     buf[4 + HNSW_HEAPTIDS * 6..4 + HNSW_HEAPTIDS * 6 + 6]
         .copy_from_slice(&itemptr_encode(e.neighbor_page, e.neighbor_offno));
     buf[ELEMENT_DATA_OFFSET..ELEMENT_DATA_OFFSET + value.len()].copy_from_slice(value);
+    Ok(())
 }
 
 // HnswSetNeighborTuple.
-pub fn set_neighbor_tuple(buf: &mut Vec<u8>, pool: &ElementPool<'_>, id: u32, m: i32) {
+pub fn set_neighbor_tuple(buf: &mut Vec<u8>, pool: &ElementPool<'_>, id: u32, m: i32) -> PgResult<()> {
     let e = pool.get(id);
     let neighbors = e.neighbors.as_ref().expect("neighbors set");
     let size = neighbor_tuple_size(e.level, m);
     buf.clear();
-    buf.resize(size, 0);
+    ::mcx::std_vec_resize("pgvector_hnsw", buf, size, 0)?;
     buf[0] = HNSW_NEIGHBOR_TUPLE_TYPE;
     buf[1] = e.version;
     let mut idx = 0usize;
@@ -1066,6 +1068,7 @@ pub fn set_neighbor_tuple(buf: &mut Vec<u8>, pool: &ElementPool<'_>, id: u32, m:
         }
     }
     buf[2..4].copy_from_slice(&(idx as u16).to_ne_bytes());
+    Ok(())
 }
 
 // HnswFindElementNeighbors (algorithm 1, on-disk form). Fills e.neighbors.
@@ -1148,7 +1151,7 @@ pub fn find_element_neighbors<'t>(
         )?;
 
         // Convert search candidates to candidates; RemoveElements (disk form).
-        let mut lw: Vec<Candidate> = Vec::with_capacity(w.len());
+        let mut lw: Vec<Candidate> = ::mcx::std_vec_with_capacity("pgvector_hnsw", w.len())?;
         for sc in w.iter() {
             let hce = pool.get(sc.element);
             if let Some((sb, so)) = skip {
@@ -1290,8 +1293,8 @@ mod tests {
         ];
         for (info, img) in typed {
             let d = Datum::from_usize(img.as_ptr() as usize);
-            assert!(hnsw_check_dim(2, info, InvalidOid, d).is_ok());
-            let e = hnsw_check_dim(3, info, InvalidOid, d).unwrap_err();
+            assert!(hnsw_check_dim(2, info, InvalidOid, m, d).is_ok());
+            let e = hnsw_check_dim(3, info, InvalidOid, m, d).unwrap_err();
             assert_eq!(e.message(), "expected 3 dimensions, not 2");
             assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_EXCEPTION);
         }

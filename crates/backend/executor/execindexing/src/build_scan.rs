@@ -1,10 +1,7 @@
 // heapam_index_build_range_scan (heapam_handler.c); boundary hoisted above
 // heapam_handler (execindexing already sits above the AM stack — a
-// heapam_handler home would cycle).
-// Lanes: SnapshotAny or a concurrent build's MVCC snapshot, block ranges,
-// and a parallel heap scan (heapam_handler.c:1272-1281).
-use std::ptr::NonNull;
-
+// heapam_handler home would cycle). A parallel index build passes the shared
+// parallel heap scan every participant joins.
 use ::datum::Datum;
 use ::mcx::{Mcx, PgVec};
 use ::types_core::{BlockNumber, INDEX_MAX_KEYS, InvalidBlockNumber};
@@ -80,23 +77,60 @@ where
     )
 }
 
-// heapam_scan_get_blocks_done (heapam_handler.c:1987-2022): blocks completed
-// so far, wrapping when the scan did not start at block 0. In a parallel
-// scan, workers can be concurrently reading blocks further ahead than what
-// is reported.
+// heapam_scan_get_blocks_done (heapam_handler.c): blocks completed so far,
+// wrapping when the scan did not start at block 0.
 fn heapam_scan_get_blocks_done(
     scan: &heapam::HeapScanDescData<'_>,
-    parallel: Option<&tableam_vocab::ParallelBlockTableScanDescData>,
+    parallel: Option<&tableam::ParallelTableScanDescShared>,
 ) -> BlockNumber {
-    let (startblock, nblocks) = match parallel {
-        Some(p) => (p.phs_startblock.load(core::sync::atomic::Ordering::Relaxed), p.phs_nblocks),
-        None => (scan.rs_startblock, scan.rs_nblocks),
+    let startblock = match parallel {
+        Some(p) => p.pscan.phs_startblock.load(core::sync::atomic::Ordering::Relaxed),
+        None => scan.rs_startblock,
     };
     if scan.rs_cblock > startblock {
         scan.rs_cblock - startblock
     } else {
+        let nblocks = match parallel {
+            Some(p) => p.pscan.phs_nblocks,
+            None => scan.rs_nblocks,
+        };
         nblocks - startblock + scan.rs_cblock
     }
+}
+
+/// `table_index_build_scan` with a parallel heap scan (the `scan != NULL`
+/// arm, heapam_handler.c:1172-1300): this participant claims blocks from
+/// `parallel_scan`, whose snapshot (SnapshotAny, or the concurrent build's
+/// MVCC snapshot) drives the scan. Every participant of a parallel build
+/// (btree's, and pgvector's HNSW and IVFFlat) calls this with the same shared
+/// descriptor. A parallel scan always allows syncscan (heapam_handler.c:1280).
+pub fn table_index_build_scan_parallel<'mcx, F>(
+    mcx: Mcx<'mcx>,
+    heap_relation: &Relation<'mcx>,
+    index_relation: &Relation<'mcx>,
+    index_info: &mut IndexInfo<'mcx>,
+    progress: bool,
+    parallel_scan: &tableam::ParallelTableScanDescShared,
+    callback: F,
+) -> PgResult<f64>
+where
+    F: FnMut(&Relation<'mcx>, &ItemPointerData, &[Datum], &[bool], bool) -> PgResult<()>,
+{
+    build_range_scan_core_inner(
+        mcx,
+        heap_relation,
+        index_relation,
+        index_info,
+        true,
+        false,
+        progress,
+        0,
+        InvalidBlockNumber,
+        None,
+        None,
+        Some(parallel_scan),
+        callback,
+    )
 }
 
 /// [`table_index_build_range_scan`] with a HOISTED `OldestXmin` (M4.2
@@ -136,7 +170,6 @@ where
         numblocks,
         hoisted_oldest_xmin,
         None,
-        None,
         callback,
     )
 }
@@ -167,40 +200,6 @@ where
         InvalidBlockNumber,
         None,
         Some(snapshot),
-        None,
-        callback,
-    )
-}
-
-/// table_index_build_scan with a parallel heap scan (C's `scan` argument,
-/// heapam_handler.c:1172-1300): every participant of a parallel build calls
-/// this with the same shared descriptor, which hands out the blocks. A
-/// parallel scan always allows syncscan (heapam_handler.c:1280).
-pub fn table_index_build_scan_parallel<'mcx, F>(
-    mcx: Mcx<'mcx>,
-    heap_relation: &Relation<'mcx>,
-    index_relation: &Relation<'mcx>,
-    index_info: &mut IndexInfo<'mcx>,
-    progress: bool,
-    parallel_scan: &tableam::ParallelTableScanDescShared,
-    callback: F,
-) -> PgResult<f64>
-where
-    F: FnMut(&Relation<'mcx>, &ItemPointerData, &[Datum], &[bool], bool) -> PgResult<()>,
-{
-    build_range_scan_core(
-        mcx,
-        heap_relation,
-        index_relation,
-        index_info,
-        true,
-        false,
-        progress,
-        0,
-        InvalidBlockNumber,
-        None,
-        None,
-        Some(parallel_scan),
         callback,
     )
 }
@@ -218,12 +217,51 @@ fn build_range_scan_core<'mcx, F>(
     numblocks: BlockNumber,
     hoisted_oldest_xmin: Option<types_core::TransactionId>,
     snapshot: Option<&snapmgr::Snapshot>,
-    parallel_scan: Option<&tableam::ParallelTableScanDescShared>,
+    callback: F,
+) -> PgResult<f64>
+where
+    F: FnMut(&Relation<'mcx>, &ItemPointerData, &[Datum], &[bool], bool) -> PgResult<()>,
+{
+    build_range_scan_core_inner(
+        mcx,
+        heap_relation,
+        index_relation,
+        index_info,
+        allow_sync,
+        anyvisible,
+        progress,
+        start_blockno,
+        numblocks,
+        hoisted_oldest_xmin,
+        snapshot,
+        None,
+        callback,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_range_scan_core_inner<'mcx, F>(
+    mcx: Mcx<'mcx>,
+    heap_relation: &Relation<'mcx>,
+    index_relation: &Relation<'mcx>,
+    index_info: &mut IndexInfo<'mcx>,
+    allow_sync: bool,
+    anyvisible: bool,
+    progress: bool,
+    start_blockno: BlockNumber,
+    numblocks: BlockNumber,
+    hoisted_oldest_xmin: Option<types_core::TransactionId>,
+    snapshot: Option<&snapmgr::Snapshot>,
+    parallel: Option<&tableam::ParallelTableScanDescShared>,
     mut callback: F,
 ) -> PgResult<f64>
 where
     F: FnMut(&Relation<'mcx>, &ItemPointerData, &[Datum], &[bool], bool) -> PgResult<()>,
 {
+    // IX1 L1: a pgrcolumnar table's rows live outside its (empty) main fork; its own scan feeds the callback.
+    if tableam_vocab::TableAm::of(heap_relation) == Some(tableam_vocab::TableAm::Pgrcolumnar) {
+        return pgrc_build_range_scan(mcx, heap_relation, index_relation, index_info, start_blockno, numblocks, callback);
+    }
     let concurrent = index_info.ii_Concurrent;
     let is_system_catalog = catalog::IsSystemRelation(heap_relation);
     let checking_uniqueness = index_info.ii_Unique || index_info.ii_HasExclusion;
@@ -244,8 +282,7 @@ where
     // MVCC snapshot, restored and registered for this scan the way
     // table_beginscan_parallel does (its SO_TEMP_SNAPSHOT), and dropped at
     // the end.
-    let (registered, owned) = if let Some(p) = parallel_scan {
-        debug_assert!(allow_sync);
+    let (registered, owned) = if let Some(p) = parallel {
         // table_beginscan_parallel (tableam.c:172) asserts that the relation
         // is the file the parallel scan was initialized for. DIVERGENCE: an
         // ERROR where C asserts. A participant whose relcache entry missed an
@@ -312,22 +349,27 @@ where
     if allow_sync {
         flags |= SO_ALLOW_SYNC;
     }
+    debug_assert!(parallel.is_none() || allow_sync);
     let mut scan = heapam::heap_beginscan(
         mcx,
         heap_relation,
         registered.clone(), // None is SnapshotAny
         0,
         PgVec::new_in(mcx),
-        parallel_scan.map(|p| NonNull::from(&p.pscan)),
+        parallel.map(|p| core::ptr::NonNull::from(&p.pscan)),
         flags,
     )?;
+    let nblocks = match parallel {
+        Some(p) => p.pscan.phs_nblocks,
+        None => scan.rs_nblocks,
+    };
 
     // heapam_handler.c:1298-1314: publish the number of blocks to scan
     // (the whole relation, even for a range scan).
     if progress {
         backend_progress_seams::pgstat_progress_update_param::call(
             PROGRESS_SCAN_BLOCKS_TOTAL,
-            i64::from(parallel_scan.map_or(scan.rs_nblocks, |p| p.pscan.phs_nblocks)),
+            i64::from(nblocks),
         );
     }
 
@@ -351,7 +393,7 @@ where
     // C's per-tuple econtext reset (heapam_handler.c:1611): expression and
     // predicate results land here, consumed by `callback` within the
     // iteration, freed before the next tuple.
-    let mut per_tuple = mcx::MemoryContext::new_bump("IndexBuildPerTuple");
+    let mut per_tuple = mcx::MemoryContext::new_wholesale("IndexBuildPerTuple");
 
     loop {
         per_tuple.reset();
@@ -361,7 +403,7 @@ where
 
         // heapam_handler.c:1338-1348: report scan progress, if asked to.
         if progress {
-            let blocks_done = heapam_scan_get_blocks_done(&scan, parallel_scan.map(|p| &p.pscan));
+            let blocks_done = heapam_scan_get_blocks_done(&scan, parallel);
             if blocks_done != previous_blkno {
                 backend_progress_seams::pgstat_progress_update_param::call(
                     PROGRESS_SCAN_BLOCKS_DONE,
@@ -540,7 +582,7 @@ where
     if progress {
         backend_progress_seams::pgstat_progress_update_param::call(
             PROGRESS_SCAN_BLOCKS_DONE,
-            i64::from(parallel_scan.map_or(scan.rs_nblocks, |p| p.pscan.phs_nblocks)),
+            i64::from(nblocks),
         );
     }
 
@@ -582,4 +624,154 @@ fn slot_is_heap_only(slot: &SlotData<'_>) -> bool {
             .is_some_and(|t| t.t_data().is_heap_only()),
         _ => unreachable!("build scan slot is BufferHeap"),
     }
+}
+
+fn pgrc_refused(message: impl Into<String>) -> Box<types_error::PgError> {
+    Box::new(types_error::PgError::error(message).with_sqlstate(types_error::ERRCODE_FEATURE_NOT_SUPPORTED))
+}
+
+/// DefineIndex asks before any catalog work, with `concurrent` its effective CONCURRENTLY; the build scan asks again
+/// for the rebuild paths (REINDEX, SET ACCESS METHOD, ALTER's rewrites, TRUNCATE), where a concurrent build is never
+/// asked about (amcheck's MVCC lane uses it).
+pub fn pgrc_index_check(am: types_relscan::IndexAmKind, amname: &str, unique: bool, exclusion: bool, concurrent: bool) -> PgResult<()> {
+    use types_relscan::IndexAmKind as K;
+    match am {
+        K::Btree | K::Hash | K::Gist | K::Spgist | K::Gin => {}
+        K::Brin => {
+            return Err(Box::new(
+                types_error::PgError::error("pgrcolumnar does not support BRIN indexes")
+                    .with_sqlstate(types_error::ERRCODE_FEATURE_NOT_SUPPORTED)
+                    .with_hint("Zone maps already prune block ranges of pgrcolumnar tables."),
+            ))
+        }
+        #[allow(unreachable_patterns)]
+        _ => return Err(pgrc_refused(format!("pgrcolumnar does not support index access method \"{amname}\""))),
+    }
+    if unique {
+        return Err(pgrc_refused("pgrcolumnar does not support unique indexes yet"));
+    }
+    if exclusion {
+        return Err(pgrc_refused("pgrcolumnar does not support exclusion constraints yet"));
+    }
+    if concurrent {
+        return Err(pgrc_refused("pgrcolumnar does not support CREATE INDEX CONCURRENTLY"));
+    }
+    Ok(())
+}
+
+fn pgrc_build_needed_attrs(natts: usize, index_info: &IndexInfo<'_>) -> PgResult<Option<Box<[bool]>>> {
+    struct Cx {
+        needed: Vec<bool>,
+        all: bool,
+    }
+    impl<'mcx> nodes_core::NodeWalker<'mcx> for Cx {
+        fn visit(&mut self, n: ::types_nodes::node_tree::Node<'mcx>) -> PgResult<bool> {
+            if let Some(v) = n.as_var() {
+                if v.varlevelsup == 0 {
+                    match usize::try_from(v.varattno) {
+                        Ok(a) if a >= 1 && a <= self.needed.len() => self.needed[a - 1] = true,
+                        _ => self.all = true,
+                    }
+                }
+                return Ok(self.all);
+            }
+            nodes_core::expression_tree_walker(n, self)
+        }
+    }
+    let mut cx = Cx { needed: ::mcx::stdvec::try_filled(natts, false, "pgrc_build_needed_attrs")?, all: false };
+    for &a in &index_info.ii_IndexAttrNumbers[..index_info.ii_NumIndexAttrs as usize] {
+        match usize::try_from(a) {
+            Ok(0) => {}
+            Ok(a) if a <= natts => cx.needed[a - 1] = true,
+            _ => cx.all = true,
+        }
+    }
+    for list in [&index_info.ii_Expressions, &index_info.ii_Predicate] {
+        for n in list.iter() {
+            if nodes_core::NodeWalker::visit(&mut cx, n)? {
+                return Ok(None);
+            }
+        }
+    }
+    Ok((!cx.all).then(|| cx.needed.into_boxed_slice()))
+}
+
+/// A non-concurrent build indexes every row whose insert did not abort and that no delete removed below the horizon:
+/// the parts of the newest generation the table's commit check sees under `SnapshotAny` (committed and own publishes;
+/// `EXT_UNDER` parts of aborted creators stay hidden), minus their DV marks, and the live segments' rows under
+/// `SnapshotNonVacuumable` (an aborted insert is skipped, the transaction's own in-progress one kept). No tombstone
+/// hides a row: a row deleted in flight stays indexed (recently dead), and a fetch decides each hit's visibility.
+/// CREATE INDEX's ShareLock keeps writers out; seal, compile, compaction and rotation may run beside the scan (they
+/// keep every row's ID, and the scan reads one generation). Every row is passed as alive (no unique index is built).
+fn pgrc_build_range_scan<'mcx, F>(
+    mcx: Mcx<'mcx>,
+    heap_relation: &Relation<'mcx>,
+    index_relation: &Relation<'mcx>,
+    index_info: &mut IndexInfo<'mcx>,
+    start_blockno: BlockNumber,
+    numblocks: BlockNumber,
+    mut callback: F,
+) -> PgResult<f64>
+where
+    F: FnMut(&Relation<'mcx>, &ItemPointerData, &[Datum], &[bool], bool) -> PgResult<()>,
+{
+    let am = types_relscan::IndexAmKind::from_relam(index_relation.rd_rel.relam);
+    pgrc_index_check(am, &format!("{am:?}").to_lowercase(), index_info.ii_Unique, index_info.ii_HasExclusion, false)?;
+    if start_blockno != 0 || numblocks != InvalidBlockNumber {
+        return Err(Box::new(types_error::PgError::error(format!(
+            "pgrcolumnar: table \"{}\" has no blocks to build an index over a block range of",
+            heap_relation.name()
+        ))));
+    }
+    let registered = if index_info.ii_Concurrent {
+        let snap = snapmgr::GetTransactionSnapshot()?;
+        Some(snapmgr::RegisterSnapshot(Some(&snap))?.expect("registered snapshot"))
+    } else {
+        None
+    };
+    crate::prepare_index_predicate(mcx, index_info)?;
+    let needed = pgrc_build_needed_attrs(heap_relation.rd_att.natts as usize, index_info)?;
+    let mut scan = tableam::table_beginscan_index_build(mcx, heap_relation, registered.clone())?;
+    if let Some(n) = needed.as_deref() {
+        tableam::table_scan_set_needed_attrs(&mut scan, n);
+    }
+    let mut slot = tableam::table_slot_create(mcx, heap_relation)?;
+    let mut values = [Datum::null(); INDEX_MAX_KEYS as usize];
+    let mut isnull = [false; INDEX_MAX_KEYS as usize];
+    let mut per_tuple = mcx::MemoryContext::new_bump("IndexBuildPerTuple");
+    let mut reltuples = 0.0f64;
+    let res = (|| -> PgResult<()> {
+        loop {
+            per_tuple.reset();
+            postgres_seams::check_for_interrupts::call()?;
+            if !tableam::table_scan_getnextslot(mcx, &mut scan, types_scan::ScanDirection::ForwardScanDirection, &mut slot)? {
+                return Ok(());
+            }
+            let tid = slot_tid(&slot);
+            if !::types_tuple::itemptr::ItemPointerIsValid(&tid) {
+                return Err(Box::new(
+                    types_error::PgError::error(format!(
+                        "pgrcolumnar: table \"{}\" holds rows without row IDs, which no index can name",
+                        heap_relation.name()
+                    ))
+                    .with_sqlstate(types_error::ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE)
+                    .with_hint("Rows written before row IDs get them from VACUUM (FULL, RENUMBER)."),
+                ));
+            }
+            reltuples += 1.0;
+            if !index_info.ii_Predicate.is_nil() && !index_predicate_passes(mcx, per_tuple.mcx(), index_info, &mut slot)? {
+                continue;
+            }
+            FormIndexDatum(mcx, per_tuple.mcx(), index_info, &mut slot, &mut values[..], &mut isnull[..])?;
+            callback(index_relation, &tid, &values[..], &isnull[..], true)?;
+        }
+    })();
+    exectuples::exec_clear_tuple(&mut slot, mcx);
+    let end = tableam::table_endscan(scan);
+    if let Some(snap) = registered {
+        snapmgr::UnregisterSnapshot(Some(&snap));
+    }
+    res?;
+    end?;
+    Ok(reltuples)
 }

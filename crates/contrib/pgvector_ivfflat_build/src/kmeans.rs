@@ -488,13 +488,13 @@ fn check_elements(mcx: Mcx<'_>, centers: &VectorArray<'_>, type_info: &IvfflatTy
 
 // CheckNorms (ivfkmeans.c:517-534): ensure no zero vectors for cosine
 // distance. It checks NORM_PROC, not KMEANS_NORM_PROC.
-fn check_norms(centers: &VectorArray<'_>, procs: &mut KmeansProcs) -> PgResult<()> {
+fn check_norms(mcx: Mcx<'_>, centers: &VectorArray<'_>, procs: &mut KmeansProcs) -> PgResult<()> {
     let collation = procs.collation;
     let Some(normprocinfo) = procs.norm.as_mut() else {
         return Ok(());
     };
     for i in 0..centers.length {
-        let norm = types_fmgr::function_call1_coll(normprocinfo, collation, centers.datum(i)?)?.as_f64();
+        let norm = types_fmgr::function_call1_coll_in(normprocinfo, collation, mcx, centers.datum(i)?)?.as_f64();
         if norm == 0.0 {
             return Err(elog_error("Zero norm detected. Please report a bug.", "ivfkmeans.c", 532, "CheckNorms"));
         }
@@ -513,7 +513,7 @@ fn check_centers(
         return Err(elog_error("Not enough centers. Please report a bug.", "ivfkmeans.c", 543, "CheckCenters"));
     }
     check_elements(mcx, centers, type_info)?;
-    check_norms(centers, procs)
+    check_norms(mcx, centers, procs)
 }
 
 // IvfflatKmeans (ivfkmeans.c:549-570): spherical k-means for inner product

@@ -128,12 +128,12 @@ fn page_add(
     Ok(())
 }
 
-fn serialize_element_tuple(buf: &mut Vec<u8>, e: &Element, p: Placement) {
+fn serialize_element_tuple(buf: &mut Vec<u8>, e: &Element, p: Placement) -> PgResult<()> {
     let value = e.value();
     let links = e.links();
     let size = element_tuple_size(value.len());
     buf.clear();
-    buf.resize(size, 0);
+    ::mcx::std_vec_resize("pgvector_hnsw_build", buf, size, 0)?;
     buf[0] = HNSW_ELEMENT_TUPLE_TYPE;
     buf[1] = e.level;
     buf[2] = 0;
@@ -150,12 +150,13 @@ fn serialize_element_tuple(buf: &mut Vec<u8>, e: &Element, p: Placement) {
     buf[4 + HNSW_HEAPTIDS * 6..4 + HNSW_HEAPTIDS * 6 + 6]
         .copy_from_slice(&itemptr_encode(p.neighbor_page, p.neighbor_offno));
     buf[ELEMENT_DATA_OFFSET..ELEMENT_DATA_OFFSET + value.len()].copy_from_slice(value);
+    Ok(())
 }
 
-fn serialize_neighbor_tuple(buf: &mut Vec<u8>, e: &Element, placements: &[Placement], m: i32) {
+fn serialize_neighbor_tuple(buf: &mut Vec<u8>, e: &Element, placements: &[Placement], m: i32) -> PgResult<()> {
     let size = neighbor_tuple_size(e.level, m);
     buf.clear();
-    buf.resize(size, 0);
+    ::mcx::std_vec_resize("pgvector_hnsw_build", buf, size, 0)?;
     buf[0] = HNSW_NEIGHBOR_TUPLE_TYPE;
     // The element's version
     buf[1] = 1;
@@ -176,6 +177,7 @@ fn serialize_neighbor_tuple(buf: &mut Vec<u8>, e: &Element, placements: &[Placem
         }
     }
     buf[2..4].copy_from_slice(&(idx as u16).to_ne_bytes());
+    Ok(())
 }
 
 // CreateGraphPages (hnswbuild.c:150-248): graph->head, newest first
@@ -224,7 +226,7 @@ fn create_graph_pages(bs: &BuildState<'_, '_>, graph: &Graph) -> PgResult<Vec<Pl
         };
         placements[id as usize] = placement;
 
-        serialize_element_tuple(&mut etup, e, placement);
+        serialize_element_tuple(&mut etup, e, placement)?;
         page_add(bs.index, buf, &etup, placement.offno)?;
 
         // SAFETY: lock held.
@@ -236,7 +238,7 @@ fn create_graph_pages(bs: &BuildState<'_, '_>, graph: &Graph) -> PgResult<Vec<Pl
             build_append_page(bs.index, &mut buf, bs.fork_num)?;
         }
         ntup_placeholder.clear();
-        ntup_placeholder.resize(ntup_size, 0);
+        ::mcx::std_vec_resize("pgvector_hnsw_build", &mut ntup_placeholder, ntup_size, 0)?;
         ntup_placeholder[0] = HNSW_NEIGHBOR_TUPLE_TYPE;
         page_add(bs.index, buf, &ntup_placeholder, placement.neighbor_offno)?;
     }
@@ -262,7 +264,7 @@ fn write_neighbor_tuples(bs: &BuildState<'_, '_>, graph: &Graph, placements: &[P
         let e = graph.element(id);
         let p = placements[id as usize];
         let ntup_size = neighbor_tuple_size(e.level, bs.m);
-        serialize_neighbor_tuple(&mut ntup, e, placements, bs.m);
+        serialize_neighbor_tuple(&mut ntup, e, placements, bs.m)?;
         let buf = bufmgr::ReadBufferExtended(
             bs.index,
             bs.fork_num,
@@ -316,7 +318,7 @@ fn insert_tuple(
     if isnull.first().copied().unwrap_or(true) {
         return Ok(false);
     }
-    let tmp = mcx::MemoryContext::new_bump("Hnsw build temporary context");
+    let tmp = mcx::MemoryContext::new_wholesale("Hnsw build temporary context");
     let mut support = bs.support.clone();
 
     // Form index value
@@ -326,7 +328,7 @@ fn insert_tuple(
     };
 
     // Check dimensions match index
-    hnsw_check_dim(bs.dimensions, bs.type_info, support.collation, Datum::from_usize(img.as_ptr() as usize))?;
+    hnsw_check_dim(bs.dimensions, bs.type_info, support.collation, tmp.mcx(), Datum::from_usize(img.as_ptr() as usize))?;
 
     let state: &BuildState<'_, '_> = bs;
     let params = InsertParams { m: state.m, ef_construction: state.ef_construction };
@@ -568,7 +570,7 @@ pub fn hnswbuild<'mcx>(
 }
 
 pub fn hnswbuildempty(index: &Relation<'_>) -> PgResult<()> {
-    let mcx_owner = mcx::MemoryContext::new_bump("hnsw buildempty");
+    let mcx_owner = mcx::MemoryContext::new_wholesale("hnsw buildempty");
     build_index(mcx_owner.mcx(), None, index, None, ForkNumber::INIT_FORKNUM)?;
     Ok(())
 }

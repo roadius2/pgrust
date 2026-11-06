@@ -170,7 +170,7 @@ fn get_scan_value(so: &mut IvfflatScanOpaqueData, orderby: &ScanKeyData) -> PgRe
     }
 
     // Check dimensions match index
-    ivfflat_check_dim(so.dimensions, so.type_info, so.collation, Datum::from_usize(value.as_ptr() as usize))?;
+    ivfflat_check_dim(so.dimensions, so.type_info, so.collation, tmp.mcx(), Datum::from_usize(value.as_ptr() as usize))?;
 
     Ok(Some(value.to_vec()))
 }
@@ -277,7 +277,7 @@ pub fn ivfflatgettuple(scan: &mut IndexScanDescData<'_>, _direction: types_scan:
 
     if opaque(scan).first {
         // Count index scan for stats
-        scan.xs_pgstat_index_scans += 1;
+        scan.xs_pgstat.count(1, 0, 0);
         scan.xs_nsearches += 1;
 
         // Safety check

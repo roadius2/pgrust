@@ -197,8 +197,8 @@ pub fn ivfflat_norm_value<'m>(
 }
 
 // IvfflatCheckNorm (ivfutils.c:93-97): a non-zero norm.
-pub fn ivfflat_check_norm(procinfo: &mut FmgrInfo, collation: Oid, value: Datum) -> PgResult<bool> {
-    Ok(types_fmgr::function_call1_coll(procinfo, collation, value)?.as_f64() > 0.0)
+pub fn ivfflat_check_norm(procinfo: &mut FmgrInfo, collation: Oid, mcx: Mcx<'_>, value: Datum) -> PgResult<bool> {
+    Ok(types_fmgr::function_call1_coll_in(procinfo, collation, mcx, value)?.as_f64() > 0.0)
 }
 
 // IvfflatNormVectors (ivfutils.c:102-120). C normalizes in tmpCtx and resets
@@ -213,7 +213,7 @@ pub fn ivfflat_norm_vectors(
         let value = arr.get(i)?;
         let new_value = ivfflat_norm_value(type_info, collation, tmp.mcx(), &value[..varsize_any(value)])?;
         // Safety check
-        ivfflat_check_dim(arr.dim, type_info, collation, Datum::from_usize(new_value.as_ptr() as usize))?;
+        ivfflat_check_dim(arr.dim, type_info, collation, tmp.mcx(), Datum::from_usize(new_value.as_ptr() as usize))?;
         arr.set(i, &new_value)?;
     }
     Ok(())
@@ -475,9 +475,10 @@ pub fn ivfflat_check_dim(
     expected: i32,
     type_info: &IvfflatTypeInfo,
     collation: Oid,
+    mcx: Mcx<'_>,
     value: Datum,
 ) -> PgResult<()> {
-    let dim = types_fmgr::fcinfo::direct_function_call1_coll(type_info.dimensions, collation, value)?.as_i32();
+    let dim = types_fmgr::fcinfo::direct_function_call1_coll_in(type_info.dimensions, collation, mcx, value)?.as_i32();
     ivfflat_check_expected_dim(expected, dim)
 }
 
@@ -777,8 +778,8 @@ mod tests {
             [(&VECTOR_TYPE_INFO, &vimg[..]), (&HALFVEC_TYPE_INFO, &himg[..]), (&BIT_TYPE_INFO, &bimg[..])];
         for (info, img) in typed {
             let d = Datum::from_usize(img.as_ptr() as usize);
-            assert!(ivfflat_check_dim(2, info, InvalidOid, d).is_ok());
-            let e = ivfflat_check_dim(3, info, InvalidOid, d).unwrap_err();
+            assert!(ivfflat_check_dim(2, info, InvalidOid, m, d).is_ok());
+            let e = ivfflat_check_dim(3, info, InvalidOid, m, d).unwrap_err();
             assert_eq!(e.message(), "expected 3 dimensions, not 2");
             assert_eq!(e.sqlstate(), types_error::ERRCODE_DATA_EXCEPTION);
         }
