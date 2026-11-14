@@ -99,3 +99,18 @@ The exact `pgbench` script shape, the loader's batch size, how the recall pass i
 ## 10. What this is not yet
 
 No number in this document is a result. The first results are phase 1's report.
+
+## 11. Amendments from phase 1's execution (2026-11-14; all Claude's rulings, recorded in the plan's ledger)
+
+Later phases plan from this section as well as from §3–§8.
+
+- **Containers need `security.nesting=true`** (the cluster's own convention). Without it, Incus's AppArmor profile denies signals between the plain container label and the stacked `//&unconfined` label that systemd-started processes carry, so `kill()` fails even for root: PostgreSQL 18's worker-mode AIO hung every connection at its first catalog read, `systemctl stop` could not stop a server, and checkpoints and parallel workers would have failed. With nesting on, `io_method=worker` works and `pg-c` keeps it (§4 stands). A plain `incus stop` of a database container still hangs on the containers' rsyslogd AppArmor profile; `borg.sh stop` stops the database service first and forces the container after 120 s.
+- **`pg-c`'s packages:** PGDG's newest pgvector build (`0.8.7-1.pgdg24.04+2`) depends on `postgresql-18 (>> 18.7)`, so the 18.6 baseline pins `postgresql-18-pgvector=0.8.7-1.pgdg24.04+1` (the same 0.8.7 source) with `postgresql-18` and `postgresql-client-18` at `18.6-1.pgdg24.04+2`, all held; `postgresql-common` is installed first with `create_main_cluster = false` so the Debian postinst does not start a cluster with the default configuration; the cluster is created by the installer and configured before its first start. PGDG also has 18.7; the report says so.
+- **`ssl = off` is a thirteenth common setting** and every client DSN carries `sslmode=disable`: the Debian template turns TLS on with a snakeoil certificate, pgrust has no TLS, and the engine is what is measured.
+- **The lookup tables `queries` and `extra` have primary keys** (same DDL on both sides): the pgbench script reads one row of them per transaction and that lookup is not what is measured — without the key C's search rate fell by a third.
+- **IVFFlat `lists = rows/1000` at every size** (glove 1183, sift 1000), computed from the loaded row count.
+- **`settle` runs before each dataset's load, each index build, the first point of each search sweep, the plain-SQL step and the soak** — not between consecutive 30 s pgbench points, whose only intervening load is our own just-finished step; it is capped at 600 s and its readings go to the run log.
+- **The soak's inserts duplicate indexed vectors** (`extra` is the first 100,000 training rows, drawn with replacement; holding rows out of `items` would break the dataset's ground truth), equally on both engines; inserted rows (`id >= 100000000`) are deleted and the table vacuumed before any later recall pass, and the report says so when reading insert numbers.
+- **Unit asymmetry, recorded not tuned:** Debian's `postgresql@18-main` has `OOMScoreAdjust=-900`; `pgrust.service` has 0. No measured step approaches the 24 GiB limit; a limit for the memory-constrained scale run.
+- **Peak memory on this kernel (6.14):** a write to `memory.peak` resets only the writer's own fd view, so `metrics_reset`/`metrics_read` work through a root helper that holds the file open; both are called from the orchestrator's shell.
+- **For phase 3:** `load.py` formats all rows before its timed `COPY`s (so the load number is the server's ingest, not the client's Python); on glove that peaked at 2.7 GB of the client's 4 GiB — the 1536-d dataset needs chunked formatting or a larger client.
