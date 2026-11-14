@@ -8,6 +8,7 @@ The first speed measurements on the v0.4-beta engine (fork `main` at `fe9b4a73cc
 - **Against the fork at v0.3.1:** the exact scan is 1.9× faster under Gravity (10.1 s → 5.4 s); searches are 3% to 7% faster; builds and inserts are unchanged.
 - **Against upstream v0.4-beta's own port:** upstream refuses every search and insert (`gravity: refused`), as the handoff said, so only builds and the exact scan compare: the exact scan is equal, and upstream's serial HNSW build is 5.6% faster than the fork's (16.4 s vs 17.3 s) where the two were equal at v0.3.1.
 - **`halfvec` is the outlier, confirmed on release:** HNSW builds 4.4× C serial and 3.9× parallel; IVFFlat 11.2× and 8.1×. On pgrust a `halfvec` HNSW build takes 2.35× its own `vector` build; on C it is faster than `vector`. The lead is the port's per-element software f16→f32 conversion (below).
+- **`halfvec` after the conversion fix (2026-11-13, the last section):** a profile confirmed the lead, the kernels now convert in blocks, and the four `halfvec` builds are 2.0× to 3.1× faster than above: HNSW 2.15× C serial and 1.84× parallel, IVFFlat 3.53× and 2.88×, with pages still byte-identical to C's seeded build.
 
 ## Method
 
@@ -78,15 +79,72 @@ Both sides launched the requested workers in every cell. The ratios match M7's `
 
 Recall differences are within ±0.003 on every row and `exact_vector` / `exact_halfvec` match C to 4e-07. M7's release numbers were 4.13 / 3.79 / 9.85 / 8.44 for the four `halfvec` rows; these agree.
 
-**The `halfvec` lead.** C's `half` is `_Float16` on this Mac (`halfvec.h:48`: `__FLT16_MAX__` is defined, so `FLT16_SUPPORT`), and `HalfToFloat4` is a hardware widening the compiler vectorizes inside the `*Default` kernels (`halfutils.h:67`, `halfutils.c:29-43`). The port's `half_to_float4` (`crates/contrib/pgvector/src/halfutils.rs:39-73`) is halfutils.h's *software* path, branches and a 10-iteration loop for subnormals, called once per element of both operands inside every kernel (`halfutils.rs:144-188`), and the kernels are what both index builds spend their time in. That explains why `halfvec` costs pgrust 2.4× to 4.9× its own `vector` time while costing C nothing. f16→f32 widening is exact, so any correct conversion gives the same bits: the fix changes no result and `pgvector_f16_parity` already checks every f16. Rust 1.96's `f16` primitive is unstable, but the conversion can be a branch-free routine LLVM vectorizes, or the hardware instruction per architecture: on AArch64 both `std::arch::aarch64::vcvt_f32_f16` (through `float16x4_t`) and an `asm!` `fcvtl` compile on the pinned stable toolchain (checked 2026-11-08); x86-64's F16C `_mm_cvtph_ps` is stable too but unchecked here. The kernels' summation order stays as it is (user decision 2026-10-06: no emulation of C's vectorized reductions), so some gap against C would remain after the fix; `vector`'s 1.5× to 1.7× is the floor to expect.
+**The `halfvec` lead.** C's `half` is `_Float16` on this Mac (`halfvec.h:48`: `__FLT16_MAX__` is defined, so `FLT16_SUPPORT`), and `HalfToFloat4` is a hardware widening the compiler vectorizes inside the `*Default` kernels (`halfutils.h:67`, `halfutils.c:29-43`). The port's `half_to_float4` (`crates/contrib/pgvector/src/halfutils.rs:39-73`) is halfutils.h's *software* path, branches and a 10-iteration loop for subnormals, called once per element of both operands inside every kernel (`halfutils.rs:144-188`), and the kernels are what both index builds spend their time in. That explains why `halfvec` costs pgrust 2.4× to 4.9× its own `vector` time while costing C nothing. f16→f32 widening is exact, so any correct conversion gives the same bits: the fix changes no result and `pgvector_f16_parity` already checks every f16. Rust 1.96's `f16` primitive is unstable, but the conversion can be a branch-free routine LLVM vectorizes, or the hardware instruction per architecture: on AArch64 both `std::arch::aarch64::vcvt_f32_f16` (through `float16x4_t`) and an `asm!` `fcvtl` compile on the pinned stable toolchain (checked 2026-11-08); x86-64's F16C `_mm_cvtph_ps` is stable too but unchecked here. The kernels' summation order stays as it is (user decision 2026-10-06: no emulation of C's vectorized reductions), so some gap against C would remain after the fix; `vector`'s 1.5× to 1.7× is the floor to expect. (The line numbers here are `fe9b4a73cc`'s. A profile taken after these runs confirmed the lead; the last section describes the fix and measures it.)
 
 ## What this measures and what it doesn't
 
 - Single-client latency and single-statement build time on one machine, data in cache, release profile. No concurrency, no I/O-bound sizes, no x86-64.
-- `halfvec`'s lead is from reading the source, not from a profile; the fix work should profile first to confirm the conversion is where the time goes.
+- ~~`halfvec`'s lead is from reading the source, not from a profile; the fix work should profile first to confirm the conversion is where the time goes.~~ Since profiled (`profile/`, after these runs) and fixed (2026-11-13): see the last section.
 - The 1.5× `vector` build gap and the 1.45× exact-scan gap have no attributed cause yet. Both need a profile (`fast-profile` or `profiling` builds exist for this). The exact scan is engine-level: upstream's port shows the same 1.47×.
 - Nothing at scale was rerun: M7's `scale-2` (396k × 300d, 2.1× to 2.9× C on builds) stands as the only scale measurement.
 
 ## Evidence
 
 `~/.cache/pgrust/speed-2026-11-08/`: `run.sh` (the driver; waits for Time Machine, then the five steps under `timed.sh`), `bench.sh`, `summarize.sh`, each step's `<step>.log` and `.out`, `bench/` (per-run TSVs, logs, plans, settings and server binaries), `work/buildtime/pgrust/` and `work/recall/pgrust/` (the tiers' own reports and TSVs), the two build logs and the commits measured (`fork-commit.txt`, `upstream-commit.txt`). The upstream worktree stays at `~/.cache/pgrust/upstream-v04beta` (1.1 GB target) for the next comparison; `git worktree remove` it when done.
+
+## 2026-11-13: the halfvec conversion, fixed
+
+**What changed** (branch `vector/halfvec-f16`, `a80a577ca5` and `435eff290b`; plan `docs/superpowers/plans/2026-11-13-pgvector-halfvec-f16-conversion.md`). Only the conversion changed. The kernels' accumulation stays element by element in C source order, with no reassociation and no fused multiply-add, per the 2026-10-06 ruling (Decision 1). The four kernels (`halfutils.rs:232-272`) share `for_each_pair` (`halfutils.rs:212-230`). It converts both operands a block of `BLOCK` = 32 halves at a time into two 32-float stack arrays (`halfutils.rs:79-81`), then hands the kernel's closure one pair at a time in order (Decision 2). The block conversion `halves_to_floats` (`halfutils.rs:116-144`) has two lane routes in one function (Decision 3). Under `cfg(all(target_arch = "aarch64", target_endian = "little", target_feature = "neon"))` it loads 8 halves at a time and widens them with `vcvt_f32_f16` / `vcvt_high_f32_f16` (`fcvtl` / `fcvtl2`, `halfutils.rs:123-141`), sending the remainder to the portable route. Every other target takes the portable route for the whole block (`halfutils.rs:142-143`). The portable route is `half_to_float4_portable` (`halfutils.rs:83-106`, looped by `portable_block` at `halfutils.rs:108-114`), a branch-free form of halfutils.h's software path whose selects LLVM can vectorize (Decision 4):
+- the sign moves up with `(h & 0x8000) << 16`;
+- a normal half becomes `((h & 0x7FFF) << 13) + (112 << 23)`;
+- a subnormal or zero half is the exact subtraction `f32(0x3880_0000 | m << 13) − f32(0x3880_0000)`, which is m·2⁻²⁴ by Sterbenz;
+- infinity and NaN become `0x7F80_0000 | (m << 13)`, with the quiet bit forced for a NaN as the software path does.
+
+`half_to_float4` (`halfutils.rs:41-77`) stays the per-element software port and is the reference every route is tested against. Widening f16 to f32 is exact, so every correct route gives the same bits, and a kernel's result can't change.
+
+**The profile that confirmed the lead** (`~/.cache/pgrust/speed-2026-11-08/profile/`, macOS `sample` at 1 ms over the `fast-profile` server, taken after the runs above, for attribution only). The serial `halfvec` HNSW build had 10,880 of its backend thread's 14,666 samples (74%) at the top of the conversion iterator, against 805 in `halfvec_inner_product` itself (`hnsw-halfvec-sample.txt`). The serial IVFFlat build had 3,623 of 4,404 (82%), against 265 (`ivfflat-halfvec-sample.txt`).
+
+**The spike** (`profile/h2f-spike/`, release profile, inner product at dim 100, best of 5 runs of 200,000 calls): the f32 `vector` kernel takes 21 ns a call; the `halfvec` kernel before the change 178 ns; with the portable block route 82 ns; with the NEON block route 34 ns.
+
+**Build times** (`run-recall.sh pgrust` on the four `halfvec` cases and the two serial `vector` cases, `PGRUST_PROFILE=release`, `target/release/postgres` at `435eff290b`, `version()` = `pgrust 0.4-beta, build 435eff2`; 3 builds a side, medians in ms; all 14 rows `ok`):
+
+| case | C (ms) | pgrust 2026-11-08 (ms) | pgrust now (ms) | now ÷ C | now ÷ own vector |
+|---|---|---|---|---|---|
+| hnsw_halfvec_serial | 9251.6 | 39929.0 | 19909.2 | 2.15 | 1.02 |
+| hnsw_halfvec_parallel | 3447.2 | 13202.6 | 6333.2 | 1.84 | — |
+| ivfflat_halfvec_serial | 789.1 | 8583.0 | 2785.5 | 3.53 | 1.51 |
+| ivfflat_halfvec_parallel | 649.4 | 4984.2 | 1867.4 | 2.88 | — |
+| hnsw_vector_serial | 11302.8 | 17005.3 | 19555.6 | 1.73 | |
+| ivfflat_vector_serial | 804.7 | 1764.7 | 1842.6 | 2.29 | |
+
+- **Against 2026-11-08:** the `halfvec` builds are 2.01× (HNSW serial), 2.08× (HNSW parallel), 3.08× (IVFFlat serial) and 2.67× (IVFFlat parallel) faster. The C side matches within 3%, apart from `ivfflat_halfvec_parallel` (649.4 against 618.1 ms, +5%) and `hnsw_vector_serial` (11302.8 against 10268.4, +10%).
+- **The last column** divides each serial `halfvec` row by the same run's serial `vector` row of the same AM. The parallel rows have no figure: they would need the recall tier's `vector` parallel rows from 2026-11-08, and table C has none. (`hnsw_vector_parallel` in table A is a different workload.)
+- **`hnsw_vector_serial` was slower on both sides in all three of these runs** (pgrust medians 20509.5, 22485.9, 19555.6; C 10910.5, 11358.0, 11302.8), with no `vector` code changed since `fe9b4a73cc` (the branch touches `halfutils.rs`, the parity crate and docs). In the run above C took +10% and pgrust +15%, and the pgrust/C ratio is 1.73 against 1.66. Against the 2026-11-08 `vector` build (17005.3), the serial HNSW `halfvec` row would be 1.17× rather than 1.02×. Either way, a `halfvec` HNSW build now costs pgrust about what its `vector` build does, where it was 2.35×. On C it is 0.82×.
+- **IVFFlat's `halfvec` build is still 1.51× its own `vector` build** (C: 0.98×), and that gap is not profiled. The spike's NEON kernel is still 1.62× the f32 kernel (34 against 21 ns), which is about the size of the gap, but nothing here shows that this is the cause. Per-element conversions also remain outside the kernels (`fc_halfvec_l2_normalize`, `crates/contrib/pgvector/src/halfvec.rs:536-560`; `halfvec_sum_center`, `crates/contrib/pgvector_ivfflat/src/utils.rs:549-558`), with 41 and 39 samples in the old IVFFlat profile.
+- **Machine.** The machine was AC-powered, Time Machine not running, no sleep events, under `caffeinate -ims` (the 2026-11-08 `timed.sh`). This was the third run of the night. Runs 1 and 2 started at a 1-minute load of 4.8 and 4.6 while other sessions ran test suites; run 2's pgrust `hnsw_vector_serial` builds spread from 18.9 to 23.1 s. Run 3, the one above, started after three 30-second readings below 4 (load 2.7 at its start, 4.8 at its end; 2026-11-08's run went from 4.1 to 4.8). Run 1 agrees with it to within 3% on every `halfvec` row, and so does run 2 on the IVFFlat rows; run 2's HNSW `halfvec` rows were 15% (parallel) and 20% (serial) slower. pgrust `hnsw_halfvec_serial` medians, runs 1 to 3: 19412.7, 23811.5 and 19909.2.
+
+**Proofs that nothing changed but the speed:**
+- **Exhaustive unit tests** (`cargo test -p pgvector --release`, 53 ok). Every one of the 65,536 halves goes through the portable routine and through `halves_to_floats` at every position of a 37-wide block, bit for bit against `half_to_float4`, so on AArch64 each half crosses NEON lanes 0 to 31 and the portable tail 32 to 36 (`block_conversion_matches_per_element_for_every_half`, `halfutils.rs:296-318`). The kernels match the per-element form bit for bit on 2,000 random vectors of dim 1 to 100 and at `HALFVEC_MAX_DIM`.
+- **The C parity crate** (`pgvector_f16_parity`, 3 ok). Every half, per element and through the block conversion, gives the same bits as C's software path and its `_Float16` path.
+- **Pages identical to C's seeded build:** `run-bytecmp.sh pgrust halfvec_l2_grid halfvec_cosine_grid ivf_halfvec_groups` reports 3/3 identical on the HNSW and IVFFlat pages, so no distance a build compared changed.
+- **Recall,** in the run above (C / pgrust):
+  - HNSW serial @10 0.9791 / 0.9793 and @100 0.9241 / 0.9250;
+  - HNSW parallel 0.9792 / 0.9801 and 0.9246 / 0.9253;
+  - IVFFlat serial 0.9373 / 0.9348 and 0.8862 / 0.8848;
+  - IVFFlat parallel 0.9367 / 0.9377 and 0.8860 / 0.8832;
+  - `exact_halfvec` and `exact_vector` ok, at most 3.0e-07 and 3.9e-07 from C.
+- **Regress:** `run-regress.sh pgrust halfvec hnsw_halfvec ivfflat_halfvec cast btree copy` prints `# All 6 tests passed.`, 6/6.
+- **Lints:** `lint_alloc` is ok. Clippy reports nothing in `halfutils.rs` or `pgvector_f16_parity`; the crate's 8 earlier `-D warnings` errors (`manual_clamp`, `mut_range_bound` in `funcs.rs`, `halfvec.rs`, `sparsevec.rs`) are unchanged.
+
+**Limits.**
+- One machine (M5 Max), and only AArch64 was timed. The portable route is unit-tested here, timed only in the spike (82 ns), and runs in these builds only on the 4-half tail of each dim-100 vector. x86-64, where the portable route is the whole conversion, was neither run nor timed, and F16C is not used.
+- Single-statement builds with the data in cache, as in table C.
+
+**Evidence:** `~/.cache/pgrust/speed-2026-11-08/halfvec-fix/`:
+- `unit.log` with the full test, clippy and `lint_alloc` logs;
+- the build logs;
+- `bytecmp.log`, `bytecmp-summary.tsv`;
+- `regress.log`, `regress-pg_regress.log`;
+- `recall.tsv`, `summary.tsv`, `report.md` (run 3) and `run1/`, `run2/`, `run3/` (each with the tier's files, the `timed.sh` log and the top processes before and after);
+- `medians.txt` (from `medians.sh` over each run's `recall.tsv` and 2026-11-08's);
+- `machine.txt`, `version.txt`.
