@@ -5,7 +5,7 @@
 
 #[cfg(all(test, pgv_c_half))]
 mod tests {
-    use pgvector::halfutils::{float4_to_half_unchecked, half_is_nan, half_to_float4, Half};
+    use pgvector::halfutils::{float4_to_half_unchecked, half_is_nan, half_to_float4, halves_to_floats, Half};
 
     extern "C" {
         fn pgv_sw_half_to_float4(h: u16) -> u32;
@@ -48,6 +48,20 @@ mod tests {
             if hw {
                 // SAFETY: as above.
                 assert_eq!(ours, unsafe { pgv_hw_half_to_float4(h) }, "_Float16, half {h:#06x}");
+            }
+            // The block conversion at a position of a 9-wide block, so on
+            // AArch64 the NEON lanes and the tail both meet C.
+            let pos = h as usize % 9;
+            let mut src = [0u8; 18];
+            src[2 * pos..2 * pos + 2].copy_from_slice(&h.to_ne_bytes());
+            let mut dst = [0f32; 9];
+            halves_to_floats(&src, &mut dst);
+            let blk = dst[pos].to_bits();
+            // SAFETY: as above.
+            assert_eq!(blk, unsafe { pgv_sw_half_to_float4(h) }, "block, software path, half {h:#06x}");
+            if hw {
+                // SAFETY: as above.
+                assert_eq!(blk, unsafe { pgv_hw_half_to_float4(h) }, "block, _Float16, half {h:#06x}");
             }
         }
     }

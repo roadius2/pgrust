@@ -5,7 +5,11 @@
 //! F16C_SUPPORT nor FLT16_SUPPORT is defined (halfutils.h:62-239). IEEE
 //! defines f32<->f16 round-to-nearest-even exactly, so they give the same
 //! bits as the F16C and _Float16 paths; crate pgvector_f16_parity checks
-//! every input. The kernels port the `*Default` loops (halfutils.c:29-207).
+//! every input. `half_to_float4` stays the per-element software port; the
+//! kernels convert in blocks through `halves_to_floats` (NEON `fcvtl` on
+//! little-endian AArch64, a vectorizable branch-free routine elsewhere), and
+//! every route is bit-identical (the exhaustive test here, and the parity
+//! crate against C). The kernels port the `*Default` loops (halfutils.c:29-207).
 //! Upstream compiles with -fassociative-math -ffp-contract=fast (Makefile:38)
 //! on every target, so the C extension's summation order and fusion are
 //! compiler-chosen, not only under the x86 F16C dispatch. These loops keep C
@@ -70,6 +74,73 @@ pub fn half_to_float4(num: Half) -> f32 {
     }
     result |= mantissa << 13;
     f32::from_bits(result)
+}
+
+/// Halves the distance kernels convert per step: two blocks of this many `f32`
+/// live on the kernels' stack.
+pub const BLOCK: usize = 32;
+
+// The behaviour of HalfToFloat4 (halfutils.h:62-141) without a branch the
+// compiler cannot turn into a select, so a loop over it vectorizes.
+#[inline(always)]
+pub fn half_to_float4_portable(num: Half) -> f32 {
+    let h = num as u32;
+    let sign = (h & 0x8000) << 16;
+    let e = h & 0x7C00;
+    let m = h & 0x03FF;
+    // Normal: the fields shifted up 13 and the exponent rebiased by 127 - 15, exact.
+    let normal = ((h & 0x7FFF) << 13) + (112u32 << 23);
+    // Subnormal or zero: (2^-14 * (1 + m/1024)) - 2^-14 = m * 2^-24, exact (Sterbenz).
+    let sub = (f32::from_bits(0x3880_0000 | (m << 13)) - f32::from_bits(0x3880_0000)).to_bits();
+    // Infinity or NaN: exponent 255, payload shifted, NaN quieted as the software path does.
+    let quiet = if m != 0 { 0x0040_0000 } else { 0 };
+    let infnan = 0x7F80_0000 | (m << 13) | quiet;
+    let r = if e == 0 {
+        sub
+    } else if e == 0x7C00 {
+        infnan
+    } else {
+        normal
+    };
+    f32::from_bits(sign | r)
+}
+
+// `half_to_float4_portable` over `dst.len()` halves of `src`.
+#[inline]
+fn portable_block(src: &[u8], dst: &mut [f32]) {
+    for (d, h) in dst.iter_mut().zip(src.chunks_exact(2)) {
+        *d = half_to_float4_portable(Half::from_ne_bytes([h[0], h[1]]));
+    }
+}
+
+/// `dst[i] = half_to_float4(Half::from_ne_bytes([src[2*i], src[2*i+1]]))` for
+/// every `i < dst.len()`. Reads only `src[..2 * dst.len()]`, which it slices
+/// once (panics if `src` is shorter). `src` may start at any byte. Widening
+/// f16 to f32 is exact, so every route gives `half_to_float4`'s bits.
+#[inline]
+pub fn halves_to_floats(src: &[u8], dst: &mut [f32]) {
+    let src = &src[..2 * dst.len()];
+    #[cfg(all(target_arch = "aarch64", target_endian = "little", target_feature = "neon"))]
+    {
+        use std::arch::aarch64::*;
+        let mut s = src.chunks_exact(16);
+        let mut d = dst.chunks_exact_mut(8);
+        for (sc, dc) in (&mut s).zip(&mut d) {
+            // SAFETY: `sc` is 16 readable bytes and `dc` eight writable f32s;
+            // vld1q_u8 takes a byte-aligned pointer and vst1q_f32 an
+            // f32-aligned one, which `&mut [f32]` gives.
+            unsafe {
+                let h = vreinterpretq_u16_u8(vld1q_u8(sc.as_ptr()));
+                let lo = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(h)));
+                let hi = vcvt_high_f32_f16(vreinterpretq_f16_u16(h));
+                vst1q_f32(dc.as_mut_ptr(), lo);
+                vst1q_f32(dc.as_mut_ptr().add(4), hi);
+            }
+        }
+        portable_block(s.remainder(), d.into_remainder());
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little", target_feature = "neon")))]
+    portable_block(src, dst);
 }
 
 // Float4ToHalfUnchecked (halfutils.h:146-239), software path.
@@ -207,6 +278,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    // Every half through both lane routes: the portable routine on its own, and
+    // the block conversion at every position of a 37-wide block, so on AArch64
+    // each half crosses the NEON lanes 0..31 and the portable tail 32..36.
+    #[test]
+    fn block_conversion_matches_per_element_for_every_half() {
+        const W: usize = 37;
+        let mut src = [0u8; 2 * W];
+        let mut dst = [1.5f32; W];
+        for h in 0..=u16::MAX {
+            let want = half_to_float4(h).to_bits();
+            assert_eq!(half_to_float4_portable(h).to_bits(), want, "portable, half {h:#06x}");
+            for pos in 0..W {
+                src.fill(0);
+                src[2 * pos..2 * pos + 2].copy_from_slice(&h.to_ne_bytes());
+                halves_to_floats(&src, &mut dst);
+                assert_eq!(dst[pos].to_bits(), want, "block, half {h:#06x} at {pos}");
+                assert!(
+                    dst.iter().enumerate().all(|(i, f)| i == pos || f.to_bits() == 0),
+                    "zeros elsewhere, half {h:#06x} at {pos}"
+                );
+            }
+        }
+    }
+
+    // The source may start at any byte: the same 100 halves converted from an
+    // even and from an odd offset of one buffer.
+    #[test]
+    fn block_conversion_is_alignment_free() {
+        let mut r = XorShift(0x2545_F491_4F6C_DD1D);
+        let halves: Vec<Half> = (0..100).map(|_| r.half()).collect();
+        let bytes: Vec<u8> = halves.iter().flat_map(|h| h.to_ne_bytes()).collect();
+        let mut shifted = vec![0u8; 1];
+        shifted.extend_from_slice(&bytes);
+        let (mut even, mut odd) = (vec![0f32; 100], vec![0f32; 100]);
+        halves_to_floats(&bytes, &mut even);
+        halves_to_floats(&shifted[1..], &mut odd);
+        for i in 0..100 {
+            assert_eq!(even[i].to_bits(), half_to_float4(halves[i]).to_bits());
+            assert_eq!(odd[i].to_bits(), even[i].to_bits());
+        }
+    }
+
+    // Nothing to convert, and a source exactly as long as the destination needs.
+    #[test]
+    fn block_conversion_of_nothing() {
+        let mut none: [f32; 0] = [];
+        halves_to_floats(&[], &mut none);
+        halves_to_floats(&[1, 2, 3, 4], &mut none);
+        let mut two = [9.0f32; 2];
+        let mut bytes = [0u8; 4];
+        bytes[..2].copy_from_slice(&0x3C00u16.to_ne_bytes());
+        bytes[2..].copy_from_slice(&0x4000u16.to_ne_bytes());
+        halves_to_floats(&bytes, &mut two);
+        assert_eq!(two, [1.0, 2.0]);
     }
 
     // The slice-once kernels against the per-element form they replace, bit
