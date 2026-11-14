@@ -23,6 +23,17 @@ script there as a file: `ssh -n borg2 bash ~/bench/scripts/borg.sh ...`.
 `incus launch` and `incus exec` read stdin when it is not a terminal, so every
 incus call in these scripts takes `</dev/null` and none is piped over `ssh bash -s`.
 
+Phase 1 (`run-phase1.sh CONTESTANT RUN_ID [--subset N] [--skip-soak]`) runs
+for hours, so the full runs go under one transient host unit, pg-c then pgrust,
+never overlapping:
+
+    sudo -n systemd-run --unit=bench-p1-RUN_ID --collect --uid=jody --gid=jody \
+      -p WorkingDirectory=/home/jody/bench --setenv=HOME=/home/jody /bin/bash -c \
+      'bash ~/bench/scripts/run-phase1.sh pg-c RUN_ID; bash ~/bench/scripts/run-phase1.sh pgrust RUN_ID'
+
+Each run logs to `results/RUN_ID/CONTESTANT.log`. `report.py RESULTS_DIR` prints
+the markdown tables; `tests/test_report.sh` checks its headline rule.
+
 On borg2: datasets in `/home/jody/bench/data` (read-only at `/data` in the
 client), results in `/home/jody/bench/results/<run-id>/`, pulled to
 `~/.cache/pgrust/bench-borg/<run-id>/` on the Mac.

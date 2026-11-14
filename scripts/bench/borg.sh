@@ -70,9 +70,22 @@ cmd_start() {
   cmd_wait_net "$1"
 }
 
+# The database server is stopped first, from inside, and checked gone: the
+# containers' rsyslogd AppArmor profile refuses systemd's TERM and KILL, so a
+# plain incus stop can hang in the shutdown and time out. With no postgres
+# process left, a stop that does not finish in 120 s is forced.
 cmd_stop() {
   need_ours "$1"
-  [ "$(status_of "$1")" = STOPPED ] || incus stop "$1" </dev/null
+  [ "$(status_of "$1")" != STOPPED ] || return 0
+  # shellcheck disable=SC2016 # expanded inside the container
+  XB "$1" 'for u in pgrust.service postgresql@18-main.service; do
+      if systemctl is-active --quiet "$u"; then systemctl stop "$u"; fi
+    done
+    ! pgrep -x postgres >/dev/null' || die "$1: a postgres process survived the service stop"
+  if ! incus stop --timeout 120 "$1" </dev/null; then
+    echo "$1: no clean shutdown in 120 s (database already stopped); forcing"
+    incus stop --force "$1" </dev/null
+  fi
 }
 
 cmd_stop_others() {
@@ -82,7 +95,7 @@ cmd_stop_others() {
     case "$name" in pgrust-db-*) ;; *) continue ;; esac
     if [ "$name" != "$keep" ] && [ "$status" = RUNNING ]; then
       echo "stopping $name"
-      incus stop "$name" </dev/null
+      cmd_stop "$name"
     fi
   done
 }

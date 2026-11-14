@@ -12,4 +12,9 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # the v flag lists what shipped on stderr.
 COPYFILE_DISABLE=1 tar czvf - --no-xattrs -C "$here" . |
   ssh borg2 'rm -rf ~/bench/scripts && mkdir -p ~/bench/scripts && tar xzf - -C ~/bench/scripts'
-echo "shipped $here to borg2:~/bench/scripts/"
+# REVISION names the commit shipped (and "dirty" if scripts/bench differs from
+# it); run-phase1.sh copies it into each run's facts.
+rev="$(git -C "$here" rev-parse HEAD)"
+[ -z "$(git -C "$here" status --porcelain -- .)" ] || rev="$rev dirty"
+ssh -n borg2 "echo '$rev' >~/bench/scripts/REVISION"
+echo "shipped $here to borg2:~/bench/scripts/ ($rev)"
