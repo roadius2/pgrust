@@ -133,14 +133,18 @@ admin() {
   esac
 }
 
-# The measurement bracket. measure_begin opens a memory.peak window and notes
-# the CPU time; measure_end sets M_PEAK, M_CPU (the step's usec), M_WALL.
+# The measurement bracket. measure_begin LABEL opens a memory.peak window,
+# notes the CPU time and logs the memory the container holds at the reset
+# (base_bytes: the floor of the step's peak; the TSV has no column for it);
+# measure_end sets M_PEAK, M_CPU (the step's usec), M_WALL.
 measure_begin() {
-  local m
+  local m base
   M_START="$(now)"
   metrics_reset "$DB"
   m="$(metrics_read "$DB")" || die "metrics_read $DB failed"
   M_CPU0="${m##*cpu_usec=}"
+  base="${m#*current=}"
+  say "measure: step=$DS/$TY/$IX/$1 base_bytes=${base%% *}"
   M_T0="$(date +%s.%N)"
 }
 
@@ -153,9 +157,10 @@ measure_end() {
   M_CPU=$(( ${m##*cpu_usec=} - M_CPU0 ))
 }
 
-# measure CMD...: run CMD inside the bracket; M_RC is its exit status.
+# measure LABEL CMD...: run CMD inside the bracket; M_RC is its exit status.
 measure() {
-  measure_begin
+  measure_begin "$1"
+  shift
   M_RC=0
   "$@" || M_RC=$?
   measure_end
@@ -226,9 +231,9 @@ fresh_db() {
     [ "$n" = 0 ] && break
     sleep 1
   done
-  admin -c "DROP DATABASE IF EXISTS bench"
-  admin -c "CREATE DATABASE bench OWNER bench"
-  admin -d bench -c "CREATE EXTENSION vector"
+  admin -c "DROP DATABASE IF EXISTS bench" &&
+    admin -c "CREATE DATABASE bench OWNER bench" &&
+    admin -d bench -c "CREATE EXTENSION vector"
 }
 
 # --- client steps (run inside the measurement bracket) -----------------------------
@@ -256,7 +261,7 @@ pgbench_point() {
   shift 7
   log="$P-pgbench-$tag.log"
   say "pgbench $tag: $*${opts:+ (PGOPTIONS=$opts)}"
-  measure client_pgbench "$log" "$opts" "$txlog" "$@"
+  measure "$meas-$setting-c$clients" client_pgbench "$log" "$opts" "$txlog" "$@"
   if [ "$M_RC" != 0 ] || grep -qE 'aborted|error' "$log"; then
     grep -E 'aborted|error' "$log" | head -5 || true # context for the run log only
     emit_error "$meas" "$setting" "$clients" 1 "$M_RC"
@@ -284,7 +289,7 @@ recall_point() {
   local meas="$1" setting="$2" rep="$3" qps recall p50 p95 p99
   shift 3
   say "recall.py $*"
-  measure to "$TMP" X "$CLIENT" /opt/bench/recall.py "$DSN" "$@"
+  measure "$meas-$setting-c1-rep$rep" to "$TMP" X "$CLIENT" /opt/bench/recall.py "$DSN" "$@"
   if [ "$M_RC" != 0 ]; then
     emit_error "$meas" "$setting" 1 "$rep" "$M_RC"
     return 0
@@ -297,22 +302,33 @@ recall_point() {
 # --- steps -----------------------------------------------------------------------
 
 # step_load REP: a fresh database and one timed load.py of $DS. Returns 1 if
-# the load failed (its row is load_error).
+# the load failed (its row is load_error). It runs under "if !", where errexit
+# is off, so every status is checked here.
 step_load() {
-  local rep="$1" value
+  local rep="$1" value rc=0
   local args=("$DSN" "/data/$DS.hdf5" --dim "$DIM" --metric "$METRIC")
   [ "$HALFVEC" = 1 ] && args+=(--halfvec)
   [ -n "$SUBSET" ] && args+=(--subset "$SUBSET")
   TY=vector IX=none
-  fresh_db
+  fresh_db || rc=$?
+  if [ "$rc" != 0 ]; then
+    say "fresh_db failed (exit $rc)"
+    unmeasured
+    emit_error load "" "" "$rep" "$rc"
+    return 1
+  fi
   settle
   say "load $DS rep $rep"
-  measure to "$TMP" X "$CLIENT" /opt/bench/load.py "${args[@]}"
+  measure "load-rep$rep" to "$TMP" X "$CLIENT" /opt/bench/load.py "${args[@]}"
   if [ "$M_RC" != 0 ]; then
     emit_error load "" "" "$rep" "$M_RC"
     return 1
   fi
-  value="$(jq -r .rows_per_s "$TMP")"
+  value="$(jq -r .rows_per_s "$TMP")" || value=""
+  if [ -z "$value" ]; then
+    emit_error load "" "" "$rep" "$M_RC"
+    return 1
+  fi
   emit load "" "" "$rep" "$value" rows/s
   say "  load rep $rep: $value rows/s ($(jq -r .rows "$TMP") rows)"
 }
@@ -333,11 +349,11 @@ step_exact() {
 # ${TABLE}_v_idx and its rows. Returns 1 if it failed.
 build_once() {
   local tbl="$1" am="$2" opclass="$3" with="$4" setting="$5" workers="$6" rep="$7"
-  local idx="${1}_v_idx" log ms size
+  local idx="${1}_v_idx" log ms size rc
   log="$P-build-$DS-$TY-$am-$setting-$rep.log"
   settle
   say "build $idx ($am, $setting) rep $rep"
-  measure to_all "$log" X "$CLIENT" psql "$DSN" -X -v ON_ERROR_STOP=1 \
+  measure "build-$setting-rep$rep" to_all "$log" X "$CLIENT" psql "$DSN" -X -v ON_ERROR_STOP=1 \
     -c "SET client_min_messages = debug1" \
     -c "SET max_parallel_maintenance_workers = $workers" \
     -c "SET maintenance_work_mem = '8GB'" \
@@ -351,15 +367,21 @@ build_once() {
   fi
   emit build "$setting" "" "$rep" "$ms" ms
   unmeasured
-  size="$(csql -c "SELECT pg_relation_size('$idx')")"
-  emit index_size "$setting" "" "$rep" "$size" bytes
+  rc=0
+  size="$(csql -c "SELECT pg_relation_size('$idx')")" || rc=$?
+  if [ "$rc" != 0 ] || [ -z "$size" ]; then
+    emit_error index_size "$setting" "" "$rep" "$rc"
+  else
+    emit index_size "$setting" "" "$rep" "$size" bytes
+  fi
   say "  build $setting rep $rep: $ms ms, $size bytes"
 }
 
 # step_builds TABLE AM OPCLASS WITH: BUILD_REPS serial then BUILD_REPS with 4
 # workers, dropping each index but the last. Returns 1 if the last one failed.
+# It runs under "if !" (errexit off), so the DROP's status is checked here.
 step_builds() {
-  local tbl="$1" am="$2" opclass="$3" with="$4" setting workers rep last=0
+  local tbl="$1" am="$2" opclass="$3" with="$4" setting workers rep rc last=0
   IX="$am"
   for setting in serial parallel4; do
     workers=0
@@ -368,7 +390,12 @@ step_builds() {
       last=0
       build_once "$tbl" "$am" "$opclass" "$with" "$setting" "$workers" "$rep" || last=1
       if [ "$setting" != parallel4 ] || [ "$rep" != "$BUILD_REPS" ]; then
-        csql -c "DROP INDEX IF EXISTS ${tbl}_v_idx"
+        rc=0
+        csql -c "DROP INDEX IF EXISTS ${tbl}_v_idx" || rc=$?
+        if [ "$rc" != 0 ]; then
+          unmeasured
+          emit_error drop_index "$setting" "" "$rep" "$rc"
+        fi
       fi
     done
   done
@@ -446,14 +473,14 @@ run_hnsw() {
   step_inserts "$tbl"
 }
 
-# run_ivfflat: IVFFlat on items, lists = rows / 1000 (1183 on glove, 1000 on
-# sift, 100 on a 100,000-row subset).
+# run_ivfflat: IVFFlat on items, lists = floor(rows / 1000) (1183 on glove,
+# 1000 on sift, 100 on a 100,000-row subset).
 run_ivfflat() {
   local rows lists
   say "== $DS $TY ivfflat"
   csql -c "DROP INDEX IF EXISTS items_v_idx"
   rows="$(csql -c "SELECT count(*) FROM items")"
-  lists=$(( (rows + 500) / 1000 ))
+  lists=$(( rows / 1000 ))
   [ "$lists" -ge 1 ] || lists=1
   say "ivfflat lists = $lists ($rows rows)"
   if ! step_builds items ivfflat "$OPCLASS" "lists = $lists"; then
@@ -546,8 +573,7 @@ step_soak() {
   say "=== soak"
   args=("$DSN" "/data/$DS.hdf5" --dim "$DIM" --metric "$METRIC")
   [ -n "$SUBSET" ] && args+=(--subset "$SUBSET")
-  fresh_db
-  if ! X "$CLIENT" /opt/bench/load.py "${args[@]}"; then
+  if ! fresh_db || ! X "$CLIENT" /opt/bench/load.py "${args[@]}"; then
     unmeasured
     emit_error soak "" 8 1 load
     return 0
@@ -565,7 +591,7 @@ step_soak() {
   cg="$(cgroup_dir "$DB")"
   rss="$P-soak-rss.tsv"
   printf 'time\tmemory_current_bytes\n' >"$rss"
-  measure_begin
+  measure_begin soak
   if ! soak_start; then
     measure_end
     emit_error soak "" 8 1 start
@@ -582,7 +608,7 @@ step_soak() {
     fi
     if [ $((SECONDS - start)) -gt $((SOAK_T + 900)) ]; then
       say "soak: pgbench still running $((SOAK_T + 900)) s after its start; stopping it"
-      X "$CLIENT" systemctl stop "$SOAK_UNIT"
+      X "$CLIENT" systemctl stop "$SOAK_UNIT" || say "soak: systemctl stop $SOAK_UNIT failed"
       timed_out=1
       break
     fi
@@ -590,7 +616,9 @@ step_soak() {
   done
   [ "${#vac[@]}" -eq 0 ] || wait "${vac[@]}"
   measure_end
-  X "$CLIENT" cat "$SOAK_DIR/pgbench.out" >"$P-soak.log"
+  # From here on a failure only loses evidence: facts and the final stop
+  # must still run.
+  X "$CLIENT" cat "$SOAK_DIR/pgbench.out" >"$P-soak.log" || say "soak: no pgbench.out from the client"
   rc="$(X "$CLIENT" cat "$SOAK_DIR/rc" 2>/dev/null)" || rc=timeout
   [ "$timed_out" = 0 ] || rc=timeout
   tail -n 25 "$P-soak.log"
@@ -616,7 +644,8 @@ step_soak() {
   if [ "$st" != 0 ]; then
     emit_error soak_aborted "" 8 1 "$st"
   fi
-  X "$CLIENT" tar czf - -C "$SOAK_DIR" . >"$P-soak-txlogs.tar.gz"
+  X "$CLIENT" tar czf - -C "$SOAK_DIR" . >"$P-soak-txlogs.tar.gz" ||
+    say "soak: archiving the transaction logs failed"
 }
 
 # --- main ------------------------------------------------------------------------

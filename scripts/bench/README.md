@@ -14,8 +14,11 @@ upgrade timers disabled), made by `borg.sh create-db NAME` and `create-client`:
 | `pgrust-client`  | 6,7,14,15               | 4 GiB  | load, recall, pgbench; `/data` |
 
 Only one database container runs during a measurement (`borg.sh stop-others`).
-`settle` (in `lib.sh`) waits before each timed step for the host's 1-minute load
-to read below 1.0 three times 10 s apart, but at most 600 s; then it proceeds.
+`settle` (in `lib.sh`) waits for the host's 1-minute load to read below 1.0
+three times 10 s apart, but at most 600 s; then it proceeds. `run-phase1.sh`
+calls it before each load, each index build, the first point of each sweep,
+each insert step, the plain-SQL step and the soak (not between consecutive
+pgbench points).
 
 Edit here, never on the host: `scripts/bench/sync.sh` replaces `~/bench/scripts/`
 on borg2 with this directory (a tar pipe; the host has no rsync). Then run a

@@ -9,7 +9,8 @@ stem names the contestant: pg-c, pgrust) and prints:
   (a) a headline table per dataset and vector type: HNSW serial and parallel
       build medians, QPS at recall >= 0.95 and >= 0.99 at 8 and 16 clients
       (HNSW and IVFFlat), exact-scan QPS, insert rows/s at 8 clients, and the
-      peak memory and CPU-seconds of the serial HNSW build;
+      container peak, the approximate build increment and the CPU-seconds of
+      the serial HNSW build;
   (b) one table per measurement with every point;
   (c) the soak windows, the soak's failed transactions and its memory over
       the hour (CONTESTANT-soak-rss.tsv).
@@ -20,6 +21,13 @@ setting's 8- (or 16-) client QPS, with the setting named. No interpolation; a
 sweep that never reaches R prints "not reached". Ratios are the second
 contestant's value divided by the first's (pgrust / pg-c), as x.xx×.
 Medians are of the repetitions in the TSV. Standard library only.
+
+Memory: peak_bytes is the container's cgroup high-water mark during the step
+(anonymous memory and touched shared buffers; the file cache is outside the
+cgroup), so its floor is what the container held before the step. The "build
+increment (approx.)" is a row's peak_bytes minus the peak_bytes of the row
+before it in the same TSV: that earlier peak is an upper bound on the memory
+held at this step's reset, so the increment is a lower bound.
 """
 
 import csv
@@ -59,8 +67,14 @@ def load(directory):
             if header != HEADER:
                 print(f"warning: {path}: not a run-phase1.sh TSV, skipped", file=sys.stderr)
                 continue
-            runs[name[:-4]] = [dict(zip(HEADER, r + [""] * (len(HEADER) - len(r))))
-                               for r in reader if r]
+            rows = [dict(zip(HEADER, r + [""] * (len(HEADER) - len(r)))) for r in reader if r]
+        prev = None  # the last peak_bytes seen in this file
+        for r in rows:
+            peak = num(r["peak_bytes"])
+            r["increment_bytes"] = "" if peak is None or prev is None else str(peak - prev)
+            if peak is not None:
+                prev = peak
+        runs[name[:-4]] = rows
     if not runs:
         die(f"no run-phase1.sh TSV in {directory}")
     return runs
@@ -92,6 +106,10 @@ def ratio(a, b):
 
 def gib(b):
     return None if b is None else b / 2**30
+
+
+def fmt_gib(v):
+    return "–" if v is None else f"{v:.2f}"
 
 
 def table(head, rows):
@@ -142,11 +160,11 @@ def headline(runs, cs):
     for ds, ty in groups:
         lines = []
 
-        def simple(label, value_of):
+        def simple(label, value_of, f=fmt):
             vals = [value_of(runs[c]) for c in cs]
             if all(v is None for v in vals):
                 return
-            lines.append([label] + [fmt(v) for v in vals] + ([ratio(vals[0], vals[1])] if two else []))
+            lines.append([label] + [f(v) for v in vals] + ([ratio(vals[0], vals[1])] if two else []))
 
         def build(setting, field="value", scale=lambda v: v):
             def f(rows):
@@ -184,10 +202,17 @@ def headline(runs, cs):
         simple("HNSW inserts, rows/s, 8 clients",
                lambda rows: median(select(rows, dataset=ds, type=ty, index="hnsw",
                                           measurement="insert", clients="8")))
-        simple("Peak memory of the serial HNSW build, median GiB", build("serial", "peak_bytes", gib))
+        simple("Container peak, serial HNSW build (median), GiB¹", build("serial", "peak_bytes", gib), fmt_gib)
+        simple("Build increment (approx.), serial HNSW build (median), GiB¹",
+               build("serial", "increment_bytes", gib), fmt_gib)
         simple("CPU-seconds of the serial HNSW build, median", build("serial", "cpu_usec", lambda v: v / 1e6))
         if lines:
             out += [f"### {ds} / {ty}", "", table(head, lines), ""]
+    out += ["¹ Container peak: the database container's cgroup high-water mark during the "
+            "step (anonymous memory and touched shared buffers; the file cache lives outside "
+            "the cgroup), whose floor is the memory resident before the step. Build increment "
+            "(approx.): that peak minus the preceding TSV row's peak, an upper bound on the "
+            "baseline and so a lower bound on what the build added.", ""]
     return out
 
 
@@ -203,15 +228,17 @@ def flags(runs, cs):
     return (["## Errors and flags", ""] + lines + [""]) if lines else []
 
 
-# (field, column label, scale, formatter) shown per contestant when present
+# (field, column label, scale, formatter, measurements or None for all) shown
+# per contestant when present
 EXTRA = [
-    ("recall", "recall", lambda v: v, lambda v: "–" if v is None else f"{v:.4f}"),
-    ("p50_ms", "p50 ms", lambda v: v, fmt),
-    ("p95_ms", "p95 ms", lambda v: v, fmt),
-    ("p99_ms", "p99 ms", lambda v: v, fmt),
-    ("peak_bytes", "peak GiB", gib, lambda v: "–" if v is None else f"{v:.2f}"),
-    ("cpu_usec", "CPU s", lambda v: v / 1e6, fmt),
-    ("wall_s", "wall s", lambda v: v, fmt),
+    ("recall", "recall", lambda v: v, lambda v: "–" if v is None else f"{v:.4f}", None),
+    ("p50_ms", "p50 ms", lambda v: v, fmt, None),
+    ("p95_ms", "p95 ms", lambda v: v, fmt, None),
+    ("p99_ms", "p99 ms", lambda v: v, fmt, None),
+    ("peak_bytes", "container peak GiB", gib, fmt_gib, None),
+    ("increment_bytes", "increment GiB (approx.)", gib, fmt_gib, {"build"}),
+    ("cpu_usec", "CPU s", lambda v: v / 1e6, fmt, None),
+    ("wall_s", "wall s", lambda v: v, fmt, None),
 ]
 KEY = ("dataset", "type", "index", "setting", "clients", "rep")
 
@@ -236,10 +263,10 @@ def measurements(runs, cs):
         units = {r["unit"] for k in keys for r in by[k].values()}
         to_mib = units == {"bytes"}
         unit = "MiB" if to_mib else ", ".join(sorted(units))
-        extra = [e for e in EXTRA
-                 if any(num(r[e[0]]) is not None for k in keys for r in by[k].values())]
+        extra = [e for e in EXTRA if (e[4] is None or m in e[4])
+                 and any(num(r[e[0]]) is not None for k in keys for r in by[k].values())]
         head = list(KEY) + [f"{c} {unit}" for c in cs] + ([f"{cs[1]} ÷ {cs[0]}"] if two else [])
-        for _, label, _, _ in extra:
+        for _, label, _, _, _ in extra:
             head += [f"{c} {label}" for c in cs]
         lines = []
         for k in keys:
@@ -247,7 +274,7 @@ def measurements(runs, cs):
             if to_mib:
                 vals = [None if v is None else v / 2**20 for v in vals]
             line = list(k) + [fmt(v) for v in vals] + ([ratio(vals[0], vals[1])] if two else [])
-            for field, _, scale, f in extra:
+            for field, _, scale, f, _ in extra:
                 for c in cs:
                     v = num(by[k][c][field]) if c in by[k] else None
                     line.append(f(None if v is None else scale(v)))
