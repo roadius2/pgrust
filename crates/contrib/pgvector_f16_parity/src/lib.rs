@@ -38,6 +38,23 @@ mod tests {
         })
     }
 
+    // The `_Float16` path's result for a NaN half is the compiler's conversion
+    // (`(float) num`, halfutils.h:67-68), which C pgvector takes only where
+    // halfvec.h:48 defines FLT16_SUPPORT — e.g. AArch64, whose fcvt quiets a
+    // signalling NaN. x86-64 builds define HALFVEC_DISPATCH instead and convert
+    // with the software path (portable builds, `OPTFLAGS=""`) or `_cvtsh_ss`
+    // (F16C; `-march=native`, the Makefile's default), both of which quiet,
+    // while gcc's soft-float `_Float16` conversion there (libgcc's
+    // __extendhfsf2, no -mf16c) leaves the NaN signalling: 0x7c01 gives
+    // 0x7f802000 from the shim and 0x7fc02000 from the port, which quiets as
+    // the software path does. NaN halves never reach a kernel (CheckElement
+    // rejects them on input), so a NaN half's `_Float16` result may lack only
+    // the quiet bit.
+    fn same_f32_modulo_quiet_nan(h: Half, ours: u32, c: u32) -> bool {
+        const QUIET: u32 = 0x0040_0000;
+        ours == c || (half_is_nan(h) && f32::from_bits(c).is_nan() && ours == (c | QUIET))
+    }
+
     #[test]
     fn f16_half_to_float4_matches_c_for_every_half() {
         let hw = has_float16();
@@ -47,7 +64,8 @@ mod tests {
             assert_eq!(ours, unsafe { pgv_sw_half_to_float4(h) }, "software path, half {h:#06x}");
             if hw {
                 // SAFETY: as above.
-                assert_eq!(ours, unsafe { pgv_hw_half_to_float4(h) }, "_Float16, half {h:#06x}");
+                let c = unsafe { pgv_hw_half_to_float4(h) };
+                assert!(same_f32_modulo_quiet_nan(h, ours, c), "_Float16, half {h:#06x}: {ours:#010x} vs {c:#010x}");
             }
             // The block conversion at a position of a 9-wide block, so on
             // AArch64 the NEON lanes and the tail both meet C.
@@ -61,7 +79,8 @@ mod tests {
             assert_eq!(blk, unsafe { pgv_sw_half_to_float4(h) }, "block, software path, half {h:#06x}");
             if hw {
                 // SAFETY: as above.
-                assert_eq!(blk, unsafe { pgv_hw_half_to_float4(h) }, "block, _Float16, half {h:#06x}");
+                let c = unsafe { pgv_hw_half_to_float4(h) };
+                assert!(same_f32_modulo_quiet_nan(h, blk, c), "block, _Float16, half {h:#06x}: {blk:#010x} vs {c:#010x}");
             }
         }
     }
