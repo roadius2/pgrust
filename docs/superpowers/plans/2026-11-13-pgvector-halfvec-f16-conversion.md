@@ -180,7 +180,7 @@ fn kernels_ignore_bytes_past_dim() {
     }
 }
 
-// HALFVEC_MAX_DIM (halfvec.h:9) is 16000: 500 full blocks, against the
+// HALFVEC_MAX_DIM (halfvec.h:60) is 16000: 500 full blocks, against the
 // per-element form.
 #[test]
 fn kernels_at_max_dim() {
