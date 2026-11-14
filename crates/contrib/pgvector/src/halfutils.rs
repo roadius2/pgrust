@@ -126,9 +126,9 @@ pub fn halves_to_floats(src: &[u8], dst: &mut [f32]) {
         let mut s = src.chunks_exact(16);
         let mut d = dst.chunks_exact_mut(8);
         for (sc, dc) in (&mut s).zip(&mut d) {
-            // SAFETY: `sc` is 16 readable bytes and `dc` eight writable f32s;
-            // vld1q_u8 takes a byte-aligned pointer and vst1q_f32 an
-            // f32-aligned one, which `&mut [f32]` gives.
+            // SAFETY: the cfg above enables `neon`, which the intrinsics need;
+            // `sc` is 16 readable bytes and `dc` eight writable f32s; vld1q_u8
+            // takes a byte-aligned pointer, vst1q_f32 an f32-aligned one.
             unsafe {
                 let h = vreinterpretq_u16_u8(vld1q_u8(sc.as_ptr()));
                 let lo = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(h)));
@@ -210,11 +210,11 @@ pub fn float4_to_half(num: f32) -> PgResult<Half> {
 }
 
 // Calls `f(a, b)` for each of the `dim` pairs of halves of two native-endian
-// halfvec arrays, as floats, in order. The conversion is vectorized per block
-// of BLOCK halves, but the callers' accumulation stays element by element in
-// C source order (halfutils.c:29-207's `*Default` loops): no reassociation
-// and no fused multiply-add, per the 2026-10-06 ruling the module doc
-// describes. Slicing the arrays once bounds-checks them once per kernel.
+// halfvec arrays, as floats, in order. Both operands are converted a block of
+// BLOCK halves at a time, but the callers' accumulation stays element by
+// element in C source order (halfutils.c:29-207's `*Default` loops): no
+// reassociation and no fused multiply-add, per the 2026-10-06 ruling the
+// module doc describes. Slicing the arrays once bounds-checks them once per kernel.
 #[inline]
 fn for_each_pair(dim: usize, ax: &[u8], bx: &[u8], mut f: impl FnMut(f32, f32)) {
     let (ax, bx) = (&ax[..2 * dim], &bx[..2 * dim]);
@@ -349,33 +349,45 @@ mod tests {
         assert_eq!(two, [1.0, 2.0]);
     }
 
+    // The per-element form the kernels replace, in C's `*Default` order:
+    // [l2 squared, inner product, cosine similarity, l1]. Cosine is an f64
+    // (every f32 widens exactly, so the others compare by bits as f64).
+    fn per_element(dim: usize, a: &[u8], b: &[u8]) -> [f64; 4] {
+        let hx = |x: &[u8], i: usize| half_to_float4(Half::from_ne_bytes([x[2 * i], x[2 * i + 1]]));
+        let (mut l2, mut ip, mut l1) = (0.0f32, 0.0f32, 0.0f32);
+        let (mut sim, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..dim {
+            let (x, y) = (hx(a, i), hx(b, i));
+            let diff = x - y;
+            l2 += diff * diff;
+            ip += x * y;
+            l1 += (x - y).abs();
+            sim += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        let cos = sim as f64 / ((na as f64) * (nb as f64)).sqrt();
+        [l2 as f64, ip as f64, cos, l1 as f64]
+    }
+
+    fn assert_kernels_match(dim: usize, a: &[u8], b: &[u8]) {
+        let [l2, ip, cos, l1] = per_element(dim, a, b);
+        assert_eq!((halfvec_l2_squared_distance(dim, a, b) as f64).to_bits(), l2.to_bits());
+        assert_eq!((halfvec_inner_product(dim, a, b) as f64).to_bits(), ip.to_bits());
+        assert_eq!((halfvec_l1_distance(dim, a, b) as f64).to_bits(), l1.to_bits());
+        assert_eq!(halfvec_cosine_similarity(dim, a, b).to_bits(), cos.to_bits());
+    }
+
     // The slice-once kernels against the per-element form they replace, bit
     // for bit, over random finite halves of every magnitude.
     #[test]
     fn kernels_match_per_element_reference() {
-        let hx = |x: &[u8], i: usize| half_to_float4(Half::from_ne_bytes([x[2 * i], x[2 * i + 1]]));
         let mut r = XorShift(0x9E37_79B9_7F4A_7C15);
         for n in 0..2000usize {
             let dim = 1 + n % 100;
             let a: Vec<u8> = (0..dim).flat_map(|_| r.half().to_ne_bytes()).collect();
             let b: Vec<u8> = (0..dim).flat_map(|_| r.half().to_ne_bytes()).collect();
-            let (mut l2, mut ip, mut l1) = (0.0f32, 0.0f32, 0.0f32);
-            let (mut sim, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
-            for i in 0..dim {
-                let (x, y) = (hx(&a, i), hx(&b, i));
-                let diff = x - y;
-                l2 += diff * diff;
-                ip += x * y;
-                l1 += (x - y).abs();
-                sim += x * y;
-                na += x * x;
-                nb += y * y;
-            }
-            let cos = sim as f64 / ((na as f64) * (nb as f64)).sqrt();
-            assert_eq!(halfvec_l2_squared_distance(dim, &a, &b).to_bits(), l2.to_bits());
-            assert_eq!(halfvec_inner_product(dim, &a, &b).to_bits(), ip.to_bits());
-            assert_eq!(halfvec_l1_distance(dim, &a, &b).to_bits(), l1.to_bits());
-            assert_eq!(halfvec_cosine_similarity(dim, &a, &b).to_bits(), cos.to_bits());
+            assert_kernels_match(dim, &a, &b);
         }
     }
 
@@ -443,19 +455,27 @@ mod tests {
         }
     }
 
-    // HALFVEC_MAX_DIM (halfvec.h:9) is 16000: 500 full blocks, against the
-    // per-element form.
+    // HALFVEC_MAX_DIM (halfvec.h:60) is 16000: 500 full blocks, all four
+    // kernels against the per-element form.
     #[test]
     fn kernels_at_max_dim() {
-        let dim = 16000usize;
+        let dim = crate::halfvec::HALFVEC_MAX_DIM as usize;
         let mut r = XorShift(0xDEAD_BEEF_CAFE_F00D);
         let a: Vec<u8> = (0..dim).flat_map(|_| r.half().to_ne_bytes()).collect();
         let b: Vec<u8> = (0..dim).flat_map(|_| r.half().to_ne_bytes()).collect();
-        let hx = |x: &[u8], i: usize| half_to_float4(Half::from_ne_bytes([x[2 * i], x[2 * i + 1]]));
-        let mut ip = 0.0f32;
-        for i in 0..dim {
-            ip += hx(&a, i) * hx(&b, i);
+        assert_kernels_match(dim, &a, &b);
+    }
+
+    // The portable loop over all 65,536 halves in one call, so a release build
+    // runs its vectorized form; on AArch64 the block conversion hands it only
+    // tails of 0..7 halves.
+    #[test]
+    fn portable_block_matches_per_element_for_every_half() {
+        let src: Vec<u8> = (0..=u16::MAX).flat_map(|h| h.to_ne_bytes()).collect();
+        let mut dst = vec![1.5f32; 1 << 16];
+        portable_block(&src, &mut dst);
+        for h in 0..=u16::MAX {
+            assert_eq!(dst[h as usize].to_bits(), half_to_float4(h).to_bits(), "half {h:#06x}");
         }
-        assert_eq!(halfvec_inner_product(dim, &a, &b).to_bits(), ip.to_bits());
     }
 }
