@@ -8,7 +8,8 @@
 #   X CONTAINER CMD...      run CMD in CONTAINER
 #   XB CONTAINER 'STRING'   run the bash -c STRING in CONTAINER
 #   settle                  block until the host's 1-minute load average is
-#                           below 1.0 on three readings in a row, 10 s apart
+#                           below 1.0 on three readings in a row, 10 s apart,
+#                           or for at most $SETTLE_MAX_S (600) s; prints them
 #   metrics_reset C         open a memory.peak window on container C's cgroup
 #   metrics_read C          print "peak=<bytes> current=<bytes> cpu_usec=<usec>":
 #                           the peak since the last metrics_reset, the rest now
@@ -31,9 +32,14 @@ XB() {
   incus exec "$1" -- bash -c "$2" </dev/null
 }
 
+SETTLE_MAX_S="${SETTLE_MAX_S:-600}"
+
+# Other people's instances share the host, so settle gives up waiting after
+# $SETTLE_MAX_S seconds rather than park an unattended run; the printed
+# readings are the record of the load it ran under.
 settle() {
-  local load ok=0
-  while [ "$ok" -lt 3 ]; do
+  local load ok=0 start="$SECONDS"
+  while :; do
     load="$(cut -d' ' -f1 /proc/loadavg)"
     if awk -v l="$load" 'BEGIN { exit !(l < 1.0) }'; then
       ok=$((ok + 1))
@@ -41,7 +47,12 @@ settle() {
       ok=0
     fi
     echo "settle: load1=$load ($ok/3)"
-    [ "$ok" -lt 3 ] && sleep 10
+    [ "$ok" -lt 3 ] || return 0
+    if [ $((SECONDS - start)) -ge "$SETTLE_MAX_S" ]; then
+      echo "settle: proceeding at load $load after $SETTLE_MAX_S s"
+      return 0
+    fi
+    sleep 10
   done
 }
 
@@ -96,8 +107,10 @@ metrics_reset() {
   rm -f "$f.req" "$f.reply"
   mkfifo "$f.req" "$f.reply"
   exec {fd}<>"$f.reply"
-  setsid sudo -n python3 -c "$METRICS_HOLDER" "$d/memory.peak" "$f.req" "$f.reply" "$$" \
-    </dev/null >/dev/null 2>"$f.err" &
+  # The double fork re-parents the helper to init, so the caller's bare
+  # "wait" does not wait for it; $$ in the subshell is still the caller's PID.
+  (setsid sudo -n python3 -c "$METRICS_HOLDER" "$d/memory.peak" "$f.req" "$f.reply" "$$" \
+    </dev/null >/dev/null 2>"$f.err" &)
   read -r -t 10 -u "$fd" line || true
   exec {fd}<&-
   [ "$line" = reset ] || die "metrics_reset $c: the helper did not start: $(cat "$f.err")"
