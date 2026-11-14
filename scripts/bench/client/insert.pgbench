@@ -1,3 +1,5 @@
+-- The inserted vectors duplicate indexed ones (extra = train rows 0..99999):
+-- delete them (id >= 100000000) before any recall pass.
 -- One insert of a random extra row (extra.id 1..100000) into -D tbl=items,
 -- as id + 100000000; remove them after a run with
 -- DELETE FROM items WHERE id >= 100000000.

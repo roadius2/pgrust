@@ -20,7 +20,7 @@ Every table is filled with COPY ... FROM STDIN (text format), one COPY per
 batch of 10,000 rows, in autocommit. The vectors are formatted with %.9g,
 which round-trips every float32 exactly. Three worker processes format all of
 a table's batches before its first COPY (about 1.5 GB of text for glove's
-items), so the timed COPYs measure the server and the network, not the
+items, reused for items_h), so the timed COPYs measure the server and the network, not the
 client's formatting, which is no faster than about 100,000 rows/s here.
 
 Prints one JSON line on stdout for items:
@@ -109,15 +109,19 @@ def format_batch(job):
     return "".join(out).encode()
 
 
-def copy_table(conn, pool, table, columns, kind, dataset, nrows, id_base=0):
-    """COPY nrows rows of dataset into table, one COPY per batch.
-
-    Returns the seconds the COPYs took: the batches are formatted first, so
-    the time is the server's and the network's, not the client's formatting.
-    """
+def format_rows(pool, kind, dataset, nrows, id_base=0):
+    """The COPY text of rows 0..nrows-1 of dataset, one bytes per batch."""
     jobs = [(kind, dataset, lo, min(lo + BATCH, nrows), id_base + lo)
             for lo in range(0, nrows, BATCH)]
-    batches = pool.map(format_batch, jobs)
+    return pool.map(format_batch, jobs)
+
+
+def copy_table(conn, table, columns, batches, nrows):
+    """COPY the formatted batches into table, one COPY per batch.
+
+    Returns the seconds the COPYs took: the batches are formatted before, so
+    the time is the server's and the network's, not the client's formatting.
+    """
     start = time.perf_counter()
     with conn.cursor() as cur:
         for data in batches:
@@ -146,12 +150,19 @@ def load(args, f, conn, pool):
     ntrain = f["train"].shape[0]
     nrows = ntrain if args.subset is None else min(args.subset, ntrain)
     create_tables(conn, args.dim, args.halfvec)
-    seconds = copy_table(conn, pool, "items", "id, v", "vec", "train", nrows)
+    # items_h takes the same text as items (halfvec_in parses vector text),
+    # so the batches are formatted once and copied twice.
+    batches = format_rows(pool, "vec", "train", nrows)
+    seconds = copy_table(conn, "items", "id, v", batches, nrows)
     if args.halfvec:
-        copy_table(conn, pool, "items_h", "id, v", "vec", "train", nrows)
-    copy_table(conn, pool, "queries", "id, v, vh", "query", "test", f["test"].shape[0])
-    copy_table(conn, pool, "truth", "qid, nn", "truth", "neighbors", f["neighbors"].shape[0])
-    copy_table(conn, pool, "extra", "id, v", "vec", "train", min(EXTRA_ROWS, ntrain), id_base=1)
+        copy_table(conn, "items_h", "id, v", batches, nrows)
+    del batches
+    for table, columns, kind, dataset, n, id_base in (
+        ("queries", "id, v, vh", "query", "test", f["test"].shape[0], 0),
+        ("truth", "qid, nn", "truth", "neighbors", f["neighbors"].shape[0], 0),
+        ("extra", "id, v", "vec", "train", min(EXTRA_ROWS, ntrain), 1),
+    ):
+        copy_table(conn, table, columns, format_rows(pool, kind, dataset, n, id_base), n)
     return {"rows": nrows, "seconds": round(seconds, 3), "rows_per_s": round(nrows / seconds, 1)}
 
 

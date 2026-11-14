@@ -19,7 +19,8 @@
 # creates and starts no cluster here: the client runs no PostgreSQL server.
 #
 # Result: /opt/bench/{load.py,recall.py,soak_stats.py} (run them directly; their
-# shebang is the venv's python), the four .pgbench files, and pgbench 18.6.
+# shebang is the venv's python), search.pgbench and insert.pgbench (the soak runs
+# -f search.pgbench@9 -f insert.pgbench@1), and pgbench 18.6.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
