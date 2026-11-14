@@ -43,8 +43,11 @@ launch() {
   local name="$1" cpu="$2" mem="$3"
   need_ours "$name"
   [ -z "$(status_of "$name")" ] || die "$name already exists"
+  # security.nesting: without it AppArmor denies signals between systemd's and
+  # incus exec's label sets, so PostgreSQL cannot be stopped or woken.
   incus launch "$IMAGE" "$name" -p trusted-lan --target borg2 \
-    -c limits.cpu="$cpu" -c limits.memory="$mem" -c boot.autostart=false </dev/null
+    -c limits.cpu="$cpu" -c limits.memory="$mem" -c boot.autostart=false \
+    -c security.nesting=true </dev/null
   cmd_wait_net "$name"
   X "$name" cloud-init status --wait
   cmd_disable_upgrades "$name"

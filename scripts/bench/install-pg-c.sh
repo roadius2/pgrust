@@ -14,13 +14,11 @@
 # postgresql-18-pgvector at 0.8.7-1.pgdg24.04+1 (the +2 build depends on
 # postgresql-18 (>> 18.7), so it cannot be installed with 18.6).
 #
-# Two deliberate departures from a plain install. PG 18's default
-# io_method=worker hangs every connection in this Incus container (the first
-# catalog read never completes), so both contestants run io_method=sync (the
-# last line of common-settings.conf). For the same reason the postgresql-18
-# package must not create and start its default "main" cluster in its postinst
-# (that start hangs the install): create_main_cluster is turned off first and
-# the cluster is created, unstarted, with pg_createcluster.
+# The postgresql-18 package must not create and start its default "main"
+# cluster in its postinst, so create_main_cluster is turned off first and the
+# cluster is created, unstarted, with pg_createcluster. The containers need
+# security.nesting=true (borg.sh sets it), else AppArmor denies the signals
+# PostgreSQL relies on.
 #
 # Result: PostgreSQL on *:5432 (service postgresql@18-main), database bench,
 # role bench (superuser, password bench, scram), extension vector.
@@ -69,12 +67,23 @@ create_cluster() {
   [ -d /etc/postgresql/18/main ] || pg_createcluster 18 main
 }
 
-# Sets CHANGED=1 when the configuration was modified.
+# The settings block between the "# bench begin/end" markers is replaced on
+# every run, so a changed common-settings.conf reaches the server. (An earlier
+# version appended a bare "# bench" block at the end of the file; that is
+# removed too.) Sets CHANGED=1 when the configuration was modified.
 configure() {
-  if ! grep -q '^# bench$' "$CONF"; then
-    { echo; echo '# bench'; cat "$SETTINGS"; } >>"$CONF"
+  local new="$CONF.new"
+  {
+    sed -e '/^# bench begin$/,/^# bench end$/d' -e '/^# bench$/,$d' "$CONF"
+    echo '# bench begin'
+    cat "$SETTINGS"
+    echo '# bench end'
+  } >"$new"
+  if ! cmp -s "$new" "$CONF"; then
+    cat "$new" >"$CONF"
     CHANGED=1
   fi
+  rm "$new"
   if ! grep -qxF "$HBA_LINE" "$HBA"; then
     { echo "$HBA_LINE"; cat "$HBA"; } >"$HBA.new"
     cat "$HBA.new" >"$HBA"
