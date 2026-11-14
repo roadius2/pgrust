@@ -1,0 +1,5 @@
+-- One insert of a random extra row (extra.id 1..100000) into -D tbl=items,
+-- as id + 100000000; remove them after a run with
+-- DELETE FROM items WHERE id >= 100000000.
+\set id random(1, 100000)
+INSERT INTO :tbl (id, v) SELECT id + 100000000, v FROM extra WHERE id = :id;
