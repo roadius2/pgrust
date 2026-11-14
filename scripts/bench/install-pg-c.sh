@@ -25,7 +25,8 @@
 set -euo pipefail
 
 # shellcheck source=lib.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$here/lib.sh"
 
 CONTAINER="pgrust-db-c"
 PG_VERSION="18.6-1.pgdg24.04+2"
@@ -53,12 +54,13 @@ install_repo() {
 }
 
 install_packages() {
-  apt-get install -y postgresql-common
+  dpkg -s postgresql-common >/dev/null 2>&1 ||
+    apt-get install -y -o Dpkg::Options::=--force-confold postgresql-common
   sed -i -E 's/^#?[[:space:]]*create_main_cluster[[:space:]]*=.*/create_main_cluster = false/' \
     /etc/postgresql-common/createcluster.conf
   grep -q '^create_main_cluster = false$' /etc/postgresql-common/createcluster.conf ||
     die "createcluster.conf has no create_main_cluster line"
-  apt-get install -y \
+  apt-get install -y -o Dpkg::Options::=--force-confold \
     "postgresql-18=$PG_VERSION" "postgresql-client-18=$PG_VERSION" "postgresql-18-pgvector=$VECTOR_VERSION"
   apt-mark hold postgresql-18 postgresql-client-18 postgresql-18-pgvector
 }
@@ -68,13 +70,12 @@ create_cluster() {
 }
 
 # The settings block between the "# bench begin/end" markers is replaced on
-# every run, so a changed common-settings.conf reaches the server. (An earlier
-# version appended a bare "# bench" block at the end of the file; that is
-# removed too.) Sets CHANGED=1 when the configuration was modified.
+# every run, so a changed common-settings.conf reaches the server. Sets
+# CHANGED=1 when the configuration was modified.
 configure() {
   local new="$CONF.new"
   {
-    sed -e '/^# bench begin$/,/^# bench end$/d' -e '/^# bench$/,$d' "$CONF"
+    sed -e '/^# bench begin$/,/^# bench end$/d' "$CONF"
     echo '# bench begin'
     cat "$SETTINGS"
     echo '# bench end'
@@ -103,6 +104,7 @@ create_objects() {
 report() {
   dpkg-query -W -f='${Package} ${Version}\n' postgresql-18 postgresql-client-18 postgresql-18-pgvector
   psql_postgres -d bench -c "select version()"
+  psql_postgres -d bench -c "show io_method" -c "show ssl"
   psql_postgres -d bench -c "select 'vector ' || extversion from pg_extension where extname = 'vector'"
   psql_postgres -d bench -F ' | ' \
     -c "select name, setting from pg_settings where source <> 'default' order by 1"
@@ -126,6 +128,6 @@ inside() {
 if [ "${1:-}" = inside ]; then
   inside
 else
-  bash "$(dirname "${BASH_SOURCE[0]}")/borg.sh" push-dir "$CONTAINER" "$(dirname "${BASH_SOURCE[0]}")" /root
+  bash "$here/borg.sh" push-dir "$CONTAINER" "$here" /root
   XB "$CONTAINER" "bash /root/scripts/install-pg-c.sh inside"
 fi
