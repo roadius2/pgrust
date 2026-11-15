@@ -40,3 +40,42 @@ the markdown tables; `tests/test_report.sh` checks its headline rule.
 On borg2: datasets in `/home/jody/bench/data` (read-only at `/data` in the
 client), results in `/home/jody/bench/results/<run-id>/`, pulled to
 `~/.cache/pgrust/bench-borg/<run-id>/` on the Mac.
+
+## Site constants and prerequisites
+
+**Constants to change on another site:**
+
+- the cluster member `--target borg2` and the Incus profile `trusted-lan` (`borg.sh`'s `launch`);
+- `/home/jody/bench` (`DATA_DIR` in `borg.sh` and `client/datasets.sh`, `RESULTS` in `run-phase1.sh`, the unit in this README);
+- the client network `192.168.0.0/24` in `pg_hba` (`HBA_LINE` in both server installers);
+- `BUILD_CPUS=0-15` for pgrust's build (`install-pgrust.sh`);
+- the container pins: `0-5` for a database, `6,7,14,15` for the client. These assume a CPU whose SMT siblings are *i* and *i*+8.
+
+**Host prerequisites:**
+
+- `jq` and `python3`;
+- passwordless `sudo`, for `lib.sh`'s memory.peak helper and `zfs get`;
+- the `zfs` utilities, and `systemd-run` for the long runs;
+- Incus 6.0 or later. Containers get `security.nesting=true`: without it Incus's AppArmor profile denies signals between the container's label and the stacked label that systemd-started processes carry, so PostgreSQL's AIO workers hang and servers cannot be stopped (design §11).
+
+**Pinned versions:**
+
+- PGDG `postgresql-18`, `postgresql-client-18` and the client's server package at `18.6-1.pgdg24.04+2`;
+- `postgresql-18-pgvector` `0.8.7-1.pgdg24.04+1`;
+- Rust 1.96.0 (`install-pgrust.sh`);
+- the client venv's `h5py==3.16.0 numpy==2.5.4 psycopg[binary]==3.3.9`.
+
+PGDG drops superseded builds from `apt.postgresql.org`, and they move to `apt-archive.postgresql.org`. When a pin stops resolving, add a second list line in each installer's `install_repo` and re-run it:
+
+    deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt-archive.postgresql.org/pub/repos/apt noble-pgdg-archive main
+
+**Entry points** (each script's header has its usage):
+
+- `sync.sh`: ships this directory to `borg2:~/bench/scripts/`.
+- `borg.sh`: creates, starts and stops the `pgrust-*` containers and writes `facts`.
+- `install-pg-c.sh`: PGDG PostgreSQL 18.6 + pgvector 0.8.7 in `pgrust-db-c`.
+- `install-pgrust.sh`: builds and serves pgrust in `pgrust-db-rust` (`PGRUST_REF` = a branch, a tag or a full 40-character sha).
+- `client/setup.sh`: psql, pgbench and the venv in `pgrust-client`.
+- `client/datasets.sh`: fetches the HDF5 datasets and checks them against `client/SHA256SUMS`.
+- `run-phase1.sh`: one contestant's whole phase-1 run.
+- `report.py`: a results directory to markdown tables.

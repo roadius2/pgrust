@@ -72,7 +72,8 @@ install_scripts() {
 
 install_venv() {
   [ -x "$VENV/bin/python" ] || python3 -m venv "$VENV"
-  "$VENV/bin/pip" install -q --disable-pip-version-check h5py numpy 'psycopg[binary]'
+  "$VENV/bin/pip" install -q --disable-pip-version-check \
+    h5py==3.16.0 numpy==2.5.4 'psycopg[binary]==3.3.9'
 }
 
 report() {

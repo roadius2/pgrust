@@ -40,7 +40,7 @@ status_of() {
 }
 
 launch() {
-  local name="$1" cpu="$2" mem="$3"
+  local name="$1" cpu="$2" mem="$3" rc
   need_ours "$name"
   [ -z "$(status_of "$name")" ] || die "$name already exists"
   # security.nesting: without it AppArmor denies signals between systemd's and
@@ -49,7 +49,12 @@ launch() {
     -c limits.cpu="$cpu" -c limits.memory="$mem" -c boot.autostart=false \
     -c security.nesting=true </dev/null
   cmd_wait_net "$name"
-  X "$name" cloud-init status --wait
+  # Exit 2 is cloud-init's "done, degraded" (recoverable warnings): go on.
+  X "$name" cloud-init status --wait || {
+    rc=$?
+    [ "$rc" = 2 ] || die "$name: cloud-init status exit $rc"
+    echo "warning: $name: cloud-init finished degraded (exit 2)" >&2
+  }
   cmd_disable_upgrades "$name"
 }
 

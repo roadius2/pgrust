@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Installs the pgrust contestant in pgrust-db-rust: pgrust built inside the
-# container from the public fork's main (or $PGRUST_REF), served by
-# pgrust.service and configured with common-settings.conf, like the C side.
+# container from the public fork's main (or $PGRUST_REF: a branch, a tag or a
+# full 40-character sha), served by pgrust.service and configured with
+# common-settings.conf, like the C side.
 # Runs on the host, shipped there by sync.sh:
 #   ssh -n borg2 bash ~/bench/scripts/install-pgrust.sh
 # It copies scripts/ into the container (borg.sh push-dir) and runs the
@@ -84,13 +85,15 @@ install_rust() {
     sh -s -- -y -q --default-toolchain "$RUST_VERSION" --profile minimal
 }
 
+# One path for a branch, a tag or a full 40-character sha (GitHub serves a
+# full sha to a shallow fetch; an abbreviated one cannot be fetched).
 fetch_source() {
-  if [ -d "$SRC/.git" ]; then
-    git -C "$SRC" fetch --depth 1 origin "$REF"
-    git -C "$SRC" reset --hard FETCH_HEAD
-  else
-    git clone --depth 1 --branch "$REF" "$REPO" "$SRC"
+  if [ ! -d "$SRC/.git" ]; then
+    git init -q "$SRC"
+    git -C "$SRC" remote add origin "$REPO"
   fi
+  git -C "$SRC" fetch --depth 1 origin "$REF"
+  git -C "$SRC" checkout -q --detach --force FETCH_HEAD
   echo "source: $REF at $(git -C "$SRC" rev-parse HEAD)"
 }
 

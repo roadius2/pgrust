@@ -271,7 +271,9 @@ def headline(runs, cs):
             f"Matched setting: both engines at the same {GUC['hnsw']} or {GUC['ivfflat']}, with "
             "each one's 1-client recall in brackets; where the recalls agree this is the "
             "like-for-like search comparison. Recall ≥ R: the first setting whose 1-client "
-            "recall reaches R (\"not reached:\" the highest setting, with its recall).", "",
+            "recall reaches R (\"not reached:\" the highest setting, with its recall). The 8- and "
+            "16-client figures are pgbench TPS of a two-statement transaction (a primary-key "
+            "lookup returning the query vector as text, then the search).", "",
             f"† The recall of the cell's setting, or of the setting before it, is within {NEAR} "
             "of the target. Where two engines' recall curves agree to about that width, which "
             "setting first clears the bar, and so the QPS in the cell, can turn on a recall "
