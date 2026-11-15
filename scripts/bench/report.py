@@ -34,8 +34,8 @@ cgroup), so its floor is what the container held before the step. The "build
 increment, rep 1 (approx.)" is the peak_bytes of a build group's first rep
 (one dataset, type, index and setting) minus the peak_bytes of the row with
 one before it in the same TSV: the last measured step before the group (an
-exact pass, or the previous group's last build, whatever its dataset or
-index). That earlier peak is an upper bound on the memory held at the build's
+exact pass, an insert step, or the previous group's last build, whatever its
+dataset or index). That earlier peak is an upper bound on the memory held at the build's
 reset, so the increment is a lower bound. Reps 2 and 3 follow another build of
 the same index directly, so they get no increment. From the runs after
 p1-20261114 the run log's "measure: ... base_bytes=" line is the exact
@@ -263,8 +263,9 @@ def headline(runs, cs):
     out += ["¹ Container peak: the database container's cgroup high-water mark during the "
             "step (anonymous memory and touched shared buffers; the file cache lives outside "
             "the cgroup), whose floor is the memory resident before the step. Build increment "
-            "(approx.): rep 1's peak minus the peak of the last measured step before it (the "
-            "exact pass or the previous build group), an upper bound on the baseline and so a "
+            "(approx.): rep 1's peak minus the peak of the last measured step before it (an "
+            "exact pass, an insert step or the previous build group), an upper bound on the "
+            "baseline and so a "
             "lower bound on what the build added; reps 2 and 3 have none. Runs after "
             "p1-20261114 log the exact baseline (\"measure: ... base_bytes=\").", "",
             f"Matched setting: both engines at the same {GUC['hnsw']} or {GUC['ivfflat']}, with "
