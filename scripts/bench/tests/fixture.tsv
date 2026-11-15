@@ -15,3 +15,5 @@ pg-c	glove-100-angular	vector	none	exact		1	1	70	qps	1.0				1073741824			2026-11
 pg-c	glove-100-angular	vector	hnsw	build	serial		1	30000	ms					1610612736			2026-11-14T00:14:00Z
 pgrust	glove-100-angular	vector	none	exact		1	1	63	qps	1.0				805306368			2026-11-14T00:15:00Z
 pgrust	glove-100-angular	vector	hnsw	build	serial		1	54000	ms					966367642			2026-11-14T00:16:00Z
+pgrust	glove-100-angular	vector	hnsw	build	serial		2	56000	ms					955630223			2026-11-14T00:17:00Z
+pgrust	glove-100-angular	vector	hnsw	build	serial		3	52000	ms					977105060			2026-11-14T00:18:00Z

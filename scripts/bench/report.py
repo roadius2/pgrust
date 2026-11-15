@@ -25,9 +25,15 @@ Medians are of the repetitions in the TSV. Standard library only.
 Memory: peak_bytes is the container's cgroup high-water mark during the step
 (anonymous memory and touched shared buffers; the file cache is outside the
 cgroup), so its floor is what the container held before the step. The "build
-increment (approx.)" is a row's peak_bytes minus the peak_bytes of the row
-before it in the same TSV: that earlier peak is an upper bound on the memory
-held at this step's reset, so the increment is a lower bound.
+increment, rep 1 (approx.)" is the peak_bytes of a build group's first rep
+(one dataset, type, index and setting) minus the peak_bytes of the row with
+one before it in the same TSV: the last measured step before the group (an
+exact pass, or the previous group's last build, whatever its dataset or
+index). That earlier peak is an upper bound on the memory held at the build's
+reset, so the increment is a lower bound. Reps 2 and 3 follow another build of
+the same index directly, so they get no increment. From the runs after
+p1-20261114 the run log's "measure: ... base_bytes=" line is the exact
+baseline.
 """
 
 import csv
@@ -71,7 +77,9 @@ def load(directory):
         prev = None  # the last peak_bytes seen in this file
         for r in rows:
             peak = num(r["peak_bytes"])
-            r["increment_bytes"] = "" if peak is None or prev is None else str(peak - prev)
+            first_build = r["measurement"] == "build" and r["rep"] == "1"
+            r["increment_bytes"] = (str(peak - prev) if first_build and peak is not None
+                                    and prev is not None else "")
             if peak is not None:
                 prev = peak
         runs[name[:-4]] = rows
@@ -203,16 +211,20 @@ def headline(runs, cs):
                lambda rows: median(select(rows, dataset=ds, type=ty, index="hnsw",
                                           measurement="insert", clients="8")))
         simple("Container peak, serial HNSW build (median), GiB¹", build("serial", "peak_bytes", gib), fmt_gib)
-        simple("Build increment (approx.), serial HNSW build (median), GiB¹",
-               build("serial", "increment_bytes", gib), fmt_gib)
+        simple("Build increment, rep 1 (approx.), serial HNSW build, GiB¹",
+               lambda rows: gib(median(select(rows, dataset=ds, type=ty, index="hnsw",
+                                              measurement="build", setting="serial", rep="1"),
+                                       "increment_bytes")), fmt_gib)
         simple("CPU-seconds of the serial HNSW build, median", build("serial", "cpu_usec", lambda v: v / 1e6))
         if lines:
             out += [f"### {ds} / {ty}", "", table(head, lines), ""]
     out += ["¹ Container peak: the database container's cgroup high-water mark during the "
             "step (anonymous memory and touched shared buffers; the file cache lives outside "
             "the cgroup), whose floor is the memory resident before the step. Build increment "
-            "(approx.): that peak minus the preceding TSV row's peak, an upper bound on the "
-            "baseline and so a lower bound on what the build added.", ""]
+            "(approx.): rep 1's peak minus the peak of the last measured step before it (the "
+            "exact pass or the previous build group), an upper bound on the baseline and so a "
+            "lower bound on what the build added; reps 2 and 3 have none. Runs after "
+            "p1-20261114 log the exact baseline (\"measure: ... base_bytes=\").", ""]
     return out
 
 
@@ -236,7 +248,7 @@ EXTRA = [
     ("p95_ms", "p95 ms", lambda v: v, fmt, None),
     ("p99_ms", "p99 ms", lambda v: v, fmt, None),
     ("peak_bytes", "container peak GiB", gib, fmt_gib, None),
-    ("increment_bytes", "increment GiB (approx.)", gib, fmt_gib, {"build"}),
+    ("increment_bytes", "build increment, rep 1 (approx.) GiB", gib, fmt_gib, {"build"}),
     ("cpu_usec", "CPU s", lambda v: v / 1e6, fmt, None),
     ("wall_s", "wall s", lambda v: v, fmt, None),
 ]

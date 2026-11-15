@@ -3,8 +3,9 @@
 # the QPS at recall >= 0.95 is the 8-client QPS of the first ef_search whose
 # single-client recall reaches 0.95 (ef 64, not ef 40's higher QPS), and the
 # one at >= 0.99 is ef 100's; nothing is interpolated. It also checks the
-# serial build's container peak and its approximate increment (the build's
-# peak minus the preceding row's, here the exact pass's). Runs anywhere with
+# serial build's container peak and its approximate increment (rep 1's peak
+# minus the preceding row's, here the exact pass's; none for reps 2 and 3,
+# which follow another build directly). Runs anywhere with
 # python3 (the Mac or borg2):
 #   scripts/bench/tests/test_report.sh
 #
@@ -58,11 +59,16 @@ reject "4400 (ef_search"
 # Every point is in the search table, the 1-client recall included.
 expect "| glove-100-angular | vector | hnsw | 64 | 8 | 1 | 4000 | 3200 | 0.80× | – | – | 1.90 | 1.90 | – | – | 3.10 | 3.10 |"
 expect "| glove-100-angular | vector | hnsw | 40 | 1 | 1 | 900 | 800 | 0.89× | 0.9300 | 0.9310 | 1.10 | 1.10 | 1.50 | 1.50 | 2.00 | 2.00 |"
-# Memory: pg-c 1.50 GiB peak after a 1.00 GiB row (+0.50), pgrust 0.90 after
-# 0.75 (+0.15).
+# Memory: pg-c 1.50 GiB peak after a 1.00 GiB row (+0.50); pgrust's three
+# serial reps peak at 0.90 (after a 0.75 row: +0.15), 0.89 and 0.91. The
+# increment is rep 1's alone: per-rep increments (0.15, -0.01, 0.02) would
+# have a median of 0.02.
 expect "| Container peak, serial HNSW build (median), GiB¹ | 1.50 | 0.90 | 0.60× |"
-expect "| Build increment (approx.), serial HNSW build (median), GiB¹ | 0.50 | 0.15 | 0.30× |"
+expect "| Build increment, rep 1 (approx.), serial HNSW build, GiB¹ | 0.50 | 0.15 | 0.30× |"
+reject "| 0.50 | 0.02 |"
 expect "| glove-100-angular | vector | hnsw | serial |  | 1 | 30000 | 54000 | 1.80× | 1.50 | 0.90 | 0.50 | 0.15 |"
+expect "| glove-100-angular | vector | hnsw | serial |  | 2 | – | 56000 | – | – | 0.89 | – | – |"
+expect "| glove-100-angular | vector | hnsw | serial |  | 3 | – | 52000 | – | – | 0.91 | – | – |"
 if [ "$(grep -c '^| glove-100-angular | vector | hnsw | [0-9]' <<<"$out")" = 6 ]; then
   echo "ok: 6 search points"
 else
