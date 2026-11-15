@@ -7,10 +7,12 @@ Reads every CONTESTANT.tsv in RESULTS_DIR (run-phase1.sh's rows; the file's
 stem names the contestant: pg-c, pgrust) and prints:
 
   (a) a headline table per dataset and vector type: HNSW serial and parallel
-      build medians, QPS at recall >= 0.95 and >= 0.99 at 8 and 16 clients
-      (HNSW and IVFFlat), exact-scan QPS, insert rows/s at 8 clients, and the
-      container peak, the approximate build increment and the CPU-seconds of
-      the serial HNSW build;
+      build medians; the matched-setting rows (8-client QPS at ef_search 100
+      and at probes 20, each with both engines' recall), the like-for-like
+      search comparison; QPS at recall >= 0.90, >= 0.95 and >= 0.99 at 8 and
+      16 clients (HNSW and IVFFlat); exact-scan QPS, insert rows/s at 8
+      clients, and the container peak, the approximate build increment and
+      the CPU-seconds of the serial HNSW build;
   (b) one table per measurement with every point;
   (c) the soak windows, the soak's failed transactions and its memory over
       the hour (CONTESTANT-soak-rss.tsv).
@@ -18,9 +20,13 @@ stem names the contestant: pg-c, pgrust) and prints:
 The "QPS at recall >= R" rule: the first setting of the sweep (ef_search or
 probes, ascending) whose single-client recall pass reaches R; the cell is that
 setting's 8- (or 16-) client QPS, with the setting named. No interpolation; a
-sweep that never reaches R prints "not reached". Ratios are the second
-contestant's value divided by the first's (pgrust / pg-c), as x.xx×.
-Medians are of the repetitions in the TSV. Standard library only.
+sweep that never reaches R shows its highest setting's QPS and recall after
+"not reached:". A cell is marked † when the recall of its setting, or of the
+setting before it in the sweep, is within NEAR (0.005) of R: there a recall
+difference at the noise level decides which setting clears the bar. Ratios
+are the second contestant's value divided by the first's (pgrust / pg-c), as
+x.xx×; a recall row has none when one contestant reached the target and the
+other did not. Medians are of the repetitions in the TSV. Standard library only.
 
 Memory: peak_bytes is the container's cgroup high-water mark during the step
 (anonymous memory and touched shared buffers; the file cache is outside the
@@ -45,6 +51,10 @@ HEADER = ("dataset type index measurement setting clients rep value unit recall 
           "p50_ms p95_ms p99_ms peak_bytes cpu_usec wall_s started_at").split()
 ORDER = ["pg-c", "pgrust"]  # contestants first in this order, others after
 GUC = {"hnsw": "ef_search", "ivfflat": "probes"}
+MATCHED = {"hnsw": "100", "ivfflat": "20"}  # the matched-setting rows' settings
+MATCHED_CLIENTS = 8
+TARGETS = (0.90, 0.95, 0.99)
+NEAR = 0.005  # a recall this close to a target marks the cell †
 SOAK = {"soak", "soak_errors"}
 
 
@@ -135,24 +145,54 @@ def median(rows, field="value"):
     return statistics.median(vals) if vals else None
 
 
-def at_recall(rows, ds, ty, index, target, clients):
-    """(QPS, setting) at the first sweep setting whose 1-client recall >= target.
+def search_qps(rows, ds, ty, index, setting, clients):
+    """The QPS of one search point, or None when it is missing."""
+    point = select(rows, dataset=ds, type=ty, index=index, measurement="search",
+                   setting=setting, clients=str(clients))
+    return num(point[0]["value"]) if point else None
 
-    None when the sweep has no 1-client points; (None, None) when it never
-    reaches the target; (None, setting) when that setting's point at
-    `clients` is missing (an error row instead).
+
+def at_recall(rows, ds, ty, index, target, clients):
+    """(cell text, QPS, reached) for the "QPS at recall >= target" rule.
+
+    The first sweep setting whose 1-client recall reaches the target gives the
+    QPS at `clients`; a sweep that never reaches it gives its highest
+    setting's, after "not reached:", with that setting's recall. The cell
+    ends in † when the chosen setting's recall or the previous setting's is
+    within NEAR of the target. None when the sweep has no 1-client points;
+    the QPS is None when the point at `clients` is missing.
     """
     single = [r for r in select(rows, dataset=ds, type=ty, index=index, measurement="search",
                                 clients="1") if num(r["recall"]) is not None]
     if not single:
         return None
     single.sort(key=lambda r: num(r["setting"]))
-    for r in single:
+    guc = GUC[index]
+    near = lambda r: r is not None and abs(num(r["recall"]) - target) <= NEAR + 1e-9
+    for i, r in enumerate(single):
         if num(r["recall"]) >= target:
-            point = select(rows, dataset=ds, type=ty, index=index, measurement="search",
-                           setting=r["setting"], clients=str(clients))
-            return (num(point[0]["value"]) if point else None), r["setting"]
-    return None, None
+            qps = search_qps(rows, ds, ty, index, r["setting"], clients)
+            text = (f"{fmt(qps)} ({guc} {r['setting']})" if qps is not None
+                    else f"no point ({guc} {r['setting']})")
+            prev = single[i - 1] if i > 0 else None
+            return text + ("†" if near(r) or near(prev) else ""), qps, True
+    r = single[-1]
+    qps = search_qps(rows, ds, ty, index, r["setting"], clients)
+    text = (f"not reached: {fmt(qps) if qps is not None else 'no point'} "
+            f"({guc} {r['setting']}, recall {num(r['recall']):.4f})")
+    return text + ("†" if near(r) else ""), qps, False
+
+
+def at_setting(rows, ds, ty, index, setting, clients):
+    """(cell text, QPS, True) of one setting's point with its 1-client recall,
+    or None when the sweep has no such setting."""
+    single = select(rows, dataset=ds, type=ty, index=index, measurement="search",
+                    setting=setting, clients="1")
+    qps = search_qps(rows, ds, ty, index, setting, clients)
+    if not single and qps is None:
+        return None
+    recall = num(single[0]["recall"]) if single else None
+    return (f"{fmt(qps)} (recall {'–' if recall is None else f'{recall:.4f}'})", qps, True)
 
 
 def headline(runs, cs):
@@ -183,26 +223,28 @@ def headline(runs, cs):
 
         simple("HNSW serial build, median ms", build("serial"))
         simple("HNSW parallel build (4 workers), median ms", build("parallel4"))
+        def search_row(label, res):
+            """A ratio only between cells of the same kind: both reached the
+            target, or both did not (then both are the highest setting)."""
+            if all(x is None for x in res):
+                return
+            vals = [x[1] if x else None for x in res]
+            same = len({x[2] for x in res if x}) == 1
+            lines.append([label] + [x[0] if x else "–" for x in res]
+                         + ([ratio(vals[0], vals[1]) if same else "–"] if two else []))
+
         for index in ("hnsw", "ivfflat"):
-            for target in (0.95, 0.99):
+            name = "HNSW" if index == "hnsw" else "IVFFlat"
+            search_row(f"{name} QPS at {GUC[index]} {MATCHED[index]}, {MATCHED_CLIENTS} clients "
+                       f"(matched setting)",
+                       [at_setting(runs[c], ds, ty, index, MATCHED[index], MATCHED_CLIENTS)
+                        for c in cs])
+        for index in ("hnsw", "ivfflat"):
+            name = "HNSW" if index == "hnsw" else "IVFFlat"
+            for target in TARGETS:
                 for clients in (8, 16):
-                    res = [at_recall(runs[c], ds, ty, index, target, clients) for c in cs]
-                    if all(x is None for x in res):
-                        continue
-                    cells = []
-                    for x in res:
-                        if x is None:
-                            cells.append("–")
-                        elif x[1] is None:
-                            cells.append("not reached")
-                        elif x[0] is None:
-                            cells.append(f"no point ({GUC[index]} {x[1]})")
-                        else:
-                            cells.append(f"{fmt(x[0])} ({GUC[index]} {x[1]})")
-                    vals = [x[0] if x else None for x in res]
-                    lines.append([f"{index.upper() if index == 'hnsw' else 'IVFFlat'} QPS at "
-                                  f"recall ≥ {target:.2f}, {clients} clients"] + cells
-                                 + ([ratio(vals[0], vals[1])] if two else []))
+                    search_row(f"{name} QPS at recall ≥ {target:.2f}, {clients} clients",
+                               [at_recall(runs[c], ds, ty, index, target, clients) for c in cs])
         simple("Exact scan QPS, 1 client, median",
                lambda rows: median(select(rows, dataset=ds, type=ty, measurement="exact", clients="1")))
         simple("Exact scan TPS, 8 clients",
@@ -224,7 +266,15 @@ def headline(runs, cs):
             "(approx.): rep 1's peak minus the peak of the last measured step before it (the "
             "exact pass or the previous build group), an upper bound on the baseline and so a "
             "lower bound on what the build added; reps 2 and 3 have none. Runs after "
-            "p1-20261114 log the exact baseline (\"measure: ... base_bytes=\").", ""]
+            "p1-20261114 log the exact baseline (\"measure: ... base_bytes=\").", "",
+            f"Matched setting: both engines at the same {GUC['hnsw']} or {GUC['ivfflat']}, with "
+            "each one's 1-client recall in brackets; where the recalls agree this is the "
+            "like-for-like search comparison. Recall ≥ R: the first setting whose 1-client "
+            "recall reaches R (\"not reached:\" the highest setting, with its recall).", "",
+            f"† The recall of the cell's setting, or of the setting before it, is within {NEAR} "
+            "of the target. Where two engines' recall curves agree to about that width, which "
+            "setting first clears the bar, and so the QPS in the cell, can turn on a recall "
+            "difference at the noise level; read the matched-setting rows instead.", ""]
     return out
 
 

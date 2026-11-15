@@ -17,3 +17,11 @@ pgrust	glove-100-angular	vector	none	exact		1	1	63	qps	1.0				805306368			2026-1
 pgrust	glove-100-angular	vector	hnsw	build	serial		1	54000	ms					966367642			2026-11-14T00:16:00Z
 pgrust	glove-100-angular	vector	hnsw	build	serial		2	56000	ms					955630223			2026-11-14T00:17:00Z
 pgrust	glove-100-angular	vector	hnsw	build	serial		3	52000	ms					977105060			2026-11-14T00:18:00Z
+pg-c	glove-100-angular	vector	ivfflat	search	10	1	1	420	qps	0.90	2.3	3.8	4.4				2026-11-14T00:19:00Z
+pg-c	glove-100-angular	vector	ivfflat	search	10	8	1	1380	tps		4.9		15.5				2026-11-14T00:20:00Z
+pg-c	glove-100-angular	vector	ivfflat	search	20	1	1	223	qps	0.9501	4.3	6.6	7.2				2026-11-14T00:21:00Z
+pg-c	glove-100-angular	vector	ivfflat	search	20	8	1	727	tps		9.8		25.8				2026-11-14T00:22:00Z
+pgrust	glove-100-angular	vector	ivfflat	search	10	1	1	285	qps	0.899	3.3	5.4	6.1				2026-11-14T00:23:00Z
+pgrust	glove-100-angular	vector	ivfflat	search	10	8	1	1010	tps		7.0		19.1				2026-11-14T00:24:00Z
+pgrust	glove-100-angular	vector	ivfflat	search	20	1	1	151	qps	0.9491	6.4	9.6	11.0				2026-11-14T00:25:00Z
+pgrust	glove-100-angular	vector	ivfflat	search	20	8	1	550	tps		13.1		32.4				2026-11-14T00:26:00Z
